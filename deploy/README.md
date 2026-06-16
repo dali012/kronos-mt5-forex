@@ -23,14 +23,17 @@ Tune risk in `.env` if desired: `BINANCE_STOP_PCT`, `BINANCE_MAX_DRAWDOWN`,
 `BINANCE_TARGET_VOL`, `BINANCE_HEARTBEAT_SECS`.
 
 ## 3a. Run under systemd (recommended — auto-restart + start on boot)
+Run these **from inside the repo dir** (it injects the real path, so it works
+whether the repo is at /root/dev/... or /home/you/...):
 ```bash
+REPO=$(pwd)
 sudo cp deploy/kronos-trend.service /etc/systemd/system/
-sudo sed -i "s/CHANGEME/$USER/g" /etc/systemd/system/kronos-trend.service
-# also fix WorkingDirectory/paths if the repo isn't at ~/kronos-mt5-forex
+sudo sed -i "s#CHANGE_REPO_PATH#$REPO#g; s/CHANGE_USER/$USER/g" /etc/systemd/system/kronos-trend.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now kronos-trend
-journalctl -u kronos-trend -f            # follow live logs
+journalctl -u kronos-trend -f            # follow live logs (stdout -> journal)
 ```
+Output goes to the journal; the bot also writes rotating logs to `logs/`.
 
 ## 3b. Or run under tmux + the restart wrapper (simpler, no root)
 ```bash
