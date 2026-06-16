@@ -84,3 +84,25 @@ def test_api_token_guard(tmp_path, monkeypatch):
         ok = client.post("/kill", headers={"Authorization": "Bearer secret"})
         assert ok.status_code == 200 and ok.json()["halted"] is True
         assert client.get("/api/state", headers={"Authorization": "Bearer secret"}).status_code == 200
+
+
+def test_telegram_command_replies(tmp_path, monkeypatch):
+    from kronos_mt5.companion import api
+
+    p = str(tmp_path / "cmd.db")
+    store.init_db(p)
+    monkeypatch.setattr(api, "DB", p)
+    store.write_snapshot({"equity": 10300.0, "cash": 10000.0, "unrealized": 300.0, "n_open": 1,
+                          "positions": [{"symbol": "BTCUSDT", "qty": -0.003, "unrealized": 300.0}]}, p)
+    store.append_equity(10000.0, 10000.0, 0.0, 0, p)
+    store.heartbeat(p)
+
+    assert "/status" in api._command_reply("/help")
+    assert "equity" in api._command_reply("/status@mybot")          # handles /cmd@botname
+    assert "BTCUSDT" in api._command_reply("/positions")
+    assert "PnL" in api._command_reply("/pnl")
+    api._command_reply("/kill")
+    assert store.is_halted(p) is True
+    api._command_reply("/resume")
+    assert store.is_halted(p) is False
+    assert "unknown" in api._command_reply("/wat")

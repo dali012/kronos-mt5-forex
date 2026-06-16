@@ -17,6 +17,7 @@ import asyncio
 import contextlib
 from datetime import datetime, timezone
 
+import httpx
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -97,14 +98,101 @@ def _check_bot_down() -> None:
         store.set_kv("alert_bot_down", "0", DB)
 
 
+# --- Telegram two-way control (commands) ------------------------------------
+_TG_BASE = (
+    f"https://api.telegram.org/bot{settings.telegram_bot_token}"
+    if settings.telegram_bot_token
+    else None
+)
+HELP = (
+    "Kronos trend bot commands:\n"
+    "/status — live/halted + equity + uPnL\n"
+    "/positions — open positions\n"
+    "/pnl — total & unrealized P&L\n"
+    "/kill — flatten + halt (panic)\n"
+    "/resume — re-enable trading\n"
+    "/help — this message"
+)
+
+
+def _command_reply(text: str) -> str:
+    cmd = text.split()[0].lstrip("/").split("@")[0].lower()  # strip /cmd@botname
+    snap = store.read_snapshot(DB) or {}
+    if cmd in ("start", "help"):
+        return HELP
+    if cmd == "status":
+        alive, _ = _alive()
+        flag = " · ⛔HALTED" if store.is_halted(DB) else ""
+        return (
+            f"{'🟢 live' if alive else '🔴 DOWN'}{flag}\n"
+            f"equity ${snap.get('equity', 0):,.0f} | uPnL ${snap.get('unrealized', 0):+,.0f} "
+            f"| open {snap.get('n_open', 0)}"
+        )
+    if cmd == "positions":
+        pos = snap.get("positions", [])
+        if not pos:
+            return "flat (no open positions)"
+        return "\n".join(f"{p['symbol']} {p['qty']:+.4f}  uPnL ${p['unrealized']:+.0f}" for p in pos)
+    if cmd == "pnl":
+        eq = store.read_equity(limit=100000, db_path=DB)
+        base = eq[0]["equity"] if eq else snap.get("equity", 0)
+        equity = snap.get("equity", 0)
+        total = equity - base
+        pct = (total / base * 100) if base else 0
+        return (
+            f"equity ${equity:,.0f}\ntotal PnL ${total:+,.0f} ({pct:+.2f}%)\n"
+            f"unrealized ${snap.get('unrealized', 0):+,.0f}"
+        )
+    if cmd == "kill":
+        store.set_halt(True, DB)
+        return "🛑 KILL — bot flattening + halting"
+    if cmd == "resume":
+        store.set_halt(False, DB)
+        return "▶️ resumed — trading re-enabled"
+    return f"unknown command /{cmd} — try /help"
+
+
+async def _tg_post(client: httpx.AsyncClient, method: str, **params) -> dict:
+    r = await client.post(f"{_TG_BASE}/{method}", data=params)
+    return r.json()
+
+
+async def _telegram_commands() -> None:
+    """Long-poll Telegram for commands from the owner chat only."""
+    if not (_TG_BASE and settings.telegram_chat_id):
+        return
+    owner = str(settings.telegram_chat_id)
+    offset = 0
+    async with httpx.AsyncClient(timeout=40) as client:
+        with contextlib.suppress(Exception):
+            await _tg_post(client, "sendMessage", chat_id=owner, text="🤖 controller online — /help")
+        while True:
+            try:
+                r = await client.get(
+                    f"{_TG_BASE}/getUpdates", params={"offset": offset, "timeout": 30}
+                )
+                for upd in r.json().get("result", []):
+                    offset = upd["update_id"] + 1
+                    msg = upd.get("message") or {}
+                    text = (msg.get("text") or "").strip()
+                    chat = str((msg.get("chat") or {}).get("id", ""))
+                    if not text.startswith("/") or chat != owner:
+                        continue  # only respond to the owner's slash-commands
+                    await _tg_post(client, "sendMessage", chat_id=owner, text=_command_reply(text))
+            except Exception:  # noqa: BLE001
+                await asyncio.sleep(5)
+
+
 @contextlib.asynccontextmanager
 async def _lifespan(app: FastAPI):
     store.init_db(DB)
-    task = asyncio.create_task(_alerter())
+    tasks = [asyncio.create_task(_alerter()), asyncio.create_task(_telegram_commands())]
     yield
-    task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await task
+    for t in tasks:
+        t.cancel()
+    for t in tasks:
+        with contextlib.suppress(asyncio.CancelledError):
+            await t
 
 
 app = FastAPI(title="Kronos Trend Companion", lifespan=_lifespan)

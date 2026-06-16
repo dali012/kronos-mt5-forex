@@ -68,6 +68,13 @@ Open `http://<vps-ip>:8000/` (append `?token=<API_TOKEN>` if you set one).
 - **Dashboard**: equity card + total/unrealized PnL, open positions, equity chart, recent fills, live/HALTED status.
 - **⛔ KILL button** (or `curl -X POST http://<vps-ip>:8000/kill?token=...`): flattens + halts. Persisted in the DB, so it **survives a bot restart** — the bot stays halted until you hit **Resume**.
 - **Telegram alerts**: each fill, drawdown crossing `API_DD_WARN_PCT`, and **bot-down** (no heartbeat for `API_BOT_DOWN_SECS` — detected by the API, since a dead bot can't alert).
+- **Telegram commands (two-way control — no URL/token needed)**: once `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` are set, message your bot:
+  - `/status` — live/halted + equity + uPnL
+  - `/positions` — open positions
+  - `/pnl` — total & unrealized P&L
+  - `/kill` — flatten + halt (panic)  ·  `/resume` — re-enable
+  - `/help`
+  Only **your** chat id is obeyed (that's the auth). Optional: send BotFather `/setcommands` and paste the list to get a tappable command menu.
 - Open only the needed port; on a public VPS set `API_TOKEN` and consider a firewall / reverse-proxy with auth.
 
 ## 6. Safe restart / stop
