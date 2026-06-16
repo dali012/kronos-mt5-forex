@@ -1,0 +1,16 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+data/*.csv
+data/*.parquet
+vendor/Kronos/
+models/
+catalog/
+*.log
+.ipynb_checkpoints/
+backtest/results/
+reports/
+kaggle/_staging/
+kaggle/kernel/kernel-metadata.json
+logs/

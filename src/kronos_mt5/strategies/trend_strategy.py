@@ -1,0 +1,221 @@
+"""TrendStrategy — event-driven vol-targeted trend-following (NautilusTrader).
+
+Engine port of the vectorized strategy in backtest/trend.py. One instance trades
+one instrument; run N instances for the diversified portfolio.
+
+Per closed bar: ensemble sign-momentum signal in [-1,1], vol-targeted to a per
+-instrument risk budget, rebalanced toward the target via a market order.
+
+Risk controls:
+  - Exchange-native protective orders per position (reduce-only): a STOP_MARKET
+    stop-loss and (optional) LIMIT take-profit, re-anchored on each position
+    change. These live server-side, so they protect even if this process
+    crashes / disconnects.
+  - A shared `risk_state.halted` gate (set by the RiskManager drawdown
+    kill-switch) blocks new entries.
+
+Verified against NautilusTrader 1.228.0.
+"""
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+
+from nautilus_trader.model.data import Bar, BarType
+from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.trading.strategy import Strategy, StrategyConfig
+
+
+class TrendStrategyConfig(StrategyConfig, frozen=True):
+    instrument_id: str
+    bar_type: str
+    lookbacks: tuple[int, ...] = (21, 63, 126, 252)
+    vol_window: int = 33
+    target_vol: float = 0.15
+    max_leverage: float = 2.0
+    n_instruments: int = 1
+    ppy: int = 365
+    vol_floor: float = 0.02
+    rebalance_threshold: float = 0.10
+    warmup_request: bool = True
+    # --- risk controls ---
+    use_stop_loss: bool = True
+    stop_pct: float = 0.20      # close if price moves this far against the entry
+    use_take_profit: bool = False  # off by default: TP conflicts with trend-following
+    tp_pct: float = 0.50
+
+
+class TrendStrategy(Strategy):
+    def __init__(self, config: TrendStrategyConfig) -> None:
+        super().__init__(config)
+        self.instrument_id = InstrumentId.from_str(config.instrument_id)
+        self.bar_type = BarType.from_str(config.bar_type)
+        self.venue = self.instrument_id.venue
+        self._closes: deque[float] = deque(maxlen=max(config.lookbacks) + 1)
+        self.instrument = None
+        self.risk_state = None  # optional shared halt flag (injected by the runner)
+        self._protected_once = False  # force a protection refresh on first rebalance (restart cleanup)
+
+    def cfg(self) -> TrendStrategyConfig:
+        return self.config
+
+    def on_start(self) -> None:
+        self.instrument = self.cache.instrument(self.instrument_id)
+        if self.instrument is None:
+            self.log.error(f"No instrument {self.instrument_id}; stopping.")
+            self.stop()
+            return
+        if self.cfg().warmup_request:
+            import pandas as pd
+            from datetime import timedelta
+
+            try:
+                start = self.clock.utc_now() - pd.Timedelta(days=max(self.cfg().lookbacks) + 10)
+                self.request_bars(self.bar_type, start=start)
+            except Exception as exc:  # noqa: BLE001
+                self.log.warning(f"request_bars warm-up skipped: {exc!r}")
+            self.clock.set_timer(
+                name="init_rebalance", interval=timedelta(seconds=20), callback=self._on_init_timer
+            )
+            # Live only: react to the kill-switch within a minute (not just on the
+            # next daily bar). A 60s timer in backtest sim-time would fire millions
+            # of times, so it's gated to live (warmup_request).
+            self.clock.set_timer(
+                name="halt_check", interval=timedelta(seconds=60), callback=self._on_halt_timer
+            )
+        self.subscribe_bars(self.bar_type)
+
+    def _on_init_timer(self, event) -> None:  # noqa: ANN001
+        self.clock.cancel_timer("init_rebalance")
+        self.log.info(f"initial rebalance ({len(self._closes)} bars buffered) {self.instrument_id}")
+        self._rebalance()
+
+    def on_historical_data(self, data) -> None:
+        bars = data if isinstance(data, (list, tuple)) else [data]
+        for b in bars:
+            close = getattr(b, "close", None)
+            if close is not None:
+                self._closes.append(close.as_double())
+
+    def on_bar(self, bar: Bar) -> None:
+        self._closes.append(bar.close.as_double())
+        self._rebalance()
+
+    def _halted(self) -> bool:
+        return self.risk_state is not None and getattr(self.risk_state, "halted", False)
+
+    def _flatten_self(self) -> None:
+        """Flatten this strategy's own position (correctly strategy-scoped)."""
+        if self.portfolio.net_position(self.instrument_id) != 0:
+            self.cancel_all_orders(self.instrument_id)
+            self.close_all_positions(self.instrument_id)
+
+    def _on_halt_timer(self, event) -> None:  # noqa: ANN001 (live: prompt flatten on kill-switch)
+        if self._halted():
+            self._flatten_self()
+
+    def _rebalance(self) -> None:
+        if len(self._closes) <= max(self.cfg().lookbacks):
+            return
+        if self._halted():
+            self._flatten_self()  # kill-switch active — flatten own book and stay out
+            return
+
+        closes = np.array(self._closes, dtype=float)
+        price = closes[-1]
+        sig = float(np.mean([np.sign(price / closes[-1 - lb] - 1.0) for lb in self.cfg().lookbacks]))
+        rets = np.diff(closes) / closes[:-1]
+        vw = min(self.cfg().vol_window, len(rets))
+        inst_vol = max(float(np.std(rets[-vw:])) * np.sqrt(self.cfg().ppy), self.cfg().vol_floor)
+
+        equity = self._equity()
+        if equity <= 0:
+            return
+        budget = equity / self.cfg().n_instruments
+        w = float(
+            np.clip(sig * (self.cfg().target_vol / inst_vol), -self.cfg().max_leverage, self.cfg().max_leverage)
+        )
+        target_units = (budget * w) / price
+        current_units = float(self.portfolio.net_position(self.instrument_id))
+        delta = target_units - current_units
+
+        traded = False
+        if abs(delta * price) >= self.cfg().rebalance_threshold * budget:
+            qty = self.instrument.make_qty(abs(delta))
+            if qty > self.instrument.make_qty(0):
+                side = OrderSide.BUY if delta > 0 else OrderSide.SELL
+                self.submit_order(
+                    self.order_factory.market(
+                        instrument_id=self.instrument_id, order_side=side, quantity=qty
+                    )
+                )
+                self.log.info(
+                    f"{self.instrument_id.symbol} sig={sig:+.2f} vol={inst_vol:.2f} w={w:+.2f} "
+                    f"tgt={target_units:+.4f} cur={current_units:+.4f} {side.name} {qty}"
+                )
+                traded = True
+
+        # (Re)place protection when we traded, or once on first rebalance after a
+        # (re)start — so stale/wrong-side stops from a prior run get corrected.
+        if traded or not self._protected_once:
+            self._set_protection(target_units, price)
+            self._protected_once = True
+
+    # --- protective orders -------------------------------------------------
+    def on_position_closed(self, event) -> None:  # noqa: ANN001
+        self.cancel_all_orders(self.instrument_id)  # drop now-orphaned SL/TP
+
+    def _set_protection(self, target_units: float, price: float) -> None:
+        """(Re)place reduce-only SL/TP once per rebalance, sized & sided to the
+        TARGET position. Driven by the signed target (not pos.quantity, which is
+        absolute), and only here — never per-fill — so stops don't accumulate."""
+        if not (self.cfg().use_stop_loss or self.cfg().use_take_profit):
+            return
+        self.cancel_all_orders(self.instrument_id)  # clear previous protection
+        if target_units == 0:
+            return
+        is_long = target_units > 0
+        close_side = OrderSide.SELL if is_long else OrderSide.BUY  # close = opposite side
+        qty = self.instrument.make_qty(abs(target_units))
+        if qty <= self.instrument.make_qty(0):
+            return
+        try:
+            if self.cfg().use_stop_loss:
+                # long: stop BELOW; short: stop ABOVE
+                sl = price * (1 - self.cfg().stop_pct) if is_long else price * (1 + self.cfg().stop_pct)
+                self.submit_order(
+                    self.order_factory.stop_market(
+                        instrument_id=self.instrument_id,
+                        order_side=close_side,
+                        quantity=qty,
+                        trigger_price=self.instrument.make_price(sl),
+                        reduce_only=True,
+                    )
+                )
+            if self.cfg().use_take_profit:
+                tp = price * (1 + self.cfg().tp_pct) if is_long else price * (1 - self.cfg().tp_pct)
+                self.submit_order(
+                    self.order_factory.limit(
+                        instrument_id=self.instrument_id,
+                        order_side=close_side,
+                        quantity=qty,
+                        price=self.instrument.make_price(tp),
+                        reduce_only=True,
+                    )
+                )
+        except Exception as exc:  # noqa: BLE001
+            self.log.warning(f"protection placement failed for {self.instrument_id}: {exc!r}")
+
+    def _equity(self) -> float:
+        account = self.portfolio.account(self.venue)
+        if account is None:
+            return 0.0
+        ccy = getattr(account, "base_currency", None) or self.instrument.quote_currency
+        bal = account.balance_total(ccy)
+        return bal.as_double() if bal is not None else 0.0
+
+    def on_stop(self) -> None:
+        self.cancel_all_orders(self.instrument_id)
+        self.close_all_positions(self.instrument_id)

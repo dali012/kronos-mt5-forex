@@ -1,0 +1,32 @@
+# --- Trading engine ---
+nautilus_trader>=1.200            # verify installed version; API checked in CLAUDE.md
+
+# --- Kronos brain ---
+# Kronos itself is NOT on PyPI. scripts/setup_kronos.sh clones the repo and you
+# import from its `model/` package. These are its runtime deps:
+torch>=2.1
+numpy
+pandas
+huggingface_hub
+einops
+safetensors
+
+# --- MT5 (live only, Windows only) ---
+# Install separately on the Windows host; commented so non-Windows backtest envs
+# don't fail. Uncomment on the trading machine:
+# MetaTrader5>=5.0.45
+
+# --- Config / utils ---
+pydantic>=2
+pydantic-settings>=2
+python-dotenv
+
+# --- Analytics / monitoring ---
+quantstats
+matplotlib
+plotly
+
+# --- Dev ---
+pytest
+ruff
+black

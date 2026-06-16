@@ -1,0 +1,30 @@
+# systemd unit for the Kronos crypto trend bot (Binance testnet).
+# Install on a VPS:
+#   sudo cp deploy/kronos-trend.service /etc/systemd/system/
+#   # edit User= and the two paths below to match your VPS
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now kronos-trend
+#   journalctl -u kronos-trend -f         # follow logs
+#
+# systemd supervises the process: auto-restart on crash, start on boot.
+[Unit]
+Description=Kronos crypto trend bot (Binance testnet)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=CHANGEME
+WorkingDirectory=/home/CHANGEME/kronos-mt5-forex
+Environment=PYTHONPATH=src:.
+ExecStart=/home/CHANGEME/kronos-mt5-forex/.venv/bin/python -m kronos_mt5.live.run_trend_binance
+Restart=always
+RestartSec=15
+# don't hammer-restart on a hard config error:
+StartLimitIntervalSec=600
+StartLimitBurst=20
+StandardOutput=append:/home/CHANGEME/kronos-mt5-forex/logs/stdout.log
+StandardError=append:/home/CHANGEME/kronos-mt5-forex/logs/stdout.log
+
+[Install]
+WantedBy=multi-user.target

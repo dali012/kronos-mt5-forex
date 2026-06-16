@@ -1,0 +1,8 @@
+# Minimal deps to RUN the live crypto-trend bot on a VPS.
+# (No torch / Kronos / quantstats — those are only for research/backtests.)
+nautilus_trader==1.228.0
+numpy
+pandas
+pydantic>=2
+pydantic-settings>=2
+python-dotenv

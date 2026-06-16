@@ -1,0 +1,23 @@
+[project]
+name = "kronos-mt5-forex"
+version = "0.1.0"
+description = "Kronos + NautilusTrader + MetaTrader5 forex bot scaffold"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+markers = [
+    "slow: tests that load the Kronos model / run inference (deselect with '-m \"not slow\"')",
+]
+
+[tool.ruff]
+line-length = 100
+# Generated Kaggle notebook (built by kaggle/_make_notebook.py); not hand-edited.
+extend-exclude = ["kaggle/kronos_walkforward.ipynb"]
+
+[tool.black]
+line-length = 100
