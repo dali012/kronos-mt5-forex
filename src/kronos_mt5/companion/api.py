@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from datetime import datetime, timezone
+import json
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException
@@ -68,7 +69,8 @@ def _check_fills() -> None:
     last = int(store.get_kv("alert_last_fill_rowid", "0", DB) or 0)
     new = sorted(store.read_fills(limit=500, after_rowid=last, db_path=DB), key=lambda f: f["rowid"])
     for f in new:
-        tg.send(f"✅ FILL {f['symbol']} {f['side']} {f['qty']:g} @ {f['price']:g}")
+        icon = "🛑 STOPPED OUT" if f.get("kind") == "STOP" else ("🎯 TP" if f.get("kind") == "TP" else "✅ FILL")
+        tg.send(f"{icon} {f['symbol']} {f['side']} {f['qty']:g} @ {f['price']:g}")
         store.set_kv("alert_last_fill_rowid", str(f["rowid"]), DB)
 
 
@@ -108,11 +110,26 @@ HELP = (
     "<b>🤖 Kronos Trend — commands</b>\n\n"
     "📊 /status — live/halted + equity\n"
     "📦 /positions — open positions\n"
-    "💹 /pnl — total &amp; unrealized P&amp;L\n"
-    "🛑 /kill — flatten + halt (panic)\n"
-    "▶️ /resume — re-enable trading\n"
-    "ℹ️ /help — this message"
+    "💹 /pnl · /equity — P&amp;L &amp; equity deltas\n"
+    "📈 /chart — equity sparkline\n"
+    "🛡 /stops · /orders — protective orders\n"
+    "🧹 /flatten · /close BTC — flatten all / one\n"
+    "⏸ /halt — freeze (keep positions)\n"
+    "🛑 /kill — flatten + halt  ·  ▶️ /resume\n"
+    "ℹ️ /help"
 )
+QUICK_KB = {"inline_keyboard": [
+    [{"text": "📊 Status", "callback_data": "cmd:status"},
+     {"text": "📦 Positions", "callback_data": "cmd:positions"}],
+    [{"text": "💹 PnL", "callback_data": "cmd:pnl"},
+     {"text": "🛡 Stops", "callback_data": "cmd:stops"}],
+    [{"text": "📈 Chart", "callback_data": "cmd:chart"},
+     {"text": "⛔ Kill", "callback_data": "cmd:kill"}],
+]}
+KILL_KB = {"inline_keyboard": [[
+    {"text": "🛑 Confirm KILL", "callback_data": "kill:yes"},
+    {"text": "Cancel", "callback_data": "kill:no"},
+]]}
 
 
 def _usd(x: float) -> str:
@@ -127,92 +144,239 @@ def _coin(symbol: str) -> str:
     return symbol.split("USDT")[0]  # "BTCUSDT-PERP" -> "BTC"
 
 
-def _command_reply(text: str) -> str:
-    cmd = text.split()[0].lstrip("/").split("@")[0].lower()  # strip /cmd@botname
-    snap = store.read_snapshot(DB) or {}
-    if cmd in ("start", "help"):
-        return HELP
+def _sparkline(vals: list[float], width: int = 24) -> str:
+    if len(vals) > width:  # downsample
+        step = len(vals) / width
+        vals = [vals[int(i * step)] for i in range(width)]
+    lo, hi = min(vals), max(vals)
+    rng = (hi - lo) or 1
+    blocks = "▁▂▃▄▅▆▇█"
+    return "".join(blocks[min(7, int((v - lo) / rng * 7))] for v in vals)
 
+
+def _equity_summary() -> str:
+    eq = store.read_equity(limit=200000, db_path=DB)
+    if not eq:
+        return "<i>no equity data yet</i>"
+    now = eq[-1]["equity"]
+    now_ts = datetime.now(timezone.utc)
+
+    def prior(hours: int) -> float:
+        cut = now_ts - timedelta(hours=hours)
+        p = [e for e in eq if datetime.fromisoformat(e["ts"]) <= cut]
+        return p[-1]["equity"] if p else eq[0]["equity"]
+
+    def row(lbl: str, base: float) -> str:
+        d = now - base
+        pct = (d / base * 100) if base else 0
+        return f"{lbl:<8}{_signed(d):>10} ({pct:+.1f}%)"
+
+    body = (f"{'Equity':<8}{_usd(now):>10}\n" + row("Today", prior(24)) + "\n"
+            + row("7d", prior(24 * 7)) + "\n" + row("AllTime", eq[0]["equity"]))
+    return f"<b>💹 Equity</b>\n<pre>{body}</pre>"
+
+
+def _chart_text() -> str:
+    eq = store.read_equity(limit=200000, db_path=DB)
+    if len(eq) < 2:
+        return "<i>not enough data for a chart yet</i>"
+    vals = [e["equity"] for e in eq]
+    pct = ((vals[-1] / vals[0] - 1) * 100) if vals[0] else 0
+    return (f"<b>📈 Equity</b>\n<pre>{_sparkline(vals)}\n"
+            f"${min(vals):,.0f} … ${max(vals):,.0f}   now ${vals[-1]:,.0f} ({pct:+.1f}%)</pre>")
+
+
+def _stops_text(snap: dict) -> str:
+    stops = [o for o in snap.get("orders", []) if o.get("type") == "STOP_MARKET"]
+    if not stops:
+        return "<b>🛡 Stops</b>\n<i>none</i>"
+    entries = {p["symbol"]: p.get("entry") for p in snap.get("positions", [])}
+    head = f"{'COIN':<5}{'STOP':>11}{'DIST':>7}"
+    rows = []
+    for o in stops:
+        e, trig = entries.get(o["symbol"]), o.get("trigger")
+        dist = f"{(trig / e - 1) * 100:+.0f}%" if (e and trig) else "–"
+        rows.append(f"{_coin(o['symbol']):<5}{(trig or 0):>11.4f}{dist:>7}")
+    return f"<b>🛡 Stop-losses ({len(stops)})</b>\n<pre>{head}\n" + "\n".join(rows) + "</pre>"
+
+
+def _orders_text(snap: dict) -> str:
+    orders = snap.get("orders", [])
+    if not orders:
+        return "<b>📋 Orders</b>\n<i>none</i>"
+    rows = "\n".join(
+        f"{_coin(x['symbol']):<5}{x['type'][:6]:<7}{x['side'][:4]:<5}{x['qty']:>10.4f}" for x in orders
+    )
+    return f"<b>📋 Open orders ({len(orders)})</b>\n<pre>{rows}</pre>"
+
+
+def _daily_summary_text() -> str:
+    eq = store.read_equity(limit=200000, db_path=DB)
+    snap = store.read_snapshot(DB) or {}
+    if not eq:
+        return "<b>📅 Daily summary</b>\n<i>no data</i>"
+    now = eq[-1]["equity"]
+    cut = datetime.now(timezone.utc) - timedelta(hours=24)
+    prior = [e for e in eq if datetime.fromisoformat(e["ts"]) <= cut]
+    base = prior[-1]["equity"] if prior else eq[0]["equity"]
+    day = now - base
+    pct = (day / base * 100) if base else 0
+    peak = max(e["equity"] for e in eq)
+    ddv = (now / peak - 1) * 100 if peak else 0
+    n24 = sum(1 for f in store.read_fills(limit=500, db_path=DB)
+              if datetime.fromisoformat(f["ts"]) >= cut)
+    arrow = "📈" if day >= 0 else "📉"
+    body = (f"{'Equity':<10}{_usd(now):>10}\n{'Day PnL':<10}{_signed(day):>10} ({pct:+.1f}%)\n"
+            f"{'Drawdown':<10}{ddv:>9.1f}%\n{'Trades24h':<10}{n24:>10}\n"
+            f"{'Open':<10}{snap.get('n_open', 0):>10}")
+    return f"<b>{arrow} Daily summary</b>\n<pre>{body}</pre>"
+
+
+def _handle(text: str) -> tuple[str, dict | None]:
+    """Map a /command (with optional args) to (reply_html, inline_keyboard|None)."""
+    parts = text.lstrip("/").split()
+    cmd = parts[0].split("@")[0].lower() if parts else ""
+    args = parts[1:]
+    snap = store.read_snapshot(DB) or {}
+
+    if cmd in ("start", "help", "menu"):
+        return HELP, QUICK_KB
     if cmd == "status":
         alive, _ = _alive()
-        state = "⛔ HALTED" if store.is_halted(DB) else ("🟢 LIVE" if alive else "🔴 DOWN")
-        body = (
-            f"{'Equity':<9}{_usd(snap.get('equity', 0)):>11}\n"
-            f"{'uPnL':<9}{_signed(snap.get('unrealized', 0)):>11}\n"
-            f"{'Open':<9}{snap.get('n_open', 0):>11}"
-        )
-        return f"<b>🤖 Kronos Trend — {state}</b>\n<pre>{body}</pre>"
-
+        mode = store.get_mode(DB)
+        state = {"kill": "🛑 KILLED", "halt": "⏸ HALTED"}.get(mode, "🟢 LIVE" if alive else "🔴 DOWN")
+        body = (f"{'Equity':<9}{_usd(snap.get('equity', 0)):>11}\n"
+                f"{'uPnL':<9}{_signed(snap.get('unrealized', 0)):>11}\n"
+                f"{'Open':<9}{snap.get('n_open', 0):>11}")
+        return f"<b>🤖 Kronos Trend — {state}</b>\n<pre>{body}</pre>", QUICK_KB
     if cmd == "positions":
         pos = snap.get("positions", [])
         if not pos:
-            return "<b>📦 Positions</b>\n<i>flat — no open positions</i>"
+            return "<b>📦 Positions</b>\n<i>flat</i>", None
         head = f"{'COIN':<5}{'QTY':>11}{'uPnL':>8}"
-        rows = "\n".join(
-            f"{_coin(p['symbol']):<5}{p['qty']:>11.4f}{_signed(p['unrealized']):>8}" for p in pos
-        )
-        return f"<b>📦 Open positions ({len(pos)})</b>\n<pre>{head}\n{rows}</pre>"
-
+        rows = "\n".join(f"{_coin(p['symbol']):<5}{p['qty']:>11.4f}{_signed(p['unrealized']):>8}"
+                         for p in pos)
+        return f"<b>📦 Open positions ({len(pos)})</b>\n<pre>{head}\n{rows}</pre>", None
     if cmd == "pnl":
-        eq = store.read_equity(limit=100000, db_path=DB)
+        eq = store.read_equity(limit=200000, db_path=DB)
         base = eq[0]["equity"] if eq else snap.get("equity", 0)
         equity = snap.get("equity", 0)
         total = equity - base
         pct = (total / base * 100) if base else 0
         arrow = "📈" if total > 0 else ("📉" if total < 0 else "➖")
-        body = (
-            f"{'Equity':<11}{_usd(equity):>11}\n"
-            f"{'Total':<11}{_signed(total):>11} ({pct:+.2f}%)\n"
-            f"{'Unrealized':<11}{_signed(snap.get('unrealized', 0)):>11}"
-        )
-        return f"<b>{arrow} P&amp;L</b>\n<pre>{body}</pre>"
-
-    if cmd == "kill":
-        store.set_halt(True, DB)
-        return "🛑 <b>KILL</b> — bot flattening + halting all positions"
+        body = (f"{'Equity':<11}{_usd(equity):>11}\n"
+                f"{'Total':<11}{_signed(total):>11} ({pct:+.2f}%)\n"
+                f"{'Unrealized':<11}{_signed(snap.get('unrealized', 0)):>11}")
+        return f"<b>{arrow} P&amp;L</b>\n<pre>{body}</pre>", None
+    if cmd == "equity":
+        return _equity_summary(), None
+    if cmd == "chart":
+        return _chart_text(), None
+    if cmd == "stops":
+        return _stops_text(snap), None
+    if cmd == "orders":
+        return _orders_text(snap), None
+    if cmd == "halt":
+        store.set_mode("halt", DB)
+        return "⏸ <b>Halted</b> — positions kept, no new entries (/resume to continue)", None
     if cmd == "resume":
-        store.set_halt(False, DB)
-        return "▶️ <b>Resumed</b> — trading re-enabled"
-    return f"❓ unknown command <code>/{cmd}</code> — try /help"
+        store.set_mode("run", DB)
+        return "▶️ <b>Resumed</b> — trading re-enabled", None
+    if cmd == "flatten":
+        store.request_flatten("all", DB)
+        return "🧹 flatten-all requested (trading stays enabled)", None
+    if cmd == "close":
+        if not args:
+            return "usage: <code>/close BTC</code>", None
+        coin = args[0].upper().replace("USDT", "").replace("-PERP", "")
+        sym = next((p["symbol"] for p in snap.get("positions", [])
+                    if _coin(p["symbol"]).upper() == coin), None)
+        if not sym:
+            return f"no open position for <b>{coin}</b>", None
+        store.request_flatten(sym, DB)
+        return f"🧹 closing <b>{coin}</b> requested", None
+    if cmd == "kill":
+        return "⚠️ <b>Confirm KILL</b> — flatten ALL positions and halt?", KILL_KB
+    return f"❓ unknown command <code>/{cmd}</code> — try /help", None
 
 
 async def _tg_post(client: httpx.AsyncClient, method: str, **params) -> dict:
+    if isinstance(params.get("reply_markup"), (dict, list)):
+        params["reply_markup"] = json.dumps(params["reply_markup"])
     r = await client.post(f"{_TG_BASE}/{method}", data=params)
     return r.json()
 
 
+async def _send(client: httpx.AsyncClient, owner: str, text: str, kb: dict | None = None) -> None:
+    params = {"chat_id": owner, "text": text, "parse_mode": "HTML"}
+    if kb:
+        params["reply_markup"] = kb
+    await _tg_post(client, "sendMessage", **params)
+
+
 async def _telegram_commands() -> None:
-    """Long-poll Telegram for commands from the owner chat only."""
+    """Long-poll Telegram for slash-commands + button taps from the owner only."""
     if not (_TG_BASE and settings.telegram_chat_id):
         return
     owner = str(settings.telegram_chat_id)
     offset = 0
     async with httpx.AsyncClient(timeout=40) as client:
         with contextlib.suppress(Exception):
-            await _tg_post(client, "sendMessage", chat_id=owner,
-                           text="🤖 <b>controller online</b> — /help", parse_mode="HTML")
+            await _send(client, owner, "🤖 <b>controller online</b> — /help", QUICK_KB)
         while True:
             try:
-                r = await client.get(
-                    f"{_TG_BASE}/getUpdates", params={"offset": offset, "timeout": 30}
-                )
+                r = await client.get(f"{_TG_BASE}/getUpdates", params={"offset": offset, "timeout": 30})
                 for upd in r.json().get("result", []):
                     offset = upd["update_id"] + 1
-                    msg = upd.get("message") or {}
-                    text = (msg.get("text") or "").strip()
-                    chat = str((msg.get("chat") or {}).get("id", ""))
-                    if not text.startswith("/") or chat != owner:
-                        continue  # only respond to the owner's slash-commands
-                    await _tg_post(client, "sendMessage", chat_id=owner,
-                                   text=_command_reply(text), parse_mode="HTML")
+                    if "callback_query" in upd:
+                        await _on_callback(client, owner, upd["callback_query"])
+                    else:
+                        msg = upd.get("message") or {}
+                        text = (msg.get("text") or "").strip()
+                        if text.startswith("/") and str((msg.get("chat") or {}).get("id", "")) == owner:
+                            await _send(client, owner, *_handle(text))
             except Exception:  # noqa: BLE001
                 await asyncio.sleep(5)
+
+
+async def _on_callback(client: httpx.AsyncClient, owner: str, cq: dict) -> None:
+    data = cq.get("data", "")
+    chat = str((cq.get("message") or {}).get("chat", {}).get("id", ""))
+    with contextlib.suppress(Exception):
+        await _tg_post(client, "answerCallbackQuery", callback_query_id=cq["id"])
+    if chat != owner:
+        return
+    if data == "kill:yes":
+        store.set_mode("kill", DB)
+        await _send(client, owner, "🛑 <b>KILLED</b> — flattening + halting all positions")
+    elif data == "kill:no":
+        await _send(client, owner, "✅ cancelled — bot still running")
+    elif data.startswith("cmd:"):
+        await _send(client, owner, *_handle("/" + data[4:]))
+
+
+async def _daily_summary() -> None:
+    """Push a once-a-day digest at API_DAILY_SUMMARY_HOUR UTC (set <0 to disable)."""
+    if not tg.enabled or settings.api_daily_summary_hour < 0:
+        return
+    while True:
+        with contextlib.suppress(Exception):
+            now = datetime.now(timezone.utc)
+            today = now.date().isoformat()
+            if now.hour >= settings.api_daily_summary_hour and store.get_kv("last_summary_day", "", DB) != today:
+                store.set_kv("last_summary_day", today, DB)
+                tg.send(_daily_summary_text())
+        await asyncio.sleep(300)
 
 
 @contextlib.asynccontextmanager
 async def _lifespan(app: FastAPI):
     store.init_db(DB)
-    tasks = [asyncio.create_task(_alerter()), asyncio.create_task(_telegram_commands())]
+    tasks = [
+        asyncio.create_task(_alerter()),
+        asyncio.create_task(_telegram_commands()),
+        asyncio.create_task(_daily_summary()),
+    ]
     yield
     for t in tasks:
         t.cancel()
@@ -246,16 +410,16 @@ def api_fills() -> JSONResponse:
 
 @app.post("/kill", dependencies=[Depends(require_auth)])
 def kill() -> dict:
-    store.set_halt(True, DB)
+    store.set_mode("kill", DB)
     tg.send("🛑 KILL TRIGGERED via API — bot flattening + halting")
-    return {"halted": True}
+    return {"mode": "kill"}
 
 
 @app.post("/resume", dependencies=[Depends(require_auth)])
 def resume() -> dict:
-    store.set_halt(False, DB)
+    store.set_mode("run", DB)
     tg.send("▶️ RESUME via API — bot re-enabled")
-    return {"halted": False}
+    return {"mode": "run"}
 
 
 @app.get("/", response_class=HTMLResponse)

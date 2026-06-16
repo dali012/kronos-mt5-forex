@@ -1,9 +1,9 @@
 """Companion recorder — the bot-side bridge to the SQLite store.
 
-Runs as a strategy in the trading node. On timers it: writes an equity/positions
-snapshot + equity point, records any new fills, stamps an "alive" heartbeat, and
-polls the shared control flag (remote /kill -> RiskState.halted -> strategies
-flatten + stop entering). Only local SQLite writes — never blocks on the network.
+On timers it: writes an equity/positions/orders snapshot + equity point, records
+new fills (tagged STOP/TP/TREND), stamps an "alive" heartbeat, and syncs the
+remote control state (mode + one-shot flatten) from the store into the shared
+RiskState the strategies read. Only local SQLite writes — never blocks trading.
 """
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ class Companion(Strategy):
         super().__init__(config)
         self._venue = Venue(config.venue)
         self._iids = [InstrumentId.from_str(i) for i in config.instrument_ids]
-        self.risk_state = None  # injected; remote kill flips this
+        self.risk_state = None  # injected; synced from the store control flags
 
     def on_start(self) -> None:
         store.init_db(self.config.db_path)
@@ -39,18 +39,24 @@ class Companion(Strategy):
         self.clock.set_timer("companion_control",
                              timedelta(seconds=self.config.control_secs), callback=self._poll_control)
 
-    # --- remote control: /kill writes halt=1 -> flip the shared RiskState -----
+    # --- sync remote control (store -> shared RiskState) ----------------------
     def _poll_control(self, event) -> None:  # noqa: ANN001
+        rs = self.risk_state
+        if rs is None:
+            return
         try:
-            halted = store.is_halted(self.config.db_path)
+            mode = store.get_mode(self.config.db_path)
+            seq, target = store.get_flatten(self.config.db_path)
         except Exception as exc:  # noqa: BLE001
             self.log.warning(f"control poll failed: {exc!r}")
             return
-        if self.risk_state is not None and self.risk_state.halted != halted:
-            self.risk_state.halted = halted
-            self.log.error(f"REMOTE CONTROL: halt={halted} (strategies {'flattening' if halted else 'resuming'})")
+        if rs.mode != mode:
+            self.log.error(f"REMOTE CONTROL: mode={mode}")
+        rs.mode = mode
+        rs.flatten_seq = seq
+        rs.flatten_target = target
 
-    # --- snapshot + equity + fills + alive heartbeat --------------------------
+    # --- snapshot + equity + orders + fills + alive heartbeat -----------------
     def _snapshot(self, event) -> None:  # noqa: ANN001
         try:
             acct = self.portfolio.account(self._venue)
@@ -75,39 +81,55 @@ class Companion(Strategy):
                     {"symbol": iid.symbol.value, "qty": net, "entry": entry, "unrealized": u_val}
                 )
 
-            equity = cash + upnl_total
-            n_open = len(positions)
             store.write_snapshot(
                 {
-                    "equity": equity, "cash": cash, "unrealized": upnl_total,
-                    "n_open": n_open, "halted": bool(self.risk_state and self.risk_state.halted),
-                    "positions": positions,
+                    "equity": cash + upnl_total, "cash": cash, "unrealized": upnl_total,
+                    "n_open": len(positions),
+                    "mode": (self.risk_state.mode if self.risk_state else "run"),
+                    "positions": positions, "orders": self._open_orders(),
                 },
                 self.config.db_path,
             )
-            store.append_equity(equity, cash, upnl_total, n_open, self.config.db_path)
+            store.append_equity(cash + upnl_total, cash, upnl_total, len(positions), self.config.db_path)
             self._record_new_fills()
             store.heartbeat(self.config.db_path)
         except Exception as exc:  # noqa: BLE001
             self.log.warning(f"companion snapshot failed: {exc!r}")
 
+    def _open_orders(self) -> list[dict]:
+        out = []
+        for o in self.cache.orders_open():
+            trig = getattr(o, "trigger_price", None) or getattr(o, "price", None)
+            out.append({
+                "symbol": o.instrument_id.symbol.value,
+                "type": o.order_type.name,
+                "side": o.side.name,
+                "qty": float(o.quantity),
+                "trigger": float(trig) if trig is not None else None,
+            })
+        return out
+
     def _record_new_fills(self) -> None:
-        # idempotent: INSERT OR IGNORE on the order id; cheap for a daily bot
         for order in self.cache.orders():
             try:
                 filled = float(order.filled_qty)
             except Exception:  # noqa: BLE001
                 filled = 0.0
-            if filled <= 0:
+            if filled <= 0 or order.avg_px is None:
                 continue
-            avg = order.avg_px
-            if avg is None:
-                continue
+            ot = order.order_type.name
+            if ot == "STOP_MARKET":
+                kind = "STOP"
+            elif getattr(order, "is_reduce_only", False):
+                kind = "TP" if ot == "LIMIT" else "STOP"
+            else:
+                kind = "TREND"
             store.record_fill(
                 fill_id=order.client_order_id.value,
                 symbol=order.instrument_id.symbol.value,
                 side=order.side.name,
                 qty=filled,
-                price=float(avg),
+                price=float(order.avg_px),
+                kind=kind,
                 db_path=self.config.db_path,
             )

@@ -36,12 +36,23 @@ def test_fills_idempotent(db):
     assert len(fills) == 1 and fills[0]["symbol"] == "BTCUSDT"
 
 
-def test_control_flag(db):
-    assert store.is_halted(db) is False
-    store.set_halt(True, db)
+def test_control_modes(db):
+    assert store.is_halted(db) is False and store.get_mode(db) == "run"
+    store.set_mode("kill", db)
+    assert store.is_halted(db) is True and store.get_mode(db) == "kill"
+    store.set_mode("halt", db)
     assert store.is_halted(db) is True
-    store.set_halt(False, db)
+    store.set_mode("run", db)
     assert store.is_halted(db) is False
+
+
+def test_flatten_request(db):
+    seq, target = store.get_flatten(db)
+    assert seq == 0
+    n = store.request_flatten("all", db)
+    assert n == 1 and store.get_flatten(db) == (1, "all")
+    store.request_flatten("BTCUSDT-PERP", db)
+    assert store.get_flatten(db) == (2, "BTCUSDT-PERP")
 
 
 def test_api_endpoints_and_kill(tmp_path, monkeypatch):
@@ -61,10 +72,10 @@ def test_api_endpoints_and_kill(tmp_path, monkeypatch):
         assert st["equity"] == 10500.0 and st["alive"] is True and st["halted"] is False
         assert len(client.get("/api/equity").json()) == 1
 
-        assert client.post("/kill").json()["halted"] is True
+        assert client.post("/kill").json()["mode"] == "kill"
         assert store.is_halted(p) is True
         assert client.get("/api/state").json()["halted"] is True
-        assert client.post("/resume").json()["halted"] is False
+        assert client.post("/resume").json()["mode"] == "run"
 
 
 def test_api_token_guard(tmp_path, monkeypatch):
@@ -82,28 +93,51 @@ def test_api_token_guard(tmp_path, monkeypatch):
         assert client.get("/api/state").status_code == 401                   # API also guarded
         assert client.post("/kill", headers={"Authorization": "Bearer wrong"}).status_code == 401
         ok = client.post("/kill", headers={"Authorization": "Bearer secret"})
-        assert ok.status_code == 200 and ok.json()["halted"] is True
+        assert ok.status_code == 200 and ok.json()["mode"] == "kill"
         assert client.get("/api/state", headers={"Authorization": "Bearer secret"}).status_code == 200
 
 
-def test_telegram_command_replies(tmp_path, monkeypatch):
+def test_telegram_commands(tmp_path, monkeypatch):
     from kronos_mt5.companion import api
 
     p = str(tmp_path / "cmd.db")
     store.init_db(p)
     monkeypatch.setattr(api, "DB", p)
-    store.write_snapshot({"equity": 10300.0, "cash": 10000.0, "unrealized": 300.0, "n_open": 1,
-                          "positions": [{"symbol": "BTCUSDT", "qty": -0.003, "unrealized": 300.0}]}, p)
+    store.write_snapshot({
+        "equity": 10300.0, "cash": 10000.0, "unrealized": 300.0, "n_open": 1,
+        "positions": [{"symbol": "BTCUSDT-PERP", "qty": -0.003, "entry": 65000.0, "unrealized": 300.0}],
+        "orders": [{"symbol": "BTCUSDT-PERP", "type": "STOP_MARKET", "side": "BUY",
+                    "qty": 0.003, "trigger": 78000.0}],
+    }, p)
     store.append_equity(10000.0, 10000.0, 0.0, 0, p)
+    store.append_equity(10150.0, 10000.0, 150.0, 1, p)
+    store.append_equity(10300.0, 10000.0, 300.0, 1, p)
     store.heartbeat(p)
 
-    assert "/status" in api._command_reply("/help")
-    status = api._command_reply("/status@mybot")                    # handles /cmd@botname
-    assert "Equity" in status and "LIVE" in status
-    assert "BTC" in api._command_reply("/positions")                # shortened coin name
-    assert "Total" in api._command_reply("/pnl")
-    api._command_reply("/kill")
-    assert store.is_halted(p) is True
-    api._command_reply("/resume")
-    assert store.is_halted(p) is False
-    assert "unknown" in api._command_reply("/wat")
+    text, kb = api._handle("/help")
+    assert "/status" in text and kb is not None                     # quick-action keyboard
+    text, _ = api._handle("/status@mybot")                          # handles /cmd@botname
+    assert "Equity" in text and "LIVE" in text
+    assert "BTC" in api._handle("/positions")[0]                    # shortened coin name
+    assert "Total" in api._handle("/pnl")[0]
+    assert "78000" in api._handle("/stops")[0]                      # stop level shown
+    assert "STOP" in api._handle("/orders")[0]
+    assert "Equity" in api._handle("/chart")[0] and "Today" in api._handle("/equity")[0]
+
+    # /kill only CONFIRMS (returns a keyboard), doesn't kill yet
+    ktext, kkb = api._handle("/kill")
+    assert "Confirm" in ktext and kkb is not None
+    assert store.get_mode(p) == "run"
+
+    api._handle("/halt")
+    assert store.get_mode(p) == "halt"
+    api._handle("/resume")
+    assert store.get_mode(p) == "run"
+
+    s0 = store.get_flatten(p)[0]
+    api._handle("/flatten")
+    assert store.get_flatten(p) == (s0 + 1, "all")
+    api._handle("/close BTC")
+    seq, target = store.get_flatten(p)
+    assert seq == s0 + 2 and target == "BTCUSDT-PERP"
+    assert "unknown" in api._handle("/wat")[0]

@@ -1,12 +1,10 @@
 """Portfolio-level risk controls for the trend book.
 
-RiskManager runs alongside the TrendStrategy instances and enforces a portfolio
-drawdown kill-switch: if mark-to-market equity falls more than `max_drawdown`
-from its peak, it flattens everything, cancels resting orders, and sets a shared
-`RiskState.halted` flag that blocks the TrendStrategies from re-entering.
-
-(Position-level stop-loss/take-profit live inside TrendStrategy as exchange-native
-reduce-only orders, which also provide crash/disconnect protection.)
+RiskManager enforces a drawdown kill-switch: if mark-to-market equity falls more
+than `max_drawdown` from its peak it sets mode='kill' (persisted to the store, so
+it survives a bot restart). The TrendStrategies read the shared RiskState and
+flatten + stop entering. Position-level stop-loss/take-profit live in TrendStrategy
+as exchange-native reduce-only orders.
 """
 from __future__ import annotations
 
@@ -16,19 +14,30 @@ from nautilus_trader.model.currencies import USDT
 from nautilus_trader.model.identifiers import InstrumentId, Venue
 from nautilus_trader.trading.strategy import Strategy, StrategyConfig
 
+from kronos_mt5.companion import store
+
 
 class RiskState:
-    """Shared flag toggled by RiskManager and read by the TrendStrategies."""
+    """Shared control state. The bot-side Companion syncs it from the store
+    every few seconds; strategies read `mode` and the one-shot flatten request."""
 
     def __init__(self) -> None:
-        self.halted = False
+        self.mode = "run"            # run | halt | kill
+        self.flatten_seq = 0         # bumped for one-shot flatten requests
+        self.flatten_target = "all"  # 'all' or a symbol like 'BTCUSDT-PERP'
+
+    @property
+    def halted(self) -> bool:
+        return self.mode in ("halt", "kill")
 
 
 class RiskManagerConfig(StrategyConfig, frozen=True):
     venue: str
     instrument_ids: tuple[str, ...]
-    max_drawdown: float = 0.20   # flatten + halt if equity falls this far from peak
+    max_drawdown: float = 0.20
     check_secs: int = 300
+    db_path: str = store.DEFAULT_DB
+    persist: bool = True  # write kill mode to the store (live); False in backtests
 
 
 class RiskManager(Strategy):
@@ -60,16 +69,18 @@ class RiskManager(Strategy):
 
     def _check(self, event) -> None:  # noqa: ANN001
         equity = self._equity()
-        if equity <= 0 or self.risk_state is None or self.risk_state.halted:
+        if equity <= 0 or self.risk_state is None or self.risk_state.mode == "kill":
             return
         self._peak = max(self._peak, equity)
         dd = equity / self._peak - 1.0
         if dd <= -self.config.max_drawdown:
-            # Signal the halt; each TrendStrategy flattens its OWN position
-            # (position closing is strategy-scoped, so the RiskManager can't do
-            # it for them). They also stop entering while halted.
-            self.risk_state.halted = True
+            self.risk_state.mode = "kill"
+            if self.config.persist:
+                try:
+                    store.set_mode("kill", self.config.db_path)  # persist (survives restart)
+                except Exception as exc:  # noqa: BLE001
+                    self.log.warning(f"persist kill mode failed: {exc!r}")
             self.log.error(
                 f"DRAWDOWN KILL-SWITCH: equity ${equity:,.0f} (peak ${self._peak:,.0f}, "
-                f"dd {dd:.1%}) <= -{self.config.max_drawdown:.0%} -> halting; strategies flattening"
+                f"dd {dd:.1%}) <= -{self.config.max_drawdown:.0%} -> kill (flatten + halt)"
             )

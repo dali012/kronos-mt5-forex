@@ -55,8 +55,9 @@ class TrendStrategy(Strategy):
         self.venue = self.instrument_id.venue
         self._closes: deque[float] = deque(maxlen=max(config.lookbacks) + 1)
         self.instrument = None
-        self.risk_state = None  # optional shared halt flag (injected by the runner)
+        self.risk_state = None  # optional shared control state (injected by the runner)
         self._protected_once = False  # force a protection refresh on first rebalance (restart cleanup)
+        self._last_flatten_seq = 0  # one-shot flatten-request bookkeeping
 
     def cfg(self) -> TrendStrategyConfig:
         return self.config
@@ -83,7 +84,7 @@ class TrendStrategy(Strategy):
             # next daily bar). A 60s timer in backtest sim-time would fire millions
             # of times, so it's gated to live (warmup_request).
             self.clock.set_timer(
-                name="halt_check", interval=timedelta(seconds=60), callback=self._on_halt_timer
+                name="control_check", interval=timedelta(seconds=60), callback=self._on_control_timer
             )
         self.subscribe_bars(self.bar_type)
 
@@ -103,24 +104,39 @@ class TrendStrategy(Strategy):
         self._closes.append(bar.close.as_double())
         self._rebalance()
 
-    def _halted(self) -> bool:
-        return self.risk_state is not None and getattr(self.risk_state, "halted", False)
-
     def _flatten_self(self) -> None:
         """Flatten this strategy's own position (correctly strategy-scoped)."""
         if self.portfolio.net_position(self.instrument_id) != 0:
             self.cancel_all_orders(self.instrument_id)
             self.close_all_positions(self.instrument_id)
 
-    def _on_halt_timer(self, event) -> None:  # noqa: ANN001 (live: prompt flatten on kill-switch)
-        if self._halted():
-            self._flatten_self()
+    def _apply_control(self) -> bool:
+        """Handle remote control (mode + one-shot flatten). Returns True if it
+        took over this cycle (kill/halt/just-flattened) — caller should not trade."""
+        rs = self.risk_state
+        if rs is None:
+            return False
+        # one-shot flatten request (acts once per new seq, in any mode)
+        if rs.flatten_seq > self._last_flatten_seq:
+            target_me = rs.flatten_target in ("all", self.instrument_id.symbol.value)
+            self._last_flatten_seq = rs.flatten_seq
+            if target_me:
+                self._flatten_self()
+                return True
+        if rs.mode == "kill":
+            self._flatten_self()  # flatten + stay out
+            return True
+        if rs.mode == "halt":
+            return True  # freeze: keep positions, no new orders
+        return False
+
+    def _on_control_timer(self, event) -> None:  # noqa: ANN001 (live: act on control within ~1 min)
+        self._apply_control()
 
     def _rebalance(self) -> None:
         if len(self._closes) <= max(self.cfg().lookbacks):
             return
-        if self._halted():
-            self._flatten_self()  # kill-switch active — flatten own book and stay out
+        if self._apply_control():
             return
 
         closes = np.array(self._closes, dtype=float)

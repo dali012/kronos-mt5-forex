@@ -193,6 +193,7 @@ def main() -> None:
             RiskManagerConfig(
                 venue=VENUE, instrument_ids=tuple(iids),
                 max_drawdown=args.max_drawdown, check_secs=86400,  # daily check in sim time
+                persist=False,  # don't touch the live bot's companion.db
             )
         )
         rm.risk_state = risk

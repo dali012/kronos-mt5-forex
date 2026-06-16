@@ -174,6 +174,7 @@ def build_node() -> TradingNode:
             instrument_ids=tuple(iids),
             max_drawdown=settings.binance_max_drawdown,
             check_secs=settings.binance_risk_check_secs,
+            db_path=settings.companion_db,
         )
     )
     rm.risk_state = risk

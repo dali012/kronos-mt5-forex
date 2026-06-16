@@ -68,13 +68,29 @@ Open `http://<vps-ip>:8000/` (append `?token=<API_TOKEN>` if you set one).
 - **Dashboard**: equity card + total/unrealized PnL, open positions, equity chart, recent fills, live/HALTED status.
 - **⛔ KILL button** (or `curl -X POST http://<vps-ip>:8000/kill?token=...`): flattens + halts. Persisted in the DB, so it **survives a bot restart** — the bot stays halted until you hit **Resume**.
 - **Telegram alerts**: each fill, drawdown crossing `API_DD_WARN_PCT`, and **bot-down** (no heartbeat for `API_BOT_DOWN_SECS` — detected by the API, since a dead bot can't alert).
-- **Telegram commands (two-way control — no URL/token needed)**: once `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` are set, message your bot:
-  - `/status` — live/halted + equity + uPnL
-  - `/positions` — open positions
-  - `/pnl` — total & unrealized P&L
-  - `/kill` — flatten + halt (panic)  ·  `/resume` — re-enable
-  - `/help`
-  Only **your** chat id is obeyed (that's the auth). Optional: send BotFather `/setcommands` and paste the list to get a tappable command menu.
+- **Telegram commands (two-way control — no URL/token needed)**: once `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` are set, message your bot (only **your** chat id is obeyed = the auth):
+  - `/status` `/positions` `/pnl` `/equity` (today/7d/all-time) `/chart` (equity sparkline)
+  - `/stops` `/orders` — protective orders + stop levels
+  - `/halt` (freeze, keep positions) · `/flatten` (close all, keep trading) · `/close BTC` (one)
+  - `/kill` (asks for **⚠️ Confirm/Cancel** inline buttons) · `/resume`
+  - `/help` shows tappable quick-action buttons.
+  - Pushes: a **daily summary** at `API_DAILY_SUMMARY_HOUR` UTC, plus fill / drawdown / bot-down alerts; stop-outs alert distinctly (🛑 STOPPED OUT).
+  - Optional: send BotFather `/setcommands` to get a tappable command menu — paste:
+    ```
+    status - live/halted + equity
+    positions - open positions
+    pnl - total & unrealized P&L
+    equity - today / 7d / all-time deltas
+    chart - equity sparkline
+    stops - stop-loss levels
+    orders - open orders
+    halt - freeze (keep positions)
+    flatten - close all (keep trading)
+    close - close one position (e.g. /close BTC)
+    kill - flatten + halt (panic)
+    resume - re-enable trading
+    help - command menu
+    ```
 - Open only the needed port; on a public VPS set `API_TOKEN` and consider a firewall / reverse-proxy with auth.
 
 ## 6. Safe restart / stop
