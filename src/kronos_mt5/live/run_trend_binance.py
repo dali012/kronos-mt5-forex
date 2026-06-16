@@ -39,6 +39,7 @@ from nautilus_trader.model.identifiers import InstrumentId, TraderId, Venue
 from nautilus_trader.trading.strategy import Strategy, StrategyConfig
 
 from config.settings import settings
+from kronos_mt5.companion.recorder import Companion, CompanionConfig
 from kronos_mt5.strategies.risk_manager import RiskManager, RiskManagerConfig, RiskState
 from kronos_mt5.strategies.trend_strategy import TrendStrategy, TrendStrategyConfig
 
@@ -177,6 +178,19 @@ def build_node() -> TradingNode:
     )
     rm.risk_state = risk
     node.trader.add_strategy(rm)
+
+    # companion bridge: writes state/equity/fills to SQLite + polls remote kill
+    companion = Companion(
+        CompanionConfig(
+            venue=VENUE,
+            instrument_ids=tuple(iids),
+            db_path=settings.companion_db,
+            snapshot_secs=settings.companion_snapshot_secs,
+            control_secs=settings.companion_control_secs,
+        )
+    )
+    companion.risk_state = risk
+    node.trader.add_strategy(companion)
 
     node.trader.add_strategy(
         Heartbeat(

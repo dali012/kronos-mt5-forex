@@ -61,6 +61,19 @@ class Settings(BaseSettings):
     binance_max_drawdown: float = 0.20   # portfolio kill-switch: flatten+halt below this DD
     binance_risk_check_secs: int = 300
 
+    # --- companion dashboard / API / alerts ---
+    companion_db: str = "logs/companion.db"
+    companion_snapshot_secs: int = 60
+    companion_control_secs: int = 15
+    api_host: str = "0.0.0.0"
+    api_port: int = 8000
+    api_token: str = ""                  # if set, required for /kill and /resume
+    api_poll_secs: int = 30              # alerter loop interval
+    api_dd_warn_pct: float = 0.10        # Telegram warn when drawdown crosses this
+    api_bot_down_secs: int = 600         # alert if no bot heartbeat for this long
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+
     def assert_binance_testnet(self) -> None:
         """Guardrail: refuse anything but the Binance TESTNET in this scaffold."""
         if self.binance_environment.upper() != "TESTNET":

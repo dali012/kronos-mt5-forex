@@ -1,0 +1,27 @@
+# systemd unit for the companion dashboard/API (reads the bot's SQLite store).
+# Install on the VPS (run FROM INSIDE the repo dir):
+#   REPO=$(pwd)
+#   sudo cp deploy/kronos-companion.service /etc/systemd/system/
+#   sudo sed -i "s#CHANGE_REPO_PATH#$REPO#g; s/CHANGE_USER/$USER/g" /etc/systemd/system/kronos-companion.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now kronos-companion
+#   # then open http://<vps-ip>:8000/   (set API_TOKEN in .env and use ?token=...)
+#
+# Runs independently of the bot — if the API dies the bot keeps trading, and vice
+# versa. The API also sends the Telegram alerts (incl. bot-down via heartbeat).
+[Unit]
+Description=Kronos trend companion API/dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=CHANGE_USER
+WorkingDirectory=CHANGE_REPO_PATH
+Environment=PYTHONPATH=src:.
+ExecStart=CHANGE_REPO_PATH/.venv/bin/python -m kronos_mt5.companion.run_api
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

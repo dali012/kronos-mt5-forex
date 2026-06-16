@@ -50,12 +50,33 @@ bash scripts/run_live.sh                 # auto-restarts on crash
 - **logs/supervisor.log** — restarts (only present with the tmux wrapper).
 - Binance testnet UI: 8 positions + 8 BUY-above reduce-only stops (one per coin).
 
-## 5. Safe restart / stop
+## 5. Companion dashboard + Telegram alerts + remote kill (optional but recommended)
+A separate FastAPI process gives a live dashboard (PnL, positions, equity curve,
+trade log), Telegram alerts, and a remote panic switch. It reads the bot's SQLite
+store — fully decoupled, so neither process can crash the other.
+
+```bash
+# Telegram (optional): create a bot via @BotFather, get your chat id from @userinfobot,
+# put TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID in .env. Set API_TOKEN too on a public VPS.
+REPO=$(pwd)
+sudo cp deploy/kronos-companion.service /etc/systemd/system/
+sudo sed -i "s#CHANGE_REPO_PATH#$REPO#g; s/CHANGE_USER/$USER/g" /etc/systemd/system/kronos-companion.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now kronos-companion
+```
+Open `http://<vps-ip>:8000/` (append `?token=<API_TOKEN>` if you set one).
+- **Dashboard**: equity card + total/unrealized PnL, open positions, equity chart, recent fills, live/HALTED status.
+- **⛔ KILL button** (or `curl -X POST http://<vps-ip>:8000/kill?token=...`): flattens + halts. Persisted in the DB, so it **survives a bot restart** — the bot stays halted until you hit **Resume**.
+- **Telegram alerts**: each fill, drawdown crossing `API_DD_WARN_PCT`, and **bot-down** (no heartbeat for `API_BOT_DOWN_SECS` — detected by the API, since a dead bot can't alert).
+- Open only the needed port; on a public VPS set `API_TOKEN` and consider a firewall / reverse-proxy with auth.
+
+## 6. Safe restart / stop
 - Restart is safe: the bot reconciles existing positions and re-asserts stops.
   - systemd: `sudo systemctl restart kronos-trend`
 - Stop (flattens on graceful shutdown):
   - systemd: `sudo systemctl stop kronos-trend`
   - tmux wrapper: Ctrl-C inside the tmux session.
+- Remote halt without stopping the process: the **KILL** button / `/kill` endpoint.
 
 ## Notes
 - TESTNET only — the runner refuses `BINANCE_ENVIRONMENT=LIVE` by design.
