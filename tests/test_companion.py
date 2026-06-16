@@ -98,9 +98,10 @@ def test_telegram_command_replies(tmp_path, monkeypatch):
     store.heartbeat(p)
 
     assert "/status" in api._command_reply("/help")
-    assert "equity" in api._command_reply("/status@mybot")          # handles /cmd@botname
-    assert "BTCUSDT" in api._command_reply("/positions")
-    assert "PnL" in api._command_reply("/pnl")
+    status = api._command_reply("/status@mybot")                    # handles /cmd@botname
+    assert "Equity" in status and "LIVE" in status
+    assert "BTC" in api._command_reply("/positions")                # shortened coin name
+    assert "Total" in api._command_reply("/pnl")
     api._command_reply("/kill")
     assert store.is_halted(p) is True
     api._command_reply("/resume")

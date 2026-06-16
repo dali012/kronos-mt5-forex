@@ -105,14 +105,26 @@ _TG_BASE = (
     else None
 )
 HELP = (
-    "Kronos trend bot commands:\n"
-    "/status — live/halted + equity + uPnL\n"
-    "/positions — open positions\n"
-    "/pnl — total & unrealized P&L\n"
-    "/kill — flatten + halt (panic)\n"
-    "/resume — re-enable trading\n"
-    "/help — this message"
+    "<b>🤖 Kronos Trend — commands</b>\n\n"
+    "📊 /status — live/halted + equity\n"
+    "📦 /positions — open positions\n"
+    "💹 /pnl — total &amp; unrealized P&amp;L\n"
+    "🛑 /kill — flatten + halt (panic)\n"
+    "▶️ /resume — re-enable trading\n"
+    "ℹ️ /help — this message"
 )
+
+
+def _usd(x: float) -> str:
+    return f"${x:,.0f}"
+
+
+def _signed(x: float) -> str:
+    return f"{'+' if x >= 0 else '-'}${abs(x):,.0f}"
+
+
+def _coin(symbol: str) -> str:
+    return symbol.split("USDT")[0]  # "BTCUSDT-PERP" -> "BTC"
 
 
 def _command_reply(text: str) -> str:
@@ -120,36 +132,48 @@ def _command_reply(text: str) -> str:
     snap = store.read_snapshot(DB) or {}
     if cmd in ("start", "help"):
         return HELP
+
     if cmd == "status":
         alive, _ = _alive()
-        flag = " · ⛔HALTED" if store.is_halted(DB) else ""
-        return (
-            f"{'🟢 live' if alive else '🔴 DOWN'}{flag}\n"
-            f"equity ${snap.get('equity', 0):,.0f} | uPnL ${snap.get('unrealized', 0):+,.0f} "
-            f"| open {snap.get('n_open', 0)}"
+        state = "⛔ HALTED" if store.is_halted(DB) else ("🟢 LIVE" if alive else "🔴 DOWN")
+        body = (
+            f"{'Equity':<9}{_usd(snap.get('equity', 0)):>11}\n"
+            f"{'uPnL':<9}{_signed(snap.get('unrealized', 0)):>11}\n"
+            f"{'Open':<9}{snap.get('n_open', 0):>11}"
         )
+        return f"<b>🤖 Kronos Trend — {state}</b>\n<pre>{body}</pre>"
+
     if cmd == "positions":
         pos = snap.get("positions", [])
         if not pos:
-            return "flat (no open positions)"
-        return "\n".join(f"{p['symbol']} {p['qty']:+.4f}  uPnL ${p['unrealized']:+.0f}" for p in pos)
+            return "<b>📦 Positions</b>\n<i>flat — no open positions</i>"
+        head = f"{'COIN':<5}{'QTY':>11}{'uPnL':>8}"
+        rows = "\n".join(
+            f"{_coin(p['symbol']):<5}{p['qty']:>11.4f}{_signed(p['unrealized']):>8}" for p in pos
+        )
+        return f"<b>📦 Open positions ({len(pos)})</b>\n<pre>{head}\n{rows}</pre>"
+
     if cmd == "pnl":
         eq = store.read_equity(limit=100000, db_path=DB)
         base = eq[0]["equity"] if eq else snap.get("equity", 0)
         equity = snap.get("equity", 0)
         total = equity - base
         pct = (total / base * 100) if base else 0
-        return (
-            f"equity ${equity:,.0f}\ntotal PnL ${total:+,.0f} ({pct:+.2f}%)\n"
-            f"unrealized ${snap.get('unrealized', 0):+,.0f}"
+        arrow = "📈" if total > 0 else ("📉" if total < 0 else "➖")
+        body = (
+            f"{'Equity':<11}{_usd(equity):>11}\n"
+            f"{'Total':<11}{_signed(total):>11} ({pct:+.2f}%)\n"
+            f"{'Unrealized':<11}{_signed(snap.get('unrealized', 0)):>11}"
         )
+        return f"<b>{arrow} P&amp;L</b>\n<pre>{body}</pre>"
+
     if cmd == "kill":
         store.set_halt(True, DB)
-        return "🛑 KILL — bot flattening + halting"
+        return "🛑 <b>KILL</b> — bot flattening + halting all positions"
     if cmd == "resume":
         store.set_halt(False, DB)
-        return "▶️ resumed — trading re-enabled"
-    return f"unknown command /{cmd} — try /help"
+        return "▶️ <b>Resumed</b> — trading re-enabled"
+    return f"❓ unknown command <code>/{cmd}</code> — try /help"
 
 
 async def _tg_post(client: httpx.AsyncClient, method: str, **params) -> dict:
@@ -165,7 +189,8 @@ async def _telegram_commands() -> None:
     offset = 0
     async with httpx.AsyncClient(timeout=40) as client:
         with contextlib.suppress(Exception):
-            await _tg_post(client, "sendMessage", chat_id=owner, text="🤖 controller online — /help")
+            await _tg_post(client, "sendMessage", chat_id=owner,
+                           text="🤖 <b>controller online</b> — /help", parse_mode="HTML")
         while True:
             try:
                 r = await client.get(
@@ -178,7 +203,8 @@ async def _telegram_commands() -> None:
                     chat = str((msg.get("chat") or {}).get("id", ""))
                     if not text.startswith("/") or chat != owner:
                         continue  # only respond to the owner's slash-commands
-                    await _tg_post(client, "sendMessage", chat_id=owner, text=_command_reply(text))
+                    await _tg_post(client, "sendMessage", chat_id=owner,
+                                   text=_command_reply(text), parse_mode="HTML")
             except Exception:  # noqa: BLE001
                 await asyncio.sleep(5)
 
