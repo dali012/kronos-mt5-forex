@@ -88,6 +88,8 @@ class TrendStrategy(Strategy):
         self.funding_rates = None  # optional shared FundingRateState (injected by the runner)
         self._dynamic_stop_pct = config.stop_pct
         self._pending_entry_order = None
+        self._protective_orders = []  # SL/TP orders we've submitted (may be in-flight)
+        self._protection_signature = None  # (side, qty, sl, tp) currently protecting
         self._protected_once = (
             False  # force a protection refresh on first rebalance (restart cleanup)
         )
@@ -248,14 +250,16 @@ class TrendStrategy(Strategy):
 
     def on_position_closed(self, event) -> None:  # noqa: ANN001
         if getattr(event, "instrument_id", None) == self.instrument_id:
-            self.cancel_all_orders(self.instrument_id)  # drop now-orphaned SL/TP
+            self._cancel_protective_orders()  # drop now-orphaned SL/TP
+            self._protection_signature = None
 
     def _refresh_protection(self, entry_fallback: float | None = None) -> None:
         """Reconcile reduce-only protection to the real open position."""
         units = float(self.portfolio.net_position(self.instrument_id))
         if units == 0:
             if self.cfg().use_stop_loss or self.cfg().use_take_profit:
-                self.cancel_all_orders(self.instrument_id)
+                self._cancel_protective_orders()
+                self._protection_signature = None
             return
         entry = entry_fallback
         open_pos = self.cache.positions_open(instrument_id=self.instrument_id)
@@ -409,54 +413,99 @@ class TrendStrategy(Strategy):
         except (TypeError, ValueError):
             return 0.0
 
+    def _has_live_protection(self) -> bool:
+        return any(not getattr(o, "is_closed", False) for o in self._protective_orders)
+
+    def _cancel_protective_orders(self) -> None:
+        """Cancel every protective order we own, INCLUDING in-flight ones, plus any
+        stray reduce-only orders in the cache (left by a prior run / reconciliation).
+
+        cancel_order works on submitted-but-not-yet-accepted orders; cancel_all_orders
+        only targets already-open ones, which is why a racy cancel-then-resubmit
+        stacked duplicates."""
+        seen = set()
+        for order in list(self._protective_orders):
+            if not getattr(order, "is_closed", False):
+                with contextlib.suppress(Exception):
+                    self.cancel_order(order)
+            seen.add(order.client_order_id)
+        self._protective_orders.clear()
+        for order in self.cache.orders_open(instrument_id=self.instrument_id):
+            if order.client_order_id in seen or not getattr(order, "is_reduce_only", False):
+                continue
+            with contextlib.suppress(Exception):
+                self.cancel_order(order)
+
     def _set_protection(self, position_units: float, entry_price: float) -> None:
-        """(Re)place reduce-only SL/TP once per rebalance, sized & sided to the
-        actual open position. Driven by signed net position (not pos.quantity,
-        which is absolute), so stops don't accumulate or mismatch after fills."""
+        """Idempotently keep exactly one reduce-only SL (+ optional TP) on the open
+        position. Sized/sided from the signed net position. Safe to call repeatedly
+        in a burst (restart reconciliation, overlapping fill/position events): it
+        re-places only when the desired protection actually changes, and tracks its
+        own orders so it can cancel in-flight ones rather than stacking duplicates."""
         if not (self.cfg().use_stop_loss or self.cfg().use_take_profit):
             return
-        self.cancel_all_orders(self.instrument_id)  # clear previous protection
         if position_units == 0:
+            self._cancel_protective_orders()
+            self._protection_signature = None
             return
         is_long = position_units > 0
         close_side = OrderSide.SELL if is_long else OrderSide.BUY  # close = opposite side
         qty = self.instrument.make_qty(abs(position_units))
         if qty <= self.instrument.make_qty(0):
             return
+        sl_price = None
+        if self.cfg().use_stop_loss:
+            # long: stop BELOW; short: stop ABOVE
+            sl = (
+                entry_price * (1 - self._dynamic_stop_pct)
+                if is_long
+                else entry_price * (1 + self._dynamic_stop_pct)
+            )
+            sl_price = self.instrument.make_price(sl)
+        tp_price = None
+        if self.cfg().use_take_profit:
+            tp = (
+                entry_price * (1 + self.cfg().tp_pct)
+                if is_long
+                else entry_price * (1 - self.cfg().tp_pct)
+            )
+            tp_price = self.instrument.make_price(tp)
+
+        signature = (
+            close_side.value,
+            str(qty),
+            str(sl_price) if sl_price is not None else None,
+            str(tp_price) if tp_price is not None else None,
+        )
+        if signature == self._protection_signature and self._has_live_protection():
+            return  # correct protection already working/in-flight — don't duplicate
+
+        self._cancel_protective_orders()
         try:
-            if self.cfg().use_stop_loss:
-                # long: stop BELOW; short: stop ABOVE
-                sl = (
-                    entry_price * (1 - self._dynamic_stop_pct)
-                    if is_long
-                    else entry_price * (1 + self._dynamic_stop_pct)
+            if sl_price is not None:
+                order = self.order_factory.stop_market(
+                    instrument_id=self.instrument_id,
+                    order_side=close_side,
+                    quantity=qty,
+                    trigger_price=sl_price,
+                    reduce_only=True,
                 )
-                self.submit_order(
-                    self.order_factory.stop_market(
-                        instrument_id=self.instrument_id,
-                        order_side=close_side,
-                        quantity=qty,
-                        trigger_price=self.instrument.make_price(sl),
-                        reduce_only=True,
-                    )
+                self._protective_orders.append(order)
+                self.submit_order(order)
+            if tp_price is not None:
+                order = self.order_factory.limit(
+                    instrument_id=self.instrument_id,
+                    order_side=close_side,
+                    quantity=qty,
+                    price=tp_price,
+                    reduce_only=True,
                 )
-            if self.cfg().use_take_profit:
-                tp = (
-                    entry_price * (1 + self.cfg().tp_pct)
-                    if is_long
-                    else entry_price * (1 - self.cfg().tp_pct)
-                )
-                self.submit_order(
-                    self.order_factory.limit(
-                        instrument_id=self.instrument_id,
-                        order_side=close_side,
-                        quantity=qty,
-                        price=self.instrument.make_price(tp),
-                        reduce_only=True,
-                    )
-                )
+                self._protective_orders.append(order)
+                self.submit_order(order)
+            self._protection_signature = signature
         except Exception as exc:  # noqa: BLE001
             self.log.warning(f"protection placement failed for {self.instrument_id}: {exc!r}")
+            self._protection_signature = None
 
     def _equity(self) -> float:
         account = self.portfolio.account(self.venue)
