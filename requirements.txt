@@ -20,6 +20,7 @@ safetensors
 pydantic>=2
 pydantic-settings>=2
 python-dotenv
+pillow
 
 # --- Analytics / monitoring ---
 quantstats

@@ -11,6 +11,7 @@ Runs as a SEPARATE process next to the bot, reading the shared SQLite store.
 A background loop sends Telegram alerts: new fills, drawdown-threshold crossings,
 and bot-death (heartbeat staleness — which must be detected OUTSIDE the bot).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -24,6 +25,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from config.settings import settings
+from kronos_mt5.companion.cards import render_positions_card
 from kronos_mt5.companion import store
 from kronos_mt5.companion.notify import Telegram
 
@@ -40,6 +42,7 @@ def require_auth(creds: HTTPAuthorizationCredentials | None = Depends(_bearer)) 
             detail="missing or invalid bearer token",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
 
 DB = settings.companion_db
 tg = Telegram(settings.telegram_bot_token, settings.telegram_chat_id)
@@ -67,9 +70,15 @@ async def _alerter() -> None:
 
 def _check_fills() -> None:
     last = int(store.get_kv("alert_last_fill_rowid", "0", DB) or 0)
-    new = sorted(store.read_fills(limit=500, after_rowid=last, db_path=DB), key=lambda f: f["rowid"])
+    new = sorted(
+        store.read_fills(limit=500, after_rowid=last, db_path=DB), key=lambda f: f["rowid"]
+    )
     for f in new:
-        icon = "🛑 STOPPED OUT" if f.get("kind") == "STOP" else ("🎯 TP" if f.get("kind") == "TP" else "✅ FILL")
+        icon = (
+            "🛑 STOPPED OUT"
+            if f.get("kind") == "STOP"
+            else ("🎯 TP" if f.get("kind") == "TP" else "✅ FILL")
+        )
         tg.send(f"{icon} {f['symbol']} {f['side']} {f['qty']:g} @ {f['price']:g}")
         store.set_kv("alert_last_fill_rowid", str(f["rowid"]), DB)
 
@@ -118,18 +127,30 @@ HELP = (
     "🛑 /kill — flatten + halt  ·  ▶️ /resume\n"
     "ℹ️ /help"
 )
-QUICK_KB = {"inline_keyboard": [
-    [{"text": "📊 Status", "callback_data": "cmd:status"},
-     {"text": "📦 Positions", "callback_data": "cmd:positions"}],
-    [{"text": "💹 PnL", "callback_data": "cmd:pnl"},
-     {"text": "🛡 Stops", "callback_data": "cmd:stops"}],
-    [{"text": "📈 Chart", "callback_data": "cmd:chart"},
-     {"text": "⛔ Kill", "callback_data": "cmd:kill"}],
-]}
-KILL_KB = {"inline_keyboard": [[
-    {"text": "🛑 Confirm KILL", "callback_data": "kill:yes"},
-    {"text": "Cancel", "callback_data": "kill:no"},
-]]}
+QUICK_KB = {
+    "inline_keyboard": [
+        [
+            {"text": "📊 Status", "callback_data": "cmd:status"},
+            {"text": "📦 Positions", "callback_data": "cmd:positions"},
+        ],
+        [
+            {"text": "💹 PnL", "callback_data": "cmd:pnl"},
+            {"text": "🛡 Stops", "callback_data": "cmd:stops"},
+        ],
+        [
+            {"text": "📈 Chart", "callback_data": "cmd:chart"},
+            {"text": "⛔ Kill", "callback_data": "cmd:kill"},
+        ],
+    ]
+}
+KILL_KB = {
+    "inline_keyboard": [
+        [
+            {"text": "🛑 Confirm KILL", "callback_data": "kill:yes"},
+            {"text": "Cancel", "callback_data": "kill:no"},
+        ]
+    ]
+}
 
 
 def _usd(x: float) -> str:
@@ -154,6 +175,15 @@ def _sparkline(vals: list[float], width: int = 24) -> str:
     return "".join(blocks[min(7, int((v - lo) / rng * 7))] for v in vals)
 
 
+def _pnl_from_snapshot(snap: dict) -> tuple[float, float, float]:
+    eq = store.read_equity(limit=200000, db_path=DB)
+    equity = float(snap.get("equity", 0) or 0)
+    base = eq[0]["equity"] if eq else equity
+    total = equity - base
+    pct = (total / base * 100) if base else 0
+    return equity, total, pct
+
+
 def _equity_summary() -> str:
     eq = store.read_equity(limit=200000, db_path=DB)
     if not eq:
@@ -169,11 +199,15 @@ def _equity_summary() -> str:
     def row(lbl: str, base: float) -> str:
         d = now - base
         pct = (d / base * 100) if base else 0
-        return f"{lbl:<8}{_signed(d):>10} ({pct:+.1f}%)"
+        return f"<b>{lbl}</b>: {_signed(d)} ({pct:+.1f}%)"
 
-    body = (f"{'Equity':<8}{_usd(now):>10}\n" + row("Today", prior(24)) + "\n"
-            + row("7d", prior(24 * 7)) + "\n" + row("AllTime", eq[0]["equity"]))
-    return f"<b>💹 Equity</b>\n<pre>{body}</pre>"
+    return (
+        "<b>💹 Equity</b>\n\n"
+        f"<b>Now</b>: {_usd(now)}\n"
+        f"{row('Today', prior(24))}\n"
+        f"{row('7d', prior(24 * 7))}\n"
+        f"{row('All time', eq[0]['equity'])}"
+    )
 
 
 def _chart_text() -> str:
@@ -182,8 +216,12 @@ def _chart_text() -> str:
         return "<i>not enough data for a chart yet</i>"
     vals = [e["equity"] for e in eq]
     pct = ((vals[-1] / vals[0] - 1) * 100) if vals[0] else 0
-    return (f"<b>📈 Equity</b>\n<pre>{_sparkline(vals)}\n"
-            f"${min(vals):,.0f} … ${max(vals):,.0f}   now ${vals[-1]:,.0f} ({pct:+.1f}%)</pre>")
+    return (
+        f"<b>📈 Equity</b>\n<code>{_sparkline(vals)}</code>\n\n"
+        f"<b>Low</b>: ${min(vals):,.0f}\n"
+        f"<b>High</b>: ${max(vals):,.0f}\n"
+        f"<b>Now</b>: ${vals[-1]:,.0f} ({pct:+.1f}%)"
+    )
 
 
 def _stops_text(snap: dict) -> str:
@@ -205,7 +243,8 @@ def _orders_text(snap: dict) -> str:
     if not orders:
         return "<b>📋 Orders</b>\n<i>none</i>"
     rows = "\n".join(
-        f"{_coin(x['symbol']):<5}{x['type'][:6]:<7}{x['side'][:4]:<5}{x['qty']:>10.4f}" for x in orders
+        f"{_coin(x['symbol']):<5}{x['type'][:6]:<7}{x['side'][:4]:<5}{x['qty']:>10.4f}"
+        for x in orders
     )
     return f"<b>📋 Open orders ({len(orders)})</b>\n<pre>{rows}</pre>"
 
@@ -223,20 +262,29 @@ def _daily_summary_text() -> str:
     pct = (day / base * 100) if base else 0
     peak = max(e["equity"] for e in eq)
     ddv = (now / peak - 1) * 100 if peak else 0
-    n24 = sum(1 for f in store.read_fills(limit=500, db_path=DB)
-              if datetime.fromisoformat(f["ts"]) >= cut)
+    n24 = sum(
+        1 for f in store.read_fills(limit=500, db_path=DB) if datetime.fromisoformat(f["ts"]) >= cut
+    )
     arrow = "📈" if day >= 0 else "📉"
-    body = (f"{'Equity':<10}{_usd(now):>10}\n{'Day PnL':<10}{_signed(day):>10} ({pct:+.1f}%)\n"
-            f"{'Drawdown':<10}{ddv:>9.1f}%\n{'Trades24h':<10}{n24:>10}\n"
-            f"{'Open':<10}{snap.get('n_open', 0):>10}")
-    return f"<b>{arrow} Daily summary</b>\n<pre>{body}</pre>"
+    return (
+        f"<b>{arrow} Daily summary</b>\n\n"
+        f"<b>Equity</b>: {_usd(now)}\n"
+        f"<b>Day PnL</b>: {_signed(day)} ({pct:+.1f}%)\n"
+        f"<b>Drawdown</b>: {ddv:.1f}%\n"
+        f"<b>Trades 24h</b>: {n24}\n"
+        f"<b>Open</b>: {snap.get('n_open', 0)}"
+    )
+
+
+def _command_parts(text: str) -> tuple[str, list[str]]:
+    parts = text.lstrip("/").split()
+    cmd = parts[0].split("@")[0].lower() if parts else ""
+    return cmd, parts[1:]
 
 
 def _handle(text: str) -> tuple[str, dict | None]:
     """Map a /command (with optional args) to (reply_html, inline_keyboard|None)."""
-    parts = text.lstrip("/").split()
-    cmd = parts[0].split("@")[0].lower() if parts else ""
-    args = parts[1:]
+    cmd, args = _command_parts(text)
     snap = store.read_snapshot(DB) or {}
 
     if cmd in ("start", "help", "menu"):
@@ -244,30 +292,38 @@ def _handle(text: str) -> tuple[str, dict | None]:
     if cmd == "status":
         alive, _ = _alive()
         mode = store.get_mode(DB)
-        state = {"kill": "🛑 KILLED", "halt": "⏸ HALTED"}.get(mode, "🟢 LIVE" if alive else "🔴 DOWN")
-        body = (f"{'Equity':<9}{_usd(snap.get('equity', 0)):>11}\n"
-                f"{'uPnL':<9}{_signed(snap.get('unrealized', 0)):>11}\n"
-                f"{'Open':<9}{snap.get('n_open', 0):>11}")
-        return f"<b>🤖 Kronos Trend — {state}</b>\n<pre>{body}</pre>", QUICK_KB
+        state = {"kill": "🛑 KILLED", "halt": "⏸ HALTED"}.get(
+            mode, "🟢 LIVE" if alive else "🔴 DOWN"
+        )
+        equity, total, pct = _pnl_from_snapshot(snap)
+        updated = datetime.now(timezone.utc).strftime("%H:%M UTC")
+        return (
+            f"<b>🤖 Kronos Trend</b> | {state}\n"
+            f"Updated {updated} | open {snap.get('n_open', 0)}\n\n"
+            f"<b>Equity</b>: {_usd(equity)}\n"
+            f"<b>Total P&amp;L</b>: {_signed(total)} ({pct:+.2f}%)\n"
+            f"<b>Unrealized</b>: {_signed(snap.get('unrealized', 0))}",
+            QUICK_KB,
+        )
     if cmd == "positions":
         pos = snap.get("positions", [])
         if not pos:
             return "<b>📦 Positions</b>\n<i>flat</i>", None
         head = f"{'COIN':<5}{'QTY':>11}{'uPnL':>8}"
-        rows = "\n".join(f"{_coin(p['symbol']):<5}{p['qty']:>11.4f}{_signed(p['unrealized']):>8}"
-                         for p in pos)
+        rows = "\n".join(
+            f"{_coin(p['symbol']):<5}{p['qty']:>11.4f}{_signed(p['unrealized']):>8}" for p in pos
+        )
         return f"<b>📦 Open positions ({len(pos)})</b>\n<pre>{head}\n{rows}</pre>", None
     if cmd == "pnl":
-        eq = store.read_equity(limit=200000, db_path=DB)
-        base = eq[0]["equity"] if eq else snap.get("equity", 0)
-        equity = snap.get("equity", 0)
-        total = equity - base
-        pct = (total / base * 100) if base else 0
+        equity, total, pct = _pnl_from_snapshot(snap)
         arrow = "📈" if total > 0 else ("📉" if total < 0 else "➖")
-        body = (f"{'Equity':<11}{_usd(equity):>11}\n"
-                f"{'Total':<11}{_signed(total):>11} ({pct:+.2f}%)\n"
-                f"{'Unrealized':<11}{_signed(snap.get('unrealized', 0)):>11}")
-        return f"<b>{arrow} P&amp;L</b>\n<pre>{body}</pre>", None
+        return (
+            f"<b>{arrow} P&amp;L</b>\n\n"
+            f"<b>Equity</b>: {_usd(equity)}\n"
+            f"<b>Total</b>: {_signed(total)} ({pct:+.2f}%)\n"
+            f"<b>Unrealized</b>: {_signed(snap.get('unrealized', 0))}",
+            None,
+        )
     if cmd == "equity":
         return _equity_summary(), None
     if cmd == "chart":
@@ -289,8 +345,10 @@ def _handle(text: str) -> tuple[str, dict | None]:
         if not args:
             return "usage: <code>/close BTC</code>", None
         coin = args[0].upper().replace("USDT", "").replace("-PERP", "")
-        sym = next((p["symbol"] for p in snap.get("positions", [])
-                    if _coin(p["symbol"]).upper() == coin), None)
+        sym = next(
+            (p["symbol"] for p in snap.get("positions", []) if _coin(p["symbol"]).upper() == coin),
+            None,
+        )
         if not sym:
             return f"no open position for <b>{coin}</b>", None
         store.request_flatten(sym, DB)
@@ -300,10 +358,28 @@ def _handle(text: str) -> tuple[str, dict | None]:
     return f"❓ unknown command <code>/{cmd}</code> — try /help", None
 
 
-async def _tg_post(client: httpx.AsyncClient, method: str, **params) -> dict:
+def _positions_caption(snap: dict) -> str:
+    pos = snap.get("positions", [])
+    total = sum(float(p.get("unrealized") or 0) for p in pos)
+    qtys = [float(p.get("qty") or 0) for p in pos]
+    if qtys and all(q < 0 for q in qtys):
+        side = "Short basket"
+    elif qtys and all(q > 0 for q in qtys):
+        side = "Long basket"
+    else:
+        side = "Mixed basket"
+    return f"<b>Positions</b> | {len(pos)} open\n{side} | uPnL <b>{_signed(total)}</b>"
+
+
+async def _tg_post(
+    client: httpx.AsyncClient,
+    method: str,
+    files: dict | None = None,
+    **params,
+) -> dict:
     if isinstance(params.get("reply_markup"), (dict, list)):
         params["reply_markup"] = json.dumps(params["reply_markup"])
-    r = await client.post(f"{_TG_BASE}/{method}", data=params)
+    r = await client.post(f"{_TG_BASE}/{method}", data=params, files=files)
     return r.json()
 
 
@@ -312,6 +388,39 @@ async def _send(client: httpx.AsyncClient, owner: str, text: str, kb: dict | Non
     if kb:
         params["reply_markup"] = kb
     await _tg_post(client, "sendMessage", **params)
+
+
+async def _send_photo(
+    client: httpx.AsyncClient,
+    owner: str,
+    photo: bytes,
+    caption: str,
+    kb: dict | None = None,
+) -> dict:
+    params = {"chat_id": owner, "caption": caption, "parse_mode": "HTML"}
+    if kb:
+        params["reply_markup"] = kb
+    files = {"photo": ("positions.png", photo, "image/png")}
+    return await _tg_post(client, "sendPhoto", files=files, **params)
+
+
+async def _send_positions_photo(client: httpx.AsyncClient, owner: str) -> bool:
+    snap = store.read_snapshot(DB) or {}
+    if not snap.get("positions"):
+        return False
+    try:
+        card = render_positions_card(snap)
+        result = await _send_photo(client, owner, card, _positions_caption(snap))
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(result.get("ok"))
+
+
+async def _send_command(client: httpx.AsyncClient, owner: str, text: str) -> None:
+    cmd, _ = _command_parts(text)
+    if cmd == "positions" and await _send_positions_photo(client, owner):
+        return
+    await _send(client, owner, *_handle(text))
 
 
 async def _telegram_commands() -> None:
@@ -325,7 +434,9 @@ async def _telegram_commands() -> None:
             await _send(client, owner, "🤖 <b>controller online</b> — /help", QUICK_KB)
         while True:
             try:
-                r = await client.get(f"{_TG_BASE}/getUpdates", params={"offset": offset, "timeout": 30})
+                r = await client.get(
+                    f"{_TG_BASE}/getUpdates", params={"offset": offset, "timeout": 30}
+                )
                 for upd in r.json().get("result", []):
                     offset = upd["update_id"] + 1
                     if "callback_query" in upd:
@@ -333,8 +444,11 @@ async def _telegram_commands() -> None:
                     else:
                         msg = upd.get("message") or {}
                         text = (msg.get("text") or "").strip()
-                        if text.startswith("/") and str((msg.get("chat") or {}).get("id", "")) == owner:
-                            await _send(client, owner, *_handle(text))
+                        if (
+                            text.startswith("/")
+                            and str((msg.get("chat") or {}).get("id", "")) == owner
+                        ):
+                            await _send_command(client, owner, text)
             except Exception:  # noqa: BLE001
                 await asyncio.sleep(5)
 
@@ -352,7 +466,7 @@ async def _on_callback(client: httpx.AsyncClient, owner: str, cq: dict) -> None:
     elif data == "kill:no":
         await _send(client, owner, "✅ cancelled — bot still running")
     elif data.startswith("cmd:"):
-        await _send(client, owner, *_handle("/" + data[4:]))
+        await _send_command(client, owner, "/" + data[4:])
 
 
 async def _daily_summary() -> None:
@@ -363,7 +477,10 @@ async def _daily_summary() -> None:
         with contextlib.suppress(Exception):
             now = datetime.now(timezone.utc)
             today = now.date().isoformat()
-            if now.hour >= settings.api_daily_summary_hour and store.get_kv("last_summary_day", "", DB) != today:
+            if (
+                now.hour >= settings.api_daily_summary_hour
+                and store.get_kv("last_summary_day", "", DB) != today
+            ):
                 store.set_kv("last_summary_day", today, DB)
                 tg.send(_daily_summary_text())
         await asyncio.sleep(300)
