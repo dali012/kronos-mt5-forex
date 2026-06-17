@@ -224,9 +224,12 @@ class TrendStrategy(Strategy):
 
     # --- protective orders -------------------------------------------------
     def on_order_filled(self, event) -> None:  # noqa: ANN001
+        # Protection is refreshed from position events (opened/changed/closed) only.
+        # Refreshing here too double-fires per fill: cancel_all can't catch the
+        # still-SUBMITTED stop from the position-event call, so a duplicate
+        # reduce-only stop reaches the exchange (16 stops for 8 positions).
         if getattr(event, "instrument_id", None) == self.instrument_id:
             self._pending_entry_order = None
-            self._refresh_protection()
 
     def on_order_canceled(self, event) -> None:  # noqa: ANN001
         if (
