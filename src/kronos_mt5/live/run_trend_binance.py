@@ -133,7 +133,8 @@ class FundingRateUpdaterConfig(StrategyConfig, frozen=True):
 class FundingRateUpdater(Strategy):
     def __init__(self, config: FundingRateUpdaterConfig, state: FundingRateState) -> None:
         super().__init__(config)
-        self.state = state
+        # NB: not `self.state` — Component has a read-only `.state` (lifecycle) property.
+        self.funding_state = state
 
     def on_start(self) -> None:
         self._refresh(None)
@@ -151,7 +152,7 @@ class FundingRateUpdater(Strategy):
                     f"{PREMIUM_INDEX_URL}?{params}", timeout=10
                 ) as response:
                     payload = json.loads(response.read().decode("utf-8"))
-                self.state.rates[symbol] = float(payload["lastFundingRate"])
+                self.funding_state.rates[symbol] = float(payload["lastFundingRate"])
             except Exception as exc:  # noqa: BLE001
                 self.log.warning(f"funding refresh failed for {symbol}: {exc!r}")
 
