@@ -1,6 +1,7 @@
 """Central configuration. All tunables and secrets load from the environment
 (.env). Nothing here should be hardcoded in strategy/adapter code.
 """
+
 from __future__ import annotations
 
 from pydantic import field_validator
@@ -55,11 +56,30 @@ class Settings(BaseSettings):
     binance_target_vol: float = 0.15
     binance_heartbeat_secs: int = 3600  # periodic equity/PnL log between daily rebalances
     # --- risk controls ---
-    binance_stop_pct: float = 0.20       # per-position stop-loss (exchange-native, reduce-only)
+    binance_stop_pct: float = 0.20  # per-position stop-loss (exchange-native, reduce-only)
+    binance_use_vol_stop: bool = False
+    binance_stop_vol_mult: float = 4.0
+    binance_min_stop_pct: float = 0.08
+    binance_max_stop_pct: float = 0.30
     binance_use_take_profit: bool = False
     binance_tp_pct: float = 0.50
-    binance_max_drawdown: float = 0.20   # portfolio kill-switch: flatten+halt below this DD
+    binance_flatten_on_stop: bool = False  # graceful process stop should not force-exit by default
+    binance_max_drawdown: float = 0.20  # portfolio kill-switch: flatten+halt below this DD
     binance_risk_check_secs: int = 300
+    binance_use_correlation_scaling: bool = False
+    binance_corr_window: int = 90
+    binance_corr_threshold: float = 0.65
+    binance_corr_min_scalar: float = 0.50
+    binance_funding_filter_enabled: bool = False
+    binance_funding_rate_limit: float = 0.0010
+    binance_funding_refresh_secs: int = 3600
+    binance_cost_aware_rebalance: bool = False
+    binance_round_trip_cost_bps: float = 8.0
+    binance_slippage_bps: float = 2.0
+    binance_use_patient_limit: bool = False
+    binance_patient_limit_offset_bps: float = 2.0
+    binance_patient_limit_timeout_secs: int = 300
+    binance_patient_limit_market_fallback: bool = True
 
     # --- companion dashboard / API / alerts ---
     companion_db: str = "logs/companion.db"
@@ -67,11 +87,11 @@ class Settings(BaseSettings):
     companion_control_secs: int = 15
     api_host: str = "0.0.0.0"
     api_port: int = 8000
-    api_token: str = ""                  # if set, required for /kill and /resume
-    api_poll_secs: int = 30              # alerter loop interval
-    api_dd_warn_pct: float = 0.10        # Telegram warn when drawdown crosses this
-    api_bot_down_secs: int = 600         # alert if no bot heartbeat for this long
-    api_daily_summary_hour: int = 0      # UTC hour for the daily Telegram digest (<0 = off)
+    api_token: str = ""  # if set, required for /kill and /resume
+    api_poll_secs: int = 30  # alerter loop interval
+    api_dd_warn_pct: float = 0.10  # Telegram warn when drawdown crosses this
+    api_bot_down_secs: int = 600  # alert if no bot heartbeat for this long
+    api_daily_summary_hour: int = 0  # UTC hour for the daily Telegram digest (<0 = off)
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
 
@@ -98,7 +118,9 @@ class Settings(BaseSettings):
         Fail loudly if anything looks like a live account.
         """
         if not self.demo_only:
-            raise RuntimeError("DEMO_ONLY is not set; live trading is not permitted by this scaffold.")
+            raise RuntimeError(
+                "DEMO_ONLY is not set; live trading is not permitted by this scaffold."
+            )
         if "demo" not in self.mt5_server.lower():
             raise RuntimeError(
                 f"Server '{self.mt5_server}' does not look like a demo server. Aborting for safety."

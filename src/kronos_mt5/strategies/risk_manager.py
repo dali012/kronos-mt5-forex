@@ -6,9 +6,12 @@ it survives a bot restart). The TrendStrategies read the shared RiskState and
 flatten + stop entering. Position-level stop-loss/take-profit live in TrendStrategy
 as exchange-native reduce-only orders.
 """
+
 from __future__ import annotations
 
 from datetime import timedelta
+
+import numpy as np
 
 from nautilus_trader.model.currencies import USDT
 from nautilus_trader.model.identifiers import InstrumentId, Venue
@@ -22,13 +25,39 @@ class RiskState:
     every few seconds; strategies read `mode` and the one-shot flatten request."""
 
     def __init__(self) -> None:
-        self.mode = "run"            # run | halt | kill
-        self.flatten_seq = 0         # bumped for one-shot flatten requests
+        self.mode = "run"  # run | halt | kill
+        self.flatten_seq = 0  # bumped for one-shot flatten requests
         self.flatten_target = "all"  # 'all' or a symbol like 'BTCUSDT-PERP'
+        self.returns_by_symbol: dict[str, np.ndarray] = {}
 
     @property
     def halted(self) -> bool:
         return self.mode in ("halt", "kill")
+
+    def update_returns(self, symbol: str, returns: np.ndarray) -> None:
+        self.returns_by_symbol[symbol] = np.asarray(returns, dtype=float)
+
+    def correlation_scalar(
+        self,
+        window: int,
+        threshold: float,
+        min_scalar: float,
+    ) -> float:
+        series = [r[-window:] for r in self.returns_by_symbol.values() if len(r) >= window]
+        if len(series) < 2:
+            return 1.0
+        arr = np.vstack(series)
+        corr = np.corrcoef(arr)
+        upper = corr[np.triu_indices_from(corr, k=1)]
+        upper = upper[np.isfinite(upper)]
+        if len(upper) == 0:
+            return 1.0
+        avg_corr = float(np.mean(np.abs(upper)))
+        if avg_corr <= threshold:
+            return 1.0
+        span = max(1e-9, 1.0 - threshold)
+        pressure = min(1.0, (avg_corr - threshold) / span)
+        return max(min_scalar, 1.0 - pressure * (1.0 - min_scalar))
 
 
 class RiskManagerConfig(StrategyConfig, frozen=True):
@@ -49,6 +78,12 @@ class RiskManager(Strategy):
         self.risk_state: RiskState | None = None
 
     def on_start(self) -> None:
+        if self.config.persist:
+            try:
+                store.init_db(self.config.db_path)
+                self._peak = float(store.get_kv("risk_peak_equity", "0", self.config.db_path) or 0)
+            except Exception as exc:  # noqa: BLE001
+                self.log.warning(f"load risk peak failed: {exc!r}")
         self.clock.set_timer(
             name="risk_check",
             interval=timedelta(seconds=self.config.check_secs),
@@ -71,7 +106,13 @@ class RiskManager(Strategy):
         equity = self._equity()
         if equity <= 0 or self.risk_state is None or self.risk_state.mode == "kill":
             return
-        self._peak = max(self._peak, equity)
+        if equity > self._peak:
+            self._peak = equity
+            if self.config.persist:
+                try:
+                    store.set_kv("risk_peak_equity", f"{self._peak:.8f}", self.config.db_path)
+                except Exception as exc:  # noqa: BLE001
+                    self.log.warning(f"persist risk peak failed: {exc!r}")
         dd = equity / self._peak - 1.0
         if dd <= -self.config.max_drawdown:
             self.risk_state.mode = "kill"

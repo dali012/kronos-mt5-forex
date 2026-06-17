@@ -49,6 +49,27 @@ drawdowns, cost‑sensitive (dies past ~40 bps round‑trip), and crypto‑tailw
 survivorship‑bias caveats apply. It's a *real, small* systematic edge — not a money
 printer — which is the honest ceiling for a retail‑accessible strategy.
 
+### Realism / robustness controls (measured, not assumed)
+
+Each control is **off by default** (defaults reproduce the headline Sharpe 1.05).
+Measured in the NautilusTrader engine, 12 coins, 2019→, 8 bps round‑trip + slippage:
+
+| Toggle | Sharpe | maxDD | Calmar | Effect |
+|---|---|---|---|---|
+| Baseline | 1.05 | −12.3% | 0.62 | reference |
+| + Funding costs | 0.89 | −13.6% | 0.50 | perp funding is a **real ~0.15‑Sharpe drag** — now modeled, not hidden |
+| + Vol‑adaptive stop | 1.06 | −11.8% | 0.65 | best stop variant (beats fixed 20%): lower DD, higher Calmar |
+| + Correlation scaling | 1.05 | −12.1% | 0.63 | trims gross when the book gets crowded |
+| + Cost‑aware rebalance | 1.06 | −12.3% | 0.62 | skips sub‑cost rebalances; ~neutral, less churn |
+| + Patient‑limit entries | 1.05 | −12.3% | 0.62 | no effect on daily‑bar sim (only shows on live microstructure) |
+| **Kill‑switch @ 10% DD** | 0.73 | **−10.1%** | 0.38 | caps drawdown as configured (trades return for safety) |
+
+Takeaways: **funding is the one that actually moves the number** — including it makes
+the backtest *more honest*, not better. Vol‑stop and correlation scaling are small net
+positives; cost‑aware rebalance is cheap insurance; patient‑limit is untestable offline
+(verify on testnet). Reproduce any row with `backtest/trend_engine.py` (see `--help`);
+funding rows need `scripts/download_funding.py` first.
+
 ## Architecture
 
 ```
@@ -70,7 +91,10 @@ printer — which is the honest ceiling for a retail‑accessible strategy.
   risk, blended into a portfolio. Exits on signal flip / vol resize.
 - **Risk** — per‑position **exchange‑native reduce‑only stop‑losses** (survive a
   crash/disconnect because they live on the exchange) + a **portfolio drawdown
-  kill‑switch** (flatten + halt, persisted so it survives restarts).
+  kill‑switch** (flatten + halt, persisted so it survives restarts). Optional,
+  off‑by‑default realism controls (funding costs, vol‑adaptive stops, correlation
+  scaling, cost‑aware rebalancing, patient‑limit entries) are each backtested above
+  and toggled in `.env`.
 - **Companion** — decoupled via SQLite so neither process can crash the other:
   dashboard, equity curve, trade log, bearer‑auth API, Telegram alerts (fills,
   drawdown, **bot‑down via heartbeat**), and **two‑way Telegram control**

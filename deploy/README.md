@@ -22,6 +22,31 @@ nano .env   # set BINANCE_API_KEY / BINANCE_API_SECRET (FUTURES testnet keys),
 Tune risk in `.env` if desired: `BINANCE_STOP_PCT`, `BINANCE_MAX_DRAWDOWN`,
 `BINANCE_TARGET_VOL`, `BINANCE_HEARTBEAT_SECS`.
 
+### Recommended forward-test config
+
+The realism toggles are **off by default** (defaults reproduce the headline
+backtest). Based on the feature matrix in the root [README](../README.md#realism--robustness-controls-measured-not-assumed),
+the recommended set for a testnet forward test is:
+
+```ini
+# Safe net-positives (backtested: lower DD / less churn, no downside):
+BINANCE_USE_VOL_STOP=true            # vol-adaptive stop — best stop variant
+BINANCE_USE_CORRELATION_SCALING=true # trim gross when the book gets crowded
+BINANCE_COST_AWARE_REBALANCE=true    # skip sub-cost rebalances
+
+# Live-only paths — enable to OBSERVE (a daily-bar backtest can't exercise them):
+BINANCE_USE_PATIENT_LIMIT=true       # post-only entry; MARKET_FALLBACK=true so it can't hang
+BINANCE_FUNDING_FILTER_ENABLED=true  # fights the real ~0.15-Sharpe funding drag
+
+BINANCE_FLATTEN_ON_STOP=false        # keep positions across restarts (stops live on the exchange)
+```
+
+Rationale: the first three are measured net-positives. The last two are the only
+code paths a daily-bar backtest *cannot* test (limit fills/timeouts, live funding
+polling) — turn them on specifically to watch them behave on paper money before
+trusting them. The full annotated block is in [`.env.example`](../.env.example).
+The kill-switch (`BINANCE_MAX_DRAWDOWN=0.20`) demonstrably caps drawdown — keep it on.
+
 ## 3a. Run under systemd (recommended — auto-restart + start on boot)
 Run these **from inside the repo dir** (it injects the real path, so it works
 whether the repo is at /root/dev/... or /home/you/...):
@@ -96,7 +121,8 @@ Open `http://<vps-ip>:8000/` (append `?token=<API_TOKEN>` if you set one).
 ## 6. Safe restart / stop
 - Restart is safe: the bot reconciles existing positions and re-asserts stops.
   - systemd: `sudo systemctl restart kronos-trend`
-- Stop (flattens on graceful shutdown):
+- Stop: leaves positions open by default (exchange-native stops keep protecting
+  them); set `BINANCE_FLATTEN_ON_STOP=true` to force-exit on graceful shutdown.
   - systemd: `sudo systemctl stop kronos-trend`
   - tmux wrapper: Ctrl-C inside the tmux session.
 - Remote halt without stopping the process: the **KILL** button / `/kill` endpoint.

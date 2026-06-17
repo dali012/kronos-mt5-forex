@@ -10,6 +10,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
+from backtest.trend import correlation_scalars, trend_returns
 from kronos_mt5.brain.kronos_predictor import ForecastResult
 from kronos_mt5.risk.sizing import Side, make_signal, position_size
 
@@ -49,6 +50,52 @@ def test_position_size_scales_with_risk():
 
 def test_position_size_zero_on_bad_stop():
     assert position_size(10_000, 0.005, 0.0, 1.0) == 0.0
+
+
+def test_trend_returns_apply_positive_funding_cost_to_longs():
+    idx = pd.date_range("2024-01-01", periods=20, freq="D", tz="UTC")
+    close = pd.Series(range(100, 120), index=idx, dtype=float)
+    funding = pd.Series(0.001, index=idx)
+
+    no_funding = trend_returns(
+        close,
+        lookbacks=[1],
+        vol_window=3,
+        target_vol=0.10,
+        max_leverage=1.0,
+        cost_bps=0.0,
+        funding=None,
+        ppy=365,
+    )["net"]
+    with_funding = trend_returns(
+        close,
+        lookbacks=[1],
+        vol_window=3,
+        target_vol=0.10,
+        max_leverage=1.0,
+        cost_bps=0.0,
+        funding=funding,
+        ppy=365,
+    )["net"]
+
+    assert with_funding.sum() < no_funding.sum()
+
+
+def test_correlation_scalars_reduce_clustered_portfolio():
+    idx = pd.date_range("2024-01-01", periods=20, freq="D")
+    net = pd.DataFrame(
+        {
+            "A": [0.01, -0.01] * 10,
+            "B": [0.02, -0.02] * 10,
+            "C": [0.015, -0.015] * 10,
+        },
+        index=idx,
+    )
+
+    scalars = correlation_scalars(net, window=6, threshold=0.5, min_scalar=0.25)
+
+    assert scalars.iloc[-1] < 1.0
+    assert scalars.iloc[-1] >= 0.25
 
 
 @pytest.mark.slow

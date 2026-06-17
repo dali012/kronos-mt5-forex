@@ -15,21 +15,25 @@ Design (no look-ahead, no parameter fitting -> whole sample is OOS-like):
 
 Run:  python backtest/trend.py --symbols EURUSD GBPUSD USDJPY BTCUSD
 """
+
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
 DATA = REPO / "data"
 REPORTS = REPO / "reports"
 PPY = 252  # periods per year (business-day daily)
 
 # realistic round-trip costs per unit of notional turnover, in bps
 DEFAULT_COST_BPS = {"EURUSD": 1.5, "GBPUSD": 2.0, "USDJPY": 2.0, "BTCUSD": 10.0}
+FUNDING_DIR = DATA / "funding"
 
 
 def load_close(symbol: str, tf: str = "1D") -> pd.Series:
@@ -42,6 +46,29 @@ def load_close(symbol: str, tf: str = "1D") -> pd.Series:
     return s[~s.index.duplicated(keep="last")].sort_index()
 
 
+def live_symbols() -> list[str]:
+    from config.settings import settings
+
+    return [s.strip() for s in settings.binance_symbols.split(",") if s.strip()]
+
+
+def load_funding(symbol: str, funding_dir: Path = FUNDING_DIR) -> pd.Series | None:
+    path = funding_dir / f"{symbol}_funding.csv"
+    if not path.exists():
+        return None
+    df = pd.read_csv(path)
+    if "fundingRate" not in df.columns:
+        raise ValueError(f"{path} missing fundingRate column")
+    if "fundingTime" in df.columns:
+        ts = pd.to_datetime(df["fundingTime"], unit="ms", utc=True)
+    elif "timestamp" in df.columns:
+        ts = pd.to_datetime(df["timestamp"], utc=True)
+    else:
+        raise ValueError(f"{path} missing fundingTime/timestamp column")
+    rates = pd.Series(df["fundingRate"].astype(float).values, index=ts)
+    return rates.groupby(rates.index.normalize()).sum().sort_index()
+
+
 def trend_returns(
     close: pd.Series,
     lookbacks: list[int],
@@ -49,6 +76,7 @@ def trend_returns(
     target_vol: float,
     max_leverage: float,
     cost_bps: float,
+    funding: pd.Series | None = None,
     ppy: int = PPY,
 ) -> pd.DataFrame:
     """Per-instrument vol-targeted trend-following net returns (no look-ahead).
@@ -72,7 +100,14 @@ def trend_returns(
     gross = w_lag * r
     turnover = (w - w.shift(1)).abs().fillna(0.0)
     cost = turnover * (cost_bps / 1e4)
-    net = (gross - cost).where(valid)  # NaN before live
+    funding_cost = 0.0
+    if funding is not None:
+        funding_by_day = funding.copy()
+        funding_by_day.index = pd.to_datetime(funding_by_day.index, utc=True).normalize()
+        close_days = pd.Series(pd.to_datetime(close.index, utc=True).normalize(), index=close.index)
+        daily_funding = close_days.map(funding_by_day).fillna(0.0)
+        funding_cost = w_lag * daily_funding
+    net = (gross - cost - funding_cost).where(valid)  # NaN before live
 
     return pd.DataFrame({"gross": gross, "net": net, "weight": w, "turnover": turnover})
 
@@ -97,19 +132,75 @@ def stats(returns: pd.Series, ppy: int = PPY) -> dict:
     }
 
 
+def correlation_scalars(
+    net: pd.DataFrame,
+    window: int,
+    threshold: float,
+    min_scalar: float,
+) -> pd.Series:
+    scalars = pd.Series(1.0, index=net.index)
+    for i in range(window, len(net)):
+        hist = net.iloc[i - window : i].dropna(axis=1, how="any")
+        if hist.shape[1] < 2:
+            continue
+        corr = hist.corr().to_numpy()
+        upper = corr[np.triu_indices_from(corr, k=1)]
+        upper = upper[np.isfinite(upper)]
+        if len(upper) == 0:
+            continue
+        avg_corr = float(np.mean(np.abs(upper)))
+        if avg_corr <= threshold:
+            continue
+        pressure = min(1.0, (avg_corr - threshold) / max(1e-9, 1.0 - threshold))
+        scalars.iloc[i] = max(min_scalar, 1.0 - pressure * (1.0 - min_scalar))
+    return scalars
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Multi-asset trend-following backtest")
     ap.add_argument("--symbols", nargs="+", default=["EURUSD", "GBPUSD", "USDJPY", "BTCUSD"])
+    ap.add_argument(
+        "--live-universe", action="store_true", help="use BINANCE_SYMBOLS from config/.env"
+    )
     ap.add_argument("--lookbacks", nargs="+", type=int, default=[21, 63, 126, 252])
     ap.add_argument("--vol-window", type=int, default=33)
-    ap.add_argument("--target-vol", type=float, default=0.15, help="annual vol target per instrument")
+    ap.add_argument(
+        "--target-vol", type=float, default=0.15, help="annual vol target per instrument"
+    )
     ap.add_argument("--max-leverage", type=float, default=2.0)
-    ap.add_argument("--port-target-vol", type=float, default=0.10, help="annual vol target for the blended portfolio")
-    ap.add_argument("--oos-split", default="2019-01-01", help="date splitting in-sample / out-of-sample")
-    ap.add_argument("--ppy", type=int, default=252, help="periods/year (252 FX business days, 365 crypto)")
-    ap.add_argument("--calendar", choices=["B", "D"], default="B", help="B=business days, D=all days (crypto)")
-    ap.add_argument("--crypto-cost-bps", type=float, default=8.0, help="round-trip cost for symbols not in the FX table")
+    ap.add_argument(
+        "--port-target-vol",
+        type=float,
+        default=0.10,
+        help="annual vol target for the blended portfolio",
+    )
+    ap.add_argument(
+        "--oos-split", default="2019-01-01", help="date splitting in-sample / out-of-sample"
+    )
+    ap.add_argument(
+        "--ppy", type=int, default=252, help="periods/year (252 FX business days, 365 crypto)"
+    )
+    ap.add_argument(
+        "--calendar", choices=["B", "D"], default="B", help="B=business days, D=all days (crypto)"
+    )
+    ap.add_argument(
+        "--crypto-cost-bps",
+        type=float,
+        default=8.0,
+        help="round-trip cost for symbols not in the FX table",
+    )
+    ap.add_argument(
+        "--funding-dir", type=Path, default=None, help="directory of SYMBOL_funding.csv files"
+    )
+    ap.add_argument("--use-correlation-scaling", action="store_true")
+    ap.add_argument("--corr-window", type=int, default=90)
+    ap.add_argument("--corr-threshold", type=float, default=0.65)
+    ap.add_argument("--corr-min-scalar", type=float, default=0.50)
     args = ap.parse_args()
+    if args.live_universe:
+        args.symbols = live_symbols()
+        args.calendar = "D"
+        args.ppy = 365
     ppy = args.ppy
 
     # --- per-instrument trend returns ---
@@ -117,9 +208,18 @@ def main() -> None:
     turnovers = {}
     for sym in args.symbols:
         close = load_close(sym)
+        funding = load_funding(sym, args.funding_dir) if args.funding_dir else None
+        if args.funding_dir and funding is None:
+            print(f"  funding missing for {sym}: funding cost ignored")
         res = trend_returns(
-            close, args.lookbacks, args.vol_window, args.target_vol, args.max_leverage,
-            DEFAULT_COST_BPS.get(sym, args.crypto_cost_bps), ppy=ppy,
+            close,
+            args.lookbacks,
+            args.vol_window,
+            args.target_vol,
+            args.max_leverage,
+            DEFAULT_COST_BPS.get(sym, args.crypto_cost_bps),
+            funding=funding,
+            ppy=ppy,
         )
         net_cols[sym] = res["net"]
         turnovers[sym] = res["turnover"].mean() * ppy
@@ -129,10 +229,14 @@ def main() -> None:
     idx = pd.date_range(net.index.min(), net.index.max(), freq=freq)
     net = net.reindex(idx)  # keep NaN for not-yet-live instruments
 
-    print(f"Universe: {args.symbols} | {net.index[0].date()} -> {net.index[-1].date()} "
-          f"({len(net)} business days)")
-    print(f"Signal: ensemble sign-momentum {args.lookbacks} | vol target {args.target_vol:.0%}/inst, "
-          f"{args.port_target_vol:.0%} portfolio | costs {DEFAULT_COST_BPS}")
+    print(
+        f"Universe: {args.symbols} | {net.index[0].date()} -> {net.index[-1].date()} "
+        f"({len(net)} business days)"
+    )
+    print(
+        f"Signal: ensemble sign-momentum {args.lookbacks} | vol target {args.target_vol:.0%}/inst, "
+        f"{args.port_target_vol:.0%} portfolio | costs {DEFAULT_COST_BPS}"
+    )
 
     print("\n=== PER-INSTRUMENT (full sample, net of costs) ===")
     hdr = ["ann_return", "ann_vol", "sharpe", "max_dd", "calmar", "hit_rate"]
@@ -143,18 +247,30 @@ def main() -> None:
 
     # --- portfolio: equal-weight blend over LIVE instruments, scaled to vol target ---
     n_live = net.notna().sum(axis=1)
+    if args.use_correlation_scaling:
+        scalars = correlation_scalars(
+            net,
+            window=args.corr_window,
+            threshold=args.corr_threshold,
+            min_scalar=args.corr_min_scalar,
+        )
+        net = net.mul(scalars, axis=0)
     port = net.mean(axis=1).where(n_live > 0).dropna()
     realized = port.std() * np.sqrt(ppy)
     scale = args.port_target_vol / realized if realized else 1.0
     port = port * scale
-    print(f"\n(portfolio scaled x{scale:.2f} to hit {args.port_target_vol:.0%} target vol; "
-          f"avg {n_live[n_live > 0].mean():.1f} live instruments)")
+    print(
+        f"\n(portfolio scaled x{scale:.2f} to hit {args.port_target_vol:.0%} target vol; "
+        f"avg {n_live[n_live > 0].mean():.1f} live instruments)"
+    )
 
     def show(label: str, r: pd.Series) -> None:
         st = stats(r, ppy)
-        print(f"  {label:18}: Sharpe {st['sharpe']:+.2f} | ann_ret {st['ann_return']:+.1%} | "
-              f"vol {st['ann_vol']:.1%} | maxDD {st['max_dd']:.1%} | Calmar {st['calmar']:.2f} | "
-              f"hit {st['hit_rate']:.1%}")
+        print(
+            f"  {label:18}: Sharpe {st['sharpe']:+.2f} | ann_ret {st['ann_return']:+.1%} | "
+            f"vol {st['ann_vol']:.1%} | maxDD {st['max_dd']:.1%} | Calmar {st['calmar']:.2f} | "
+            f"hit {st['hit_rate']:.1%}"
+        )
 
     print("\n=== PORTFOLIO ===")
     show("full sample", port)
@@ -174,9 +290,11 @@ def main() -> None:
     r = port.dropna().to_numpy()
     finals = [np.prod(1 + rng.choice(r, len(r), replace=True)) - 1 for _ in range(2000)]
     print("\n=== MONTE CARLO (bootstrap, full horizon) ===")
-    print(f"  median total return: {np.median(finals):+.1%} | "
-          f"p05 {np.percentile(finals,5):+.1%} | p95 {np.percentile(finals,95):+.1%} | "
-          f"P(loss) {np.mean(np.array(finals)<0):.1%}")
+    print(
+        f"  median total return: {np.median(finals):+.1%} | "
+        f"p05 {np.percentile(finals,5):+.1%} | p95 {np.percentile(finals,95):+.1%} | "
+        f"P(loss) {np.mean(np.array(finals)<0):.1%}"
+    )
 
     # --- tearsheet ---
     try:

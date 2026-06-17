@@ -16,8 +16,12 @@ Setup:
        BINANCE_API_SECRET=...
   3. Run:  python -m kronos_mt5.live.run_trend_binance
 """
+
 from __future__ import annotations
 
+import json
+import urllib.parse
+import urllib.request
 from datetime import timedelta
 
 from nautilus_trader.adapters.binance import (
@@ -44,6 +48,7 @@ from kronos_mt5.strategies.risk_manager import RiskManager, RiskManagerConfig, R
 from kronos_mt5.strategies.trend_strategy import TrendStrategy, TrendStrategyConfig
 
 VENUE = "BINANCE"
+PREMIUM_INDEX_URL = "https://fapi.binance.com/fapi/v1/premiumIndex"
 
 
 class HeartbeatConfig(StrategyConfig, frozen=True):
@@ -112,6 +117,45 @@ class Heartbeat(Strategy):
             self.log.warning(f"equity csv append failed: {exc!r}")
 
 
+class FundingRateState:
+    def __init__(self) -> None:
+        self.rates: dict[str, float] = {}
+
+    def get(self, symbol: str) -> float | None:
+        return self.rates.get(symbol)
+
+
+class FundingRateUpdaterConfig(StrategyConfig, frozen=True):
+    symbols: tuple[str, ...]
+    interval_secs: int = 3600
+
+
+class FundingRateUpdater(Strategy):
+    def __init__(self, config: FundingRateUpdaterConfig, state: FundingRateState) -> None:
+        super().__init__(config)
+        self.state = state
+
+    def on_start(self) -> None:
+        self._refresh(None)
+        self.clock.set_timer(
+            name="funding_rates",
+            interval=timedelta(seconds=self.config.interval_secs),
+            callback=self._refresh,
+        )
+
+    def _refresh(self, event) -> None:  # noqa: ANN001
+        for symbol in self.config.symbols:
+            try:
+                params = urllib.parse.urlencode({"symbol": symbol})
+                with urllib.request.urlopen(
+                    f"{PREMIUM_INDEX_URL}?{params}", timeout=10
+                ) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                self.state.rates[symbol] = float(payload["lastFundingRate"])
+            except Exception as exc:  # noqa: BLE001
+                self.log.warning(f"funding refresh failed for {symbol}: {exc!r}")
+
+
 def _instrument_ids(symbols: list[str]) -> list[str]:
     # USDT-M perpetual futures instrument ids, e.g. "BTCUSDT-PERP.BINANCE"
     return [f"{s}-PERP.{VENUE}" for s in symbols]
@@ -133,11 +177,11 @@ def build_node() -> TradingNode:
     config = TradingNodeConfig(
         trader_id=TraderId("TREND-TESTNET-001"),
         logging=LoggingConfig(
-            log_level="INFO",                # stdout (captured by systemd/nohup)
+            log_level="INFO",  # stdout (captured by systemd/nohup)
             log_level_file="INFO",
-            log_directory="logs",            # persistent, rotating engine logs
+            log_directory="logs",  # persistent, rotating engine logs
             log_file_name="kronos_trend",
-            log_file_max_size=100_000_000,   # 100 MB per file
+            log_file_max_size=100_000_000,  # 100 MB per file
             log_file_max_backup_count=10,
         ),
         data_clients={VENUE: BinanceDataClientConfig(**common)},
@@ -151,21 +195,52 @@ def build_node() -> TradingNode:
 
     n = len(symbols)
     risk = RiskState()  # shared halt flag (drawdown kill-switch -> blocks entries)
+    funding = FundingRateState()
+    if settings.binance_funding_filter_enabled:
+        node.trader.add_strategy(
+            FundingRateUpdater(
+                FundingRateUpdaterConfig(
+                    symbols=tuple(symbols),
+                    interval_secs=settings.binance_funding_refresh_secs,
+                ),
+                funding,
+            )
+        )
     for iid in iids:
         strat = TrendStrategy(
             TrendStrategyConfig(
                 instrument_id=iid,
                 bar_type=f"{iid}-1-DAY-LAST-EXTERNAL",
+                portfolio_instrument_ids=tuple(iids),
                 n_instruments=n,
                 target_vol=settings.binance_target_vol,
                 ppy=365,
                 use_stop_loss=True,
                 stop_pct=settings.binance_stop_pct,
+                use_vol_stop=settings.binance_use_vol_stop,
+                stop_vol_mult=settings.binance_stop_vol_mult,
+                min_stop_pct=settings.binance_min_stop_pct,
+                max_stop_pct=settings.binance_max_stop_pct,
                 use_take_profit=settings.binance_use_take_profit,
                 tp_pct=settings.binance_tp_pct,
+                flatten_on_stop=settings.binance_flatten_on_stop,
+                use_correlation_scaling=settings.binance_use_correlation_scaling,
+                corr_window=settings.binance_corr_window,
+                corr_threshold=settings.binance_corr_threshold,
+                corr_min_scalar=settings.binance_corr_min_scalar,
+                funding_filter_enabled=settings.binance_funding_filter_enabled,
+                funding_rate_limit=settings.binance_funding_rate_limit,
+                cost_aware_rebalance=settings.binance_cost_aware_rebalance,
+                round_trip_cost_bps=settings.binance_round_trip_cost_bps,
+                slippage_bps=settings.binance_slippage_bps,
+                use_patient_limit=settings.binance_use_patient_limit,
+                patient_limit_offset_bps=settings.binance_patient_limit_offset_bps,
+                patient_limit_timeout_secs=settings.binance_patient_limit_timeout_secs,
+                patient_limit_market_fallback=settings.binance_patient_limit_market_fallback,
             )
         )
         strat.risk_state = risk
+        strat.funding_rates = funding
         node.trader.add_strategy(strat)
 
     rm = RiskManager(

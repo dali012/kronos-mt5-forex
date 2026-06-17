@@ -4,6 +4,8 @@ __pycache__/
 *.pyc
 data/*.csv
 data/*.parquet
+# funding history is fetched via scripts/download_funding.py
+data/funding/
 vendor/Kronos/
 models/
 catalog/
