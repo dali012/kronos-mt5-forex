@@ -63,6 +63,7 @@ async def _alerter() -> None:
             _check_fills()
             _check_drawdown()
             _check_bot_down()
+            _check_mark_data()
         except Exception:  # noqa: BLE001
             pass
         await asyncio.sleep(settings.api_poll_secs)
@@ -107,6 +108,19 @@ def _check_bot_down() -> None:
     elif alive and down_alerted:
         tg.send("🟢 BOT RECOVERED — heartbeat resumed")
         store.set_kv("alert_bot_down", "0", DB)
+
+
+def _check_mark_data() -> None:
+    snap = store.read_snapshot(DB) or {}
+    stale = bool(snap.get("mark_data_stale"))
+    alerted = store.get_kv("alert_mark_stale", "0", DB) == "1"
+    if stale and not alerted:
+        symbols = ", ".join(snap.get("stale_mark_symbols", [])) or "unknown"
+        tg.send(f"🟠 MARK DATA STALE — entries halted ({symbols}); positions/stops kept")
+        store.set_kv("alert_mark_stale", "1", DB)
+    elif not stale and alerted:
+        tg.send("🟢 MARK DATA RECOVERED — entry gate released")
+        store.set_kv("alert_mark_stale", "0", DB)
 
 
 # --- Telegram two-way control (commands) ------------------------------------
@@ -292,9 +306,14 @@ def _handle(text: str) -> tuple[str, dict | None]:
     if cmd == "status":
         alive, _ = _alive()
         mode = store.get_mode(DB)
-        state = {"kill": "🛑 KILLED", "halt": "⏸ HALTED"}.get(
-            mode, "🟢 LIVE" if alive else "🔴 DOWN"
-        )
+        if mode == "kill":
+            state = "🛑 KILLED"
+        elif mode == "halt":
+            state = "⏸ HALTED"
+        elif snap.get("mark_data_stale"):
+            state = "🟠 MARKS STALE"
+        else:
+            state = "🟢 LIVE" if alive else "🔴 DOWN"
         equity, total, pct = _pnl_from_snapshot(snap)
         updated = datetime.now(timezone.utc).strftime("%H:%M UTC")
         return (
@@ -511,7 +530,7 @@ def api_state() -> JSONResponse:
     alive, age = _alive()
     snap["alive"] = alive
     snap["heartbeat_age_secs"] = age
-    snap["halted"] = store.is_halted(DB)
+    snap["halted"] = store.is_halted(DB) or bool(snap.get("mark_data_stale"))
     return JSONResponse(snap)
 
 
@@ -594,7 +613,8 @@ async function refresh(){
   const fills=await (await api('/api/fills')).json();
   const base=eq.length?eq[0].equity:s.equity, pnl=(s.equity||0)-(base||0), pnlpct=base?pnl/base:0;
   const aliveDot=`<span class=dot style="background:${s.alive?'#3fb950':'#f85149'}"></span>`;
-  document.getElementById('status').innerHTML=aliveDot+(s.alive?'live':'DOWN')+(s.halted?' · <b style=color:#f85149>HALTED</b>':'');
+  const gate=s.mark_data_stale?' · <b style=color:#d29922>MARKS STALE · ENTRIES HALTED</b>':(s.halted?' · <b style=color:#f85149>HALTED</b>':'');
+  document.getElementById('status').innerHTML=aliveDot+(s.alive?'live':'DOWN')+gate;
   document.getElementById('cards').innerHTML=`
    <div class=card><div class=k>Equity</div><div class=v>$${fmt(s.equity)}</div></div>
    <div class=card><div class=k>Total PnL</div><div class="v ${cls(pnl)}">$${fmt(pnl)} (${fmt(pnlpct*100)}%)</div></div>

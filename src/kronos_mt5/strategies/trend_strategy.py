@@ -163,6 +163,15 @@ class TrendStrategy(Strategy):
         if rs.mode == "kill":
             self._flatten_self()  # flatten + stay out
             return True
+        if rs.market_data_stale:
+            # A patient limit submitted before the stream failed must not fill (or
+            # fall back to market) while the watchdog is blocking new exposure.
+            order = self._pending_entry_order
+            if order is not None and not getattr(order, "is_closed", False):
+                with contextlib.suppress(Exception):
+                    self.cancel_order(order)
+            self._pending_entry_order = None
+            return True
         if rs.mode == "halt":
             return True  # freeze: keep positions, no new orders
         return False
@@ -363,7 +372,7 @@ class TrendStrategy(Strategy):
         if order is None or order not in self.cache.orders_open():
             return
         self.cancel_order(order)
-        if self.cfg().patient_limit_market_fallback:
+        if self.cfg().patient_limit_market_fallback and not self._apply_control():
             self.submit_order(
                 self.order_factory.market(
                     instrument_id=self.instrument_id,

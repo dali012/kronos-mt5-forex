@@ -40,11 +40,18 @@ from nautilus_trader.config import (
 from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.currencies import USDT
 from nautilus_trader.model.identifiers import InstrumentId, TraderId, Venue
+from nautilus_trader.portfolio.config import PortfolioConfig
 from nautilus_trader.trading.strategy import Strategy, StrategyConfig
 
 from config.settings import settings
 from kronos_mt5.companion.recorder import Companion, CompanionConfig
-from kronos_mt5.strategies.risk_manager import RiskManager, RiskManagerConfig, RiskState
+from kronos_mt5.strategies.risk_manager import (
+    MarkPriceMonitor,
+    MarkPriceMonitorConfig,
+    RiskManager,
+    RiskManagerConfig,
+    RiskState,
+)
 from kronos_mt5.strategies.trend_strategy import TrendStrategy, TrendStrategyConfig
 
 VENUE = "BINANCE"
@@ -185,6 +192,9 @@ def build_node() -> TradingNode:
             log_file_max_size=100_000_000,  # 100 MB per file
             log_file_max_backup_count=10,
         ),
+        # MarkPriceUpdate events now drive Portfolio.unrealized_pnl/net exposure.
+        # Without this, the daily bars leave live PnL and drawdown stale all day.
+        portfolio=PortfolioConfig(use_mark_prices=True),
         data_clients={VENUE: BinanceDataClientConfig(**common)},
         exec_clients={VENUE: BinanceExecClientConfig(**common)},
     )
@@ -197,6 +207,15 @@ def build_node() -> TradingNode:
     n = len(symbols)
     risk = RiskState()  # shared halt flag (drawdown kill-switch -> blocks entries)
     funding = FundingRateState()
+    mark_monitor = MarkPriceMonitor(
+        MarkPriceMonitorConfig(
+            instrument_ids=tuple(iids),
+            check_secs=settings.binance_mark_check_secs,
+            stale_after_secs=settings.binance_mark_stale_secs,
+        )
+    )
+    mark_monitor.risk_state = risk
+    node.trader.add_strategy(mark_monitor)
     if settings.binance_funding_filter_enabled:
         node.trader.add_strategy(
             FundingRateUpdater(

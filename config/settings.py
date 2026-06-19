@@ -55,6 +55,8 @@ class Settings(BaseSettings):
     binance_symbols: str = "BTCUSDT,ETHUSDT,BNBUSDT,XRPUSDT,ADAUSDT,SOLUSDT,LTCUSDT,LINKUSDT"
     binance_target_vol: float = 0.15
     binance_heartbeat_secs: int = 3600  # periodic equity/PnL log between daily rebalances
+    binance_mark_check_secs: int = 5  # watchdog cadence for the 1s Binance mark stream
+    binance_mark_stale_secs: int = 15  # fail closed when any configured mark is older
     # --- risk controls ---
     binance_stop_pct: float = 0.20  # per-position stop-loss (exchange-native, reduce-only)
     binance_use_vol_stop: bool = False
@@ -65,7 +67,7 @@ class Settings(BaseSettings):
     binance_tp_pct: float = 0.50
     binance_flatten_on_stop: bool = False  # graceful process stop should not force-exit by default
     binance_max_drawdown: float = 0.20  # portfolio kill-switch: flatten+halt below this DD
-    binance_risk_check_secs: int = 300
+    binance_risk_check_secs: int = 5  # live mark-to-market drawdown cadence
     binance_use_correlation_scaling: bool = False
     binance_corr_window: int = 90
     binance_corr_threshold: float = 0.65

@@ -94,7 +94,8 @@ funding rows need `scripts/download_funding.py` first.
   kill‑switch** (flatten + halt, persisted so it survives restarts). Optional,
   off‑by‑default realism controls (funding costs, vol‑adaptive stops, correlation
   scaling, cost‑aware rebalancing, patient‑limit entries) are each backtested above
-  and toggled in `.env`.
+  and toggled in `.env`. Live PnL and drawdown use Binance's 1-second futures mark
+  stream; a fail-closed freshness watchdog blocks new entries if any mark goes stale.
 - **Companion** — decoupled via SQLite so neither process can crash the other:
   dashboard, equity curve, trade log, bearer‑auth API, Telegram alerts (fills,
   drawdown, **bot‑down via heartbeat**), and **two‑way Telegram control**

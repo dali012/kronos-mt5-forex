@@ -74,6 +74,11 @@ bash scripts/run_live.sh                 # auto-restarts on crash
   This is your forward-test record — plot it / compare to backtest after weeks.
 - **logs/supervisor.log** — restarts (only present with the tmux wrapper).
 - Binance testnet UI: 8 positions + 8 BUY-above reduce-only stops (one per coin).
+- The bot subscribes to Binance's 1-second futures mark stream. The dashboard PnL
+  and portfolio drawdown therefore update from live marks rather than daily bars.
+  If any configured mark is older than `BINANCE_MARK_STALE_SECS`, the watchdog
+  blocks new entries (and pending patient entries), keeps positions/stops intact,
+  and reports `MARKS STALE` until every stream recovers.
 
 ## 5. Companion dashboard + Telegram alerts + remote kill (optional but recommended)
 A separate FastAPI process gives a live dashboard (PnL, positions, equity curve,

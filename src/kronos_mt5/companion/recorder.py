@@ -78,14 +78,34 @@ class Companion(Strategy):
                 if open_pos:
                     entry = float(open_pos[0].avg_px_open)
                 positions.append(
-                    {"symbol": iid.symbol.value, "qty": net, "entry": entry, "unrealized": u_val}
+                    {
+                        "symbol": iid.symbol.value,
+                        "qty": net,
+                        "entry": entry,
+                        "mark": (
+                            self.risk_state.mark_prices.get(str(iid))
+                            if self.risk_state is not None
+                            else None
+                        ),
+                        "unrealized": u_val,
+                    }
                 )
 
+            mark_stale = bool(self.risk_state and self.risk_state.market_data_stale)
+            control_mode = self.risk_state.mode if self.risk_state else "run"
             store.write_snapshot(
                 {
                     "equity": cash + upnl_total, "cash": cash, "unrealized": upnl_total,
                     "n_open": len(positions),
-                    "mode": (self.risk_state.mode if self.risk_state else "run"),
+                    "mode": "halt" if mark_stale and control_mode == "run" else control_mode,
+                    "control_mode": control_mode,
+                    "mark_data_stale": mark_stale,
+                    "stale_mark_symbols": (
+                        list(self.risk_state.stale_mark_symbols) if self.risk_state else []
+                    ),
+                    "mark_age_secs": (
+                        self.risk_state.mark_age_secs if self.risk_state else {}
+                    ),
                     "positions": positions, "orders": self._open_orders(),
                 },
                 self.config.db_path,

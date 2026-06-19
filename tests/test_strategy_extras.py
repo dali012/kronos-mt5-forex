@@ -5,8 +5,12 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pandas as pd
+from nautilus_trader.model.data import MarkPriceUpdate
+from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.objects import Price
 
 from backtest.trend import load_funding
+from kronos_mt5.strategies.risk_manager import RiskState
 from kronos_mt5.strategies.trend_strategy import TrendStrategy, TrendStrategyConfig
 from scripts.download_funding import _ms, write_csv
 
@@ -72,6 +76,45 @@ def test_strategy_as_float_helper():
     assert TrendStrategy._as_float("2.5") == 2.5
     assert TrendStrategy._as_float(_M()) == 1.5
     assert TrendStrategy._as_float("not-a-number") == 0.0
+
+
+def _mark(iid: InstrumentId, value: str) -> MarkPriceUpdate:
+    return MarkPriceUpdate(iid, Price.from_str(value), ts_event=0, ts_init=0)
+
+
+def test_mark_watchdog_fails_closed_recovers_and_detects_staleness():
+    btc = InstrumentId.from_str("BTCUSDT-PERP.BINANCE")
+    eth = InstrumentId.from_str("ETHUSDT-PERP.BINANCE")
+    iids = (btc, eth)
+    risk = RiskState()
+
+    assert not risk.halted  # backtests/live setups without a monitor remain unchanged
+    risk.enable_mark_watchdog(iids)
+    assert risk.halted and risk.stale_mark_symbols == ("BTCUSDT-PERP", "ETHUSDT-PERP")
+
+    risk.update_mark(_mark(btc, "63000"), received_ns=1_000_000_000)
+    risk.update_mark(_mark(eth, "1700"), received_ns=2_000_000_000)
+    assert risk.evaluate_mark_freshness(iids, now_ns=3_000_000_000, stale_after_secs=15) == ()
+    assert not risk.halted
+    assert risk.mark_prices[str(btc)] == 63000.0
+    assert risk.mark_age_secs == {"BTCUSDT-PERP": 2.0, "ETHUSDT-PERP": 1.0}
+
+    stale = risk.evaluate_mark_freshness(iids, now_ns=18_000_000_000, stale_after_secs=15)
+    assert stale == ("BTCUSDT-PERP", "ETHUSDT-PERP")
+    assert risk.halted and risk.mode == "run"  # watchdog does not overwrite manual control
+
+
+def test_mark_watchdog_only_flags_the_stale_symbol():
+    btc = InstrumentId.from_str("BTCUSDT-PERP.BINANCE")
+    eth = InstrumentId.from_str("ETHUSDT-PERP.BINANCE")
+    risk = RiskState()
+    risk.enable_mark_watchdog((btc, eth))
+    risk.update_mark(_mark(btc, "63000"), received_ns=20_000_000_000)
+    risk.update_mark(_mark(eth, "1700"), received_ns=1_000_000_000)
+
+    assert risk.evaluate_mark_freshness(
+        (btc, eth), now_ns=21_000_000_000, stale_after_secs=15
+    ) == ("ETHUSDT-PERP",)
 
 
 # --- protection idempotency (the live duplicate-stop bug) --------------------

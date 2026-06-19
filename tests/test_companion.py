@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -102,6 +103,40 @@ def test_api_token_guard(tmp_path, monkeypatch):
         assert (
             client.get("/api/state", headers={"Authorization": "Bearer secret"}).status_code == 200
         )
+
+
+def test_mark_stale_alert_and_api_halt(tmp_path, monkeypatch):
+    from kronos_mt5.companion import api
+
+    p = str(tmp_path / "marks.db")
+    store.init_db(p)
+    monkeypatch.setattr(api, "DB", p)
+    sent = []
+    monkeypatch.setattr(api.tg, "send", sent.append)
+    store.write_snapshot(
+        {
+            "equity": 5000.0,
+            "cash": 5000.0,
+            "unrealized": 0.0,
+            "n_open": 0,
+            "mark_data_stale": True,
+            "stale_mark_symbols": ["ETHUSDT-PERP"],
+        },
+        p,
+    )
+
+    api._check_mark_data()
+    api._check_mark_data()  # alert is edge-triggered, not repeated every poll
+    assert len(sent) == 1 and "ETHUSDT-PERP" in sent[0]
+    state = json.loads(api.api_state().body)
+    assert state["halted"] is True and state["mark_data_stale"] is True
+
+    snap = store.read_snapshot(p)
+    snap["mark_data_stale"] = False
+    snap["stale_mark_symbols"] = []
+    store.write_snapshot(snap, p)
+    api._check_mark_data()
+    assert len(sent) == 2 and "RECOVERED" in sent[-1]
 
 
 def test_telegram_commands(tmp_path, monkeypatch):
