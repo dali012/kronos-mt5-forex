@@ -161,7 +161,15 @@ def test_telegram_commands(tmp_path, monkeypatch):
                     "side": "BUY",
                     "qty": 0.003,
                     "trigger": 78000.0,
-                }
+                },
+                {
+                    "symbol": "BTCUSDT-PERP",
+                    "type": "TRAILING_STOP_MARKET",
+                    "side": "BUY",
+                    "qty": 0.003,
+                    "trigger": 52000.0,
+                    "trailing_offset_bps": 500.0,
+                },
             ],
         },
         p,
@@ -177,7 +185,8 @@ def test_telegram_commands(tmp_path, monkeypatch):
     assert "Equity" in text and "LIVE" in text
     assert "BTC" in api._handle("/positions")[0]  # shortened coin name
     assert "Total" in api._handle("/pnl")[0]
-    assert "78000" in api._handle("/stops")[0]  # stop level shown
+    stops = api._handle("/stops")[0]
+    assert "78000" in stops and "Volatility trails" in stops and "5.0%" in stops
     assert "STOP" in api._handle("/orders")[0]
     assert "Equity" in api._handle("/chart")[0] and "Today" in api._handle("/equity")[0]
 

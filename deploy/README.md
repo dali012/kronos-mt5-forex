@@ -31,6 +31,7 @@ the recommended set for a testnet forward test is:
 ```ini
 # Safe net-positives (backtested: lower DD / less churn, no downside):
 BINANCE_USE_VOL_STOP=true            # vol-adaptive stop — best stop variant
+BINANCE_USE_TRAILING_STOP=true       # native trail arms near +1R; hard stop remains
 BINANCE_USE_CORRELATION_SCALING=true # trim gross when the book gets crowded
 BINANCE_COST_AWARE_REBALANCE=true    # skip sub-cost rebalances
 
@@ -73,7 +74,9 @@ bash scripts/run_live.sh                 # auto-restarts on crash
 - **logs/live_equity.csv** — hourly `timestamp,equity,cash,unrealized_pnl,n_open`.
   This is your forward-test record — plot it / compare to backtest after weeks.
 - **logs/supervisor.log** — restarts (only present with the tmux wrapper).
-- Binance testnet UI: 8 positions + 8 BUY-above reduce-only stops (one per coin).
+- Binance testnet UI: 8 positions + 8 hard reduce-only stops (one per coin).
+  With `BINANCE_USE_TRAILING_STOP=true`, expect one additional dormant/active
+  `TRAILING_STOP_MARKET` per position; `/stops` shows activation and callback levels.
 - The bot subscribes to Binance's 1-second futures mark stream. The dashboard PnL
   and portfolio drawdown therefore update from live marks rather than daily bars.
   If any configured mark is older than `BINANCE_MARK_STALE_SECS`, the watchdog

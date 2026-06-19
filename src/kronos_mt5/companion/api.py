@@ -78,7 +78,11 @@ def _check_fills() -> None:
         icon = (
             "🛑 STOPPED OUT"
             if f.get("kind") == "STOP"
-            else ("🎯 TP" if f.get("kind") == "TP" else "✅ FILL")
+            else (
+                "📈 TRAIL EXIT"
+                if f.get("kind") == "TRAIL"
+                else ("🎯 TP" if f.get("kind") == "TP" else "✅ FILL")
+            )
         )
         tg.send(f"{icon} {f['symbol']} {f['side']} {f['qty']:g} @ {f['price']:g}")
         store.set_kv("alert_last_fill_rowid", str(f["rowid"]), DB)
@@ -239,7 +243,9 @@ def _chart_text() -> str:
 
 
 def _stops_text(snap: dict) -> str:
-    stops = [o for o in snap.get("orders", []) if o.get("type") == "STOP_MARKET"]
+    orders = snap.get("orders", [])
+    stops = [o for o in orders if o.get("type") == "STOP_MARKET"]
+    trails = [o for o in orders if o.get("type") == "TRAILING_STOP_MARKET"]
     if not stops:
         return "<b>🛡 Stops</b>\n<i>none</i>"
     entries = {p["symbol"]: p.get("entry") for p in snap.get("positions", [])}
@@ -249,7 +255,21 @@ def _stops_text(snap: dict) -> str:
         e, trig = entries.get(o["symbol"]), o.get("trigger")
         dist = f"{(trig / e - 1) * 100:+.0f}%" if (e and trig) else "–"
         rows.append(f"{_coin(o['symbol']):<5}{(trig or 0):>11.4f}{dist:>7}")
-    return f"<b>🛡 Stop-losses ({len(stops)})</b>\n<pre>{head}\n" + "\n".join(rows) + "</pre>"
+    text = f"<b>🛡 Hard stops ({len(stops)})</b>\n<pre>{head}\n" + "\n".join(rows) + "</pre>"
+    if trails:
+        trail_rows = []
+        for o in trails:
+            activation = o.get("trigger")
+            activation_text = f"{activation:.4f}" if activation is not None else "active"
+            callback = float(o.get("trailing_offset_bps") or 0) / 100
+            trail_rows.append(f"{_coin(o['symbol']):<5}{activation_text:>11}{callback:>6.1f}%")
+        trail_head = f"{'COIN':<5}{'ACTIVATE':>11}{'TRAIL':>7}"
+        text += (
+            f"\n\n<b>📈 Volatility trails ({len(trails)})</b>\n<pre>{trail_head}\n"
+            + "\n".join(trail_rows)
+            + "</pre>"
+        )
+    return text
 
 
 def _orders_text(snap: dict) -> str:

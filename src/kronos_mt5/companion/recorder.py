@@ -119,13 +119,21 @@ class Companion(Strategy):
     def _open_orders(self) -> list[dict]:
         out = []
         for o in self.cache.orders_open():
-            trig = getattr(o, "trigger_price", None) or getattr(o, "price", None)
+            trig = (
+                getattr(o, "trigger_price", None)
+                or getattr(o, "activation_price", None)
+                or getattr(o, "price", None)
+            )
+            trailing_offset = getattr(o, "trailing_offset", None)
             out.append({
                 "symbol": o.instrument_id.symbol.value,
                 "type": o.order_type.name,
                 "side": o.side.name,
                 "qty": float(o.quantity),
                 "trigger": float(trig) if trig is not None else None,
+                "trailing_offset_bps": (
+                    float(trailing_offset) if trailing_offset is not None else None
+                ),
             })
         return out
 
@@ -140,6 +148,8 @@ class Companion(Strategy):
             ot = order.order_type.name
             if ot == "STOP_MARKET":
                 kind = "STOP"
+            elif ot == "TRAILING_STOP_MARKET":
+                kind = "TRAIL"
             elif getattr(order, "is_reduce_only", False):
                 kind = "TP" if ot == "LIMIT" else "STOP"
             else:

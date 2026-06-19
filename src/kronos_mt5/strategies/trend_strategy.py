@@ -8,9 +8,9 @@ Per closed bar: ensemble sign-momentum signal in [-1,1], vol-targeted to a per
 
 Risk controls:
   - Exchange-native protective orders per position (reduce-only): a STOP_MARKET
-    stop-loss and (optional) LIMIT take-profit, re-anchored on each position
-    change. These live server-side, so they protect even if this process
-    crashes / disconnects.
+    stop-loss, optional LIMIT take-profit, and optional native volatility trailing
+    stop which activates around +1R. These live server-side, so they protect even
+    if this process crashes / disconnects.
   - A shared `risk_state.halted` gate (set by the RiskManager drawdown
     kill-switch) blocks new entries.
 
@@ -22,11 +22,12 @@ from __future__ import annotations
 import contextlib
 from collections import deque
 from datetime import timedelta
+from decimal import Decimal
 
 import numpy as np
 
 from nautilus_trader.model.data import Bar, BarType
-from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.enums import OrderSide, TrailingOffsetType, TriggerType
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.trading.strategy import Strategy, StrategyConfig
 
@@ -53,6 +54,12 @@ class TrendStrategyConfig(StrategyConfig, frozen=True):
     max_stop_pct: float = 0.30
     use_take_profit: bool = False  # off by default: TP conflicts with trend-following
     tp_pct: float = 0.50
+    # Native Binance trailing stop: hard stop stays live; trail arms around +1R.
+    use_trailing_stop: bool = False
+    trailing_activation_r: float = 1.0
+    trailing_vol_mult: float = 3.0
+    min_trailing_pct: float = 0.005
+    max_trailing_pct: float = 0.10  # Binance callback-rate ceiling
     flatten_on_stop: bool = False
     # --- portfolio/friction controls ---
     use_correlation_scaling: bool = False
@@ -87,9 +94,14 @@ class TrendStrategy(Strategy):
         self.risk_state = None  # optional shared control state (injected by the runner)
         self.funding_rates = None  # optional shared FundingRateState (injected by the runner)
         self._dynamic_stop_pct = config.stop_pct
+        initial_daily_vol = config.vol_floor / np.sqrt(config.ppy)
+        self._dynamic_trailing_pct = self._bounded_trailing_pct(
+            config.trailing_vol_mult * initial_daily_vol
+        )
         self._pending_entry_order = None
-        self._protective_orders = []  # SL/TP orders we've submitted (may be in-flight)
-        self._protection_signature = None  # (side, qty, sl, tp) currently protecting
+        self._protective_orders = []  # SL/TP/trailing orders we've submitted (may be in-flight)
+        self._protection_signature = None  # desired protection currently working/in-flight
+        self._protection_position_key = None  # freezes +1R/trail width for this position
         self._protected_once = (
             False  # force a protection refresh on first rebalance (restart cleanup)
         )
@@ -249,6 +261,17 @@ class TrendStrategy(Strategy):
         ):
             self._pending_entry_order = None
 
+    def on_order_rejected(self, event) -> None:  # noqa: ANN001
+        client_order_id = getattr(event, "client_order_id", None)
+        if any(o.client_order_id == client_order_id for o in self._protective_orders):
+            # Keep any accepted hard stop working, but force the next reconciliation
+            # to replace an incomplete protection set rather than treating it as valid.
+            self._protection_signature = None
+            self.log.error(
+                f"protective order rejected for {self.instrument_id}: "
+                f"{getattr(event, 'reason', 'unknown reason')}"
+            )
+
     def on_position_opened(self, event) -> None:  # noqa: ANN001
         if getattr(event, "instrument_id", None) == self.instrument_id:
             self._refresh_protection()
@@ -259,16 +282,22 @@ class TrendStrategy(Strategy):
 
     def on_position_closed(self, event) -> None:  # noqa: ANN001
         if getattr(event, "instrument_id", None) == self.instrument_id:
-            self._cancel_protective_orders()  # drop now-orphaned SL/TP
+            self._cancel_protective_orders()  # drop now-orphaned SL/TP/trail
             self._protection_signature = None
+            self._protection_position_key = None
 
     def _refresh_protection(self, entry_fallback: float | None = None) -> None:
         """Reconcile reduce-only protection to the real open position."""
         units = float(self.portfolio.net_position(self.instrument_id))
         if units == 0:
-            if self.cfg().use_stop_loss or self.cfg().use_take_profit:
+            if (
+                self.cfg().use_stop_loss
+                or self.cfg().use_take_profit
+                or self.cfg().use_trailing_stop
+            ):
                 self._cancel_protective_orders()
                 self._protection_signature = None
+                self._protection_position_key = None
             return
         entry = entry_fallback
         open_pos = self.cache.positions_open(instrument_id=self.instrument_id)
@@ -280,17 +309,28 @@ class TrendStrategy(Strategy):
         self._set_protection(units, entry)
 
     def _update_dynamic_stop(self, inst_vol: float) -> None:
+        daily_vol = inst_vol / np.sqrt(self.cfg().ppy)
         if not self.cfg().use_vol_stop:
             self._dynamic_stop_pct = self.cfg().stop_pct
-            return
-        daily_vol = inst_vol / np.sqrt(self.cfg().ppy)
-        self._dynamic_stop_pct = float(
-            np.clip(
-                self.cfg().stop_vol_mult * daily_vol,
-                self.cfg().min_stop_pct,
-                self.cfg().max_stop_pct,
+        else:
+            self._dynamic_stop_pct = float(
+                np.clip(
+                    self.cfg().stop_vol_mult * daily_vol,
+                    self.cfg().min_stop_pct,
+                    self.cfg().max_stop_pct,
+                )
             )
+        self._dynamic_trailing_pct = self._bounded_trailing_pct(
+            self.cfg().trailing_vol_mult * daily_vol
         )
+
+    def _bounded_trailing_pct(self, value: float) -> float:
+        # Binance Futures callbackRate is 0.1%-10%. Keep configured bounds inside
+        # venue limits so a typo cannot leave the trailing protection rejected.
+        venue_min, venue_max = 0.001, 0.10
+        lower = float(np.clip(self.cfg().min_trailing_pct, venue_min, venue_max))
+        upper = float(np.clip(self.cfg().max_trailing_pct, lower, venue_max))
+        return float(np.clip(value, lower, upper))
 
     def _update_portfolio_returns(self, returns: np.ndarray) -> None:
         if not (self.cfg().use_correlation_scaling and self.risk_state is not None):
@@ -423,7 +463,15 @@ class TrendStrategy(Strategy):
             return 0.0
 
     def _has_live_protection(self) -> bool:
-        return any(not getattr(o, "is_closed", False) for o in self._protective_orders)
+        expected = sum(
+            (
+                bool(self.cfg().use_stop_loss),
+                bool(self.cfg().use_take_profit),
+                bool(self.cfg().use_trailing_stop),
+            )
+        )
+        live = sum(not getattr(o, "is_closed", False) for o in self._protective_orders)
+        return live == expected
 
     def _cancel_protective_orders(self) -> None:
         """Cancel every protective order we own, INCLUDING in-flight ones, plus any
@@ -446,21 +494,33 @@ class TrendStrategy(Strategy):
                 self.cancel_order(order)
 
     def _set_protection(self, position_units: float, entry_price: float) -> None:
-        """Idempotently keep exactly one reduce-only SL (+ optional TP) on the open
-        position. Sized/sided from the signed net position. Safe to call repeatedly
-        in a burst (restart reconciliation, overlapping fill/position events): it
-        re-places only when the desired protection actually changes, and tracks its
-        own orders so it can cancel in-flight ones rather than stacking duplicates."""
-        if not (self.cfg().use_stop_loss or self.cfg().use_take_profit):
+        """Idempotently keep a hard SL plus optional TP/native trail on the position."""
+        if not (
+            self.cfg().use_stop_loss
+            or self.cfg().use_take_profit
+            or self.cfg().use_trailing_stop
+        ):
             return
         if position_units == 0:
             self._cancel_protective_orders()
             self._protection_signature = None
+            self._protection_position_key = None
             return
         is_long = position_units > 0
         close_side = OrderSide.SELL if is_long else OrderSide.BUY  # close = opposite side
         qty = self.instrument.make_qty(abs(position_units))
         if qty <= self.instrument.make_qty(0):
+            return
+        position_key = (is_long, str(qty), str(self.instrument.make_price(entry_price)))
+        if (
+            self.cfg().use_trailing_stop
+            and position_key == self._protection_position_key
+            and self._has_live_protection()
+        ):
+            # Native trailing orders remember their best favorable price. Do not
+            # cancel/recreate them on each daily vol update, which would reset and
+            # potentially loosen the exchange-side watermark. R and trail width are
+            # therefore fixed when this position/size is first protected.
             return
         sl_price = None
         if self.cfg().use_stop_loss:
@@ -480,11 +540,41 @@ class TrendStrategy(Strategy):
             )
             tp_price = self.instrument.make_price(tp)
 
+        trail_activation = None
+        trail_offset_bps = None
+        if self.cfg().use_trailing_stop:
+            activation_distance = max(0.0, self.cfg().trailing_activation_r) * (
+                entry_price * self._dynamic_stop_pct
+            )
+            activation = (
+                entry_price + activation_distance if is_long else entry_price - activation_distance
+            )
+            trail_activation = self.instrument.make_price(activation)
+
+            # If price already passed +1R, omitting activation_price tells Binance
+            # to arm from the current mark and avoids "Order would immediately trigger"
+            # on restart or reconciliation.
+            mark = None
+            if self.risk_state is not None:
+                mark = getattr(self.risk_state, "mark_prices", {}).get(str(self.instrument_id))
+            already_activated = mark is not None and (
+                (is_long and mark >= activation) or (not is_long and mark <= activation)
+            )
+            if already_activated:
+                trail_activation = None
+            trail_offset_bps = Decimal(str(round(self._dynamic_trailing_pct * 10_000, 8)))
+
         signature = (
             close_side.value,
             str(qty),
             str(sl_price) if sl_price is not None else None,
             str(tp_price) if tp_price is not None else None,
+            (
+                str(trail_activation)
+                if trail_activation is not None
+                else ("IMMEDIATE" if trail_offset_bps is not None else None)
+            ),
+            str(trail_offset_bps) if trail_offset_bps is not None else None,
         )
         if signature == self._protection_signature and self._has_live_protection():
             return  # correct protection already working/in-flight — don't duplicate
@@ -511,10 +601,26 @@ class TrendStrategy(Strategy):
                 )
                 self._protective_orders.append(order)
                 self.submit_order(order)
+            if trail_offset_bps is not None:
+                order = self.order_factory.trailing_stop_market(
+                    instrument_id=self.instrument_id,
+                    order_side=close_side,
+                    quantity=qty,
+                    trailing_offset=trail_offset_bps,
+                    trailing_offset_type=TrailingOffsetType.BASIS_POINTS,
+                    activation_price=trail_activation,
+                    trigger_type=TriggerType.MARK_PRICE,
+                    reduce_only=True,
+                    tags=["VOL_TRAIL"],
+                )
+                self._protective_orders.append(order)
+                self.submit_order(order)
             self._protection_signature = signature
+            self._protection_position_key = position_key
         except Exception as exc:  # noqa: BLE001
             self.log.warning(f"protection placement failed for {self.instrument_id}: {exc!r}")
             self._protection_signature = None
+            self._protection_position_key = None
 
     def _equity(self) -> float:
         account = self.portfolio.account(self.venue)

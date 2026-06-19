@@ -65,6 +65,11 @@ class Settings(BaseSettings):
     binance_max_stop_pct: float = 0.30
     binance_use_take_profit: bool = False
     binance_tp_pct: float = 0.50
+    binance_use_trailing_stop: bool = False
+    binance_trailing_activation_r: float = 1.0
+    binance_trailing_vol_mult: float = 3.0
+    binance_min_trailing_pct: float = 0.005
+    binance_max_trailing_pct: float = 0.10
     binance_flatten_on_stop: bool = False  # graceful process stop should not force-exit by default
     binance_max_drawdown: float = 0.20  # portfolio kill-switch: flatten+halt below this DD
     binance_risk_check_secs: int = 5  # live mark-to-market drawdown cadence

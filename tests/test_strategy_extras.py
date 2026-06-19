@@ -64,6 +64,7 @@ def test_trend_config_patient_limit_and_safe_defaults():
     d = TrendStrategyConfig(instrument_id="X.Y", bar_type="X.Y-1-DAY-LAST-EXTERNAL")
     assert not d.use_patient_limit and not d.use_vol_stop and not d.use_correlation_scaling
     assert not d.funding_filter_enabled and not d.cost_aware_rebalance
+    assert not d.use_trailing_stop and d.trailing_activation_r == 1.0
     assert d.flatten_on_stop is False
 
 
@@ -119,8 +120,10 @@ def test_mark_watchdog_only_flags_the_stale_symbol():
 
 # --- protection idempotency (the live duplicate-stop bug) --------------------
 class _FakeOrder:
-    def __init__(self, coid: str) -> None:
+    def __init__(self, coid: str, kind: str, kwargs: dict) -> None:
         self.client_order_id = coid
+        self.kind = kind
+        self.kwargs = kwargs
         self.is_closed = False
         self.is_reduce_only = True
 
@@ -129,15 +132,18 @@ class _FakeFactory:
     def __init__(self) -> None:
         self.n = 0
 
-    def _mk(self, tag: str) -> _FakeOrder:
+    def _mk(self, tag: str, kwargs: dict) -> _FakeOrder:
         self.n += 1
-        return _FakeOrder(f"{tag}-{self.n}")
+        return _FakeOrder(f"{tag}-{self.n}", tag, kwargs)
 
-    def stop_market(self, **_kw):
-        return self._mk("stop")
+    def stop_market(self, **kwargs):
+        return self._mk("stop", kwargs)
 
-    def limit(self, **_kw):
-        return self._mk("limit")
+    def limit(self, **kwargs):
+        return self._mk("limit", kwargs)
+
+    def trailing_stop_market(self, **kwargs):
+        return self._mk("trail", kwargs)
 
 
 class _Num(float):
@@ -152,13 +158,32 @@ class _FakeInstrument:
         return _Num(x)
 
 
-def _protection_strat(monkeypatch, use_tp: bool = False) -> TrendStrategy:
+def _protection_strat(
+    monkeypatch,
+    use_tp: bool = False,
+    use_trail: bool = False,
+) -> TrendStrategy:
     """A TrendStrategy with just enough wired up to exercise _set_protection
     without a broker/engine (bypasses Strategy.__init__ via __new__). order_factory,
     cache and instrument_id are read-only Cython properties on the base class, so we
     shadow them with properties on the TrendStrategy subclass (precedes base in MRO)."""
     s = TrendStrategy.__new__(TrendStrategy)
-    cfg = SimpleNamespace(use_stop_loss=True, use_take_profit=use_tp, tp_pct=0.5, ppy=365)
+    cfg = SimpleNamespace(
+        use_stop_loss=True,
+        use_take_profit=use_tp,
+        tp_pct=0.5,
+        use_trailing_stop=use_trail,
+        trailing_activation_r=1.0,
+        trailing_vol_mult=3.0,
+        min_trailing_pct=0.005,
+        max_trailing_pct=0.10,
+        use_vol_stop=True,
+        stop_pct=0.20,
+        stop_vol_mult=4.0,
+        min_stop_pct=0.08,
+        max_stop_pct=0.30,
+        ppy=365,
+    )
     s.cfg = lambda: cfg
     s.instrument = _FakeInstrument()
     s._fake_factory = _FakeFactory()
@@ -170,7 +195,10 @@ def _protection_strat(monkeypatch, use_tp: bool = False) -> TrendStrategy:
     )
     s._protective_orders = []
     s._protection_signature = None
+    s._protection_position_key = None
     s._dynamic_stop_pct = 0.20
+    s._dynamic_trailing_pct = 0.05
+    s.risk_state = SimpleNamespace(mark_prices={})
     s.submitted = []
     s.canceled = []
     s.submit_order = s.submitted.append
@@ -204,6 +232,56 @@ def test_set_protection_flat_cancels_all(monkeypatch):
     assert s.submitted[0].is_closed
     assert s._protection_signature is None
     assert not s._has_live_protection()
+
+
+def test_native_vol_trail_keeps_hard_stop_and_arms_at_one_r(monkeypatch):
+    s = _protection_strat(monkeypatch, use_trail=True)
+    s._set_protection(2.0, 100.0)
+
+    assert [o.kind for o in s.submitted] == ["stop", "trail"]
+    hard, trail = s.submitted
+    assert float(hard.kwargs["trigger_price"]) == 80.0
+    assert float(trail.kwargs["activation_price"]) == 120.0
+    assert float(trail.kwargs["trailing_offset"]) == 500.0  # 5% = 500 bps
+    assert trail.kwargs["trailing_offset_type"].name == "BASIS_POINTS"
+    assert trail.kwargs["trigger_type"].name == "MARK_PRICE"
+    assert trail.kwargs["reduce_only"] is True
+
+
+def test_native_vol_trail_short_side_and_already_activated(monkeypatch):
+    s = _protection_strat(monkeypatch, use_trail=True)
+    s.risk_state.mark_prices["BTCUSDT.BINANCE"] = 75.0  # beyond short's +1R level (80)
+    s._set_protection(-2.0, 100.0)
+
+    hard, trail = s.submitted
+    assert float(hard.kwargs["trigger_price"]) == 120.0
+    assert hard.kwargs["order_side"].name == "BUY"
+    assert trail.kwargs["activation_price"] is None  # arm from current mark, avoid -2021
+    assert trail.kwargs["order_side"].name == "BUY"
+
+
+def test_native_trail_watermark_is_not_reset_by_daily_vol_update(monkeypatch):
+    s = _protection_strat(monkeypatch, use_trail=True)
+    s._set_protection(2.0, 100.0)
+    original_orders = list(s.submitted)
+
+    s._dynamic_stop_pct = 0.10
+    s._dynamic_trailing_pct = 0.02
+    s._set_protection(2.0, 100.0)
+
+    assert s.submitted == original_orders
+    assert not s.canceled
+
+
+def test_trailing_distance_uses_daily_vol_and_binance_bounds(monkeypatch):
+    s = _protection_strat(monkeypatch, use_trail=True)
+    s._update_dynamic_stop(inst_vol=0.38)
+    expected = 3.0 * 0.38 / (365**0.5)
+    assert abs(s._dynamic_trailing_pct - expected) < 1e-12
+
+    s.cfg().trailing_vol_mult = 100.0
+    s._update_dynamic_stop(inst_vol=1.0)
+    assert s._dynamic_trailing_pct == 0.10  # Binance maximum callback rate
 
 
 def test_funding_rate_updater_constructs():
