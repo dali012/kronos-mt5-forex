@@ -3,7 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
+import sqlite3
+import urllib.parse
+from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -40,6 +46,150 @@ def test_fills_idempotent(db):
     assert store.record_fill("oid-1", "BTCUSDT", "SELL", 0.01, 65000.0, db_path=db) is False  # dup
     fills = store.read_fills(db_path=db)
     assert len(fills) == 1 and fills[0]["symbol"] == "BTCUSDT"
+
+
+def test_accounting_migrates_old_db(tmp_path):
+    p = str(tmp_path / "old.db")
+    con = sqlite3.connect(p)
+    con.executescript(
+        """
+        CREATE TABLE snapshot (id INTEGER PRIMARY KEY, ts TEXT, data TEXT);
+        CREATE TABLE equity (ts TEXT, equity REAL, cash REAL, unrealized REAL, n_open INTEGER);
+        CREATE TABLE fills (
+            fill_id TEXT PRIMARY KEY, ts TEXT, symbol TEXT, side TEXT,
+            qty REAL, price REAL, kind TEXT
+        );
+        CREATE TABLE kv (name TEXT PRIMARY KEY, value TEXT, ts TEXT);
+        """
+    )
+    con.commit()
+    con.close()
+
+    store.init_db(p)
+    con = sqlite3.connect(p)
+    fill_cols = {row[1] for row in con.execute("PRAGMA table_info(fills)")}
+    equity_cols = {row[1] for row in con.execute("PRAGMA table_info(equity)")}
+    tables = {row[0] for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    con.close()
+    assert {"commission", "reference_price", "slippage", "trade_id", "reconciliation"} <= fill_cols
+    assert {"realized", "commissions", "funding", "slippage", "total_pnl"} <= equity_cols
+    assert "income" in tables
+
+
+def test_performance_accounting_reconciles_components(db):
+    store.append_equity(1000.0, 1000.0, 0.0, 0, db)
+    baseline = store.ensure_accounting_baseline(1000.0, 1000.0, 0.0, db)
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000) + 1
+    rows = [
+        ("realized", "REALIZED_PNL", 20.0),
+        ("commission", "COMMISSION", -2.0),
+        ("funding", "FUNDING_FEE", -1.0),
+        ("bonus", "WELCOME_BONUS", 5.0),
+    ]
+    for income_id, income_type, amount in rows:
+        store.record_income(income_id, now_ms, income_type, amount, db_path=db)
+    store.record_fill(
+        "fill-1",
+        "BTCUSDT",
+        "BUY",
+        1.0,
+        101.5,
+        reference_price=100.0,
+        slippage=1.5,
+        commission=0.04,
+        db_path=db,
+    )
+
+    summary = store.performance_summary(1027.0, 1022.0, 5.0, db)
+    assert baseline["equity"] == 1000.0
+    assert summary["total_pnl"] == 27.0
+    assert summary["realized_pnl"] == 20.0
+    assert summary["commissions"] == 2.0
+    assert summary["funding_payments"] == -1.0
+    assert summary["other_income"] == 5.0
+    assert summary["unrealized_change"] == 5.0
+    assert summary["slippage"] == 1.5 and summary["slippage_known_fills"] == 1
+    assert summary["reconciliation_residual"] == 0.0
+
+    # Baseline is immutable across restarts/snapshots.
+    again = store.ensure_accounting_baseline(2000.0, 2000.0, 0.0, db)
+    assert again == baseline
+
+
+def test_binance_income_client_signs_request():
+    from kronos_mt5.companion.accounting import BinanceIncomeClient
+
+    captured = {}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return b'[{"incomeType":"FUNDING_FEE","income":"-0.25","time":123}]'
+
+    def opener(request, timeout):
+        captured["request"] = request
+        captured["timeout"] = timeout
+        return Response()
+
+    client = BinanceIncomeClient(
+        "api-key",
+        "secret",
+        "https://demo-fapi.binance.com",
+        opener=opener,
+        clock_ms=lambda: 999,
+    )
+    rows = client.fetch_income(100)
+    assert rows[0]["incomeType"] == "FUNDING_FEE"
+    request = captured["request"]
+    parsed = urllib.parse.urlsplit(request.full_url)
+    params = urllib.parse.parse_qs(parsed.query)
+    signature = params.pop("signature")[0]
+    unsigned = parsed.query.rsplit("&signature=", 1)[0]
+    expected = hmac.new(b"secret", unsigned.encode(), hashlib.sha256).hexdigest()
+    assert signature == expected
+    assert request.get_header("X-mbx-apikey") == "api-key"
+    assert params["startTime"] == ["100"] and captured["timeout"] == 10.0
+
+
+def test_fill_reference_price_prefers_decision_tag():
+    from kronos_mt5.companion.recorder import Companion
+
+    order = SimpleNamespace(
+        tags=["REF_PX=100.25"],
+        trigger_price=99.0,
+        price=None,
+        activation_price=None,
+    )
+    assert Companion._reference_price(order) == 100.25
+
+
+def test_reconciliation_fill_is_stored_but_not_alerted(tmp_path, monkeypatch):
+    from kronos_mt5.companion import api
+
+    p = str(tmp_path / "reconciliation.db")
+    store.init_db(p)
+    store.record_fill(
+        "old-fill",
+        "BTCUSDT",
+        "BUY",
+        0.01,
+        65000.0,
+        reconciliation=True,
+        db_path=p,
+    )
+    sent = []
+    monkeypatch.setattr(api, "DB", p)
+    monkeypatch.setattr(api.tg, "send", sent.append)
+    api._check_fills()
+
+    assert sent == []
+    assert store.read_fills(db_path=p)[0]["reconciliation"] == 1
+    assert store.get_kv("alert_last_fill_rowid", "0", p) == "1"
 
 
 def test_control_modes(db):

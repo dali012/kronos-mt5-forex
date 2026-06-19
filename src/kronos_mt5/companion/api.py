@@ -5,6 +5,8 @@ Runs as a SEPARATE process next to the bot, reading the shared SQLite store.
 - GET  /api/state        latest equity / positions / alive
 - GET  /api/equity       equity curve
 - GET  /api/fills        trade log
+- GET  /api/performance  attributed PnL / costs / reconciliation
+- GET  /api/income       exchange income ledger
 - POST /kill   /resume   flip the shared control flag (panic switch; survives
                          bot restarts because the bot reads it from the DB)
 
@@ -75,6 +77,9 @@ def _check_fills() -> None:
         store.read_fills(limit=500, after_rowid=last, db_path=DB), key=lambda f: f["rowid"]
     )
     for f in new:
+        if f.get("reconciliation"):
+            store.set_kv("alert_last_fill_rowid", str(f["rowid"]), DB)
+            continue  # historical reconciliation on restart, not a new live fill
         icon = (
             "🛑 STOPPED OUT"
             if f.get("kind") == "STOP"
@@ -194,12 +199,32 @@ def _sparkline(vals: list[float], width: int = 24) -> str:
 
 
 def _pnl_from_snapshot(snap: dict) -> tuple[float, float, float]:
-    eq = store.read_equity(limit=200000, db_path=DB)
     equity = float(snap.get("equity", 0) or 0)
-    base = eq[0]["equity"] if eq else equity
-    total = equity - base
+    performance = snap.get("performance") or {}
+    base = float(performance.get("starting_equity", equity) or equity)
+    total = float(performance.get("total_pnl", equity - base) or 0)
     pct = (total / base * 100) if base else 0
     return equity, total, pct
+
+
+def _performance_text(snap: dict) -> str:
+    p = snap.get("performance") or {}
+    equity, total, pct = _pnl_from_snapshot(snap)
+    arrow = "📈" if total > 0 else ("📉" if total < 0 else "➖")
+    return (
+        f"<b>{arrow} Performance accounting</b>\n\n"
+        f"<b>Starting equity</b>: {_usd(float(p.get('starting_equity', equity)))}\n"
+        f"<b>Current equity</b>: {_usd(equity)}\n"
+        f"<b>Total net P&amp;L</b>: {_signed(total)} ({pct:+.2f}%)\n\n"
+        f"<b>Realized P&amp;L</b>: {_signed(float(p.get('realized_pnl', 0)))}\n"
+        f"<b>Unrealized P&amp;L</b>: {_signed(float(p.get('unrealized_pnl', 0)))}\n"
+        f"<b>Commissions</b>: -${float(p.get('commissions', 0)):,.2f}\n"
+        f"<b>Funding</b>: {_signed(float(p.get('funding_payments', 0)))}\n"
+        f"<b>Slippage</b>: ${float(p.get('slippage', 0)):,.2f}\n"
+        f"<b>Other income</b>: {_signed(float(p.get('other_income', 0)))}\n"
+        f"<b>Unexplained residual</b>: "
+        f"{_signed(float(p.get('reconciliation_residual', 0)))}"
+    )
 
 
 def _equity_summary() -> str:
@@ -300,13 +325,17 @@ def _daily_summary_text() -> str:
         1 for f in store.read_fills(limit=500, db_path=DB) if datetime.fromisoformat(f["ts"]) >= cut
     )
     arrow = "📈" if day >= 0 else "📉"
+    performance = snap.get("performance") or {}
     return (
         f"<b>{arrow} Daily summary</b>\n\n"
         f"<b>Equity</b>: {_usd(now)}\n"
         f"<b>Day PnL</b>: {_signed(day)} ({pct:+.1f}%)\n"
         f"<b>Drawdown</b>: {ddv:.1f}%\n"
         f"<b>Trades 24h</b>: {n24}\n"
-        f"<b>Open</b>: {snap.get('n_open', 0)}"
+        f"<b>Open</b>: {snap.get('n_open', 0)}\n"
+        f"<b>Realized</b>: {_signed(float(performance.get('realized_pnl', 0)))} · "
+        f"<b>Fees</b>: ${float(performance.get('commissions', 0)):,.2f} · "
+        f"<b>Funding</b>: {_signed(float(performance.get('funding_payments', 0)))}"
     )
 
 
@@ -354,15 +383,7 @@ def _handle(text: str) -> tuple[str, dict | None]:
         )
         return f"<b>📦 Open positions ({len(pos)})</b>\n<pre>{head}\n{rows}</pre>", None
     if cmd == "pnl":
-        equity, total, pct = _pnl_from_snapshot(snap)
-        arrow = "📈" if total > 0 else ("📉" if total < 0 else "➖")
-        return (
-            f"<b>{arrow} P&amp;L</b>\n\n"
-            f"<b>Equity</b>: {_usd(equity)}\n"
-            f"<b>Total</b>: {_signed(total)} ({pct:+.2f}%)\n"
-            f"<b>Unrealized</b>: {_signed(snap.get('unrealized', 0))}",
-            None,
-        )
+        return _performance_text(snap), None
     if cmd == "equity":
         return _equity_summary(), None
     if cmd == "chart":
@@ -564,6 +585,17 @@ def api_fills() -> JSONResponse:
     return JSONResponse(store.read_fills(limit=200, db_path=DB))
 
 
+@app.get("/api/performance", dependencies=[Depends(require_auth)])
+def api_performance() -> JSONResponse:
+    snap = store.read_snapshot(DB) or {}
+    return JSONResponse(snap.get("performance") or {})
+
+
+@app.get("/api/income", dependencies=[Depends(require_auth)])
+def api_income() -> JSONResponse:
+    return JSONResponse(store.read_income(limit=500, db_path=DB))
+
+
 @app.post("/kill", dependencies=[Depends(require_auth)])
 def kill() -> dict:
     store.set_mode("kill", DB)
@@ -631,20 +663,24 @@ async function refresh(){
   const s=await sr.json();
   const eq=await (await api('/api/equity')).json();
   const fills=await (await api('/api/fills')).json();
-  const base=eq.length?eq[0].equity:s.equity, pnl=(s.equity||0)-(base||0), pnlpct=base?pnl/base:0;
+  const p=s.performance||{}, base=p.starting_equity??s.equity, pnl=p.total_pnl??((s.equity||0)-(base||0)), pnlpct=base?pnl/base:0;
   const aliveDot=`<span class=dot style="background:${s.alive?'#3fb950':'#f85149'}"></span>`;
   const gate=s.mark_data_stale?' · <b style=color:#d29922>MARKS STALE · ENTRIES HALTED</b>':(s.halted?' · <b style=color:#f85149>HALTED</b>':'');
   document.getElementById('status').innerHTML=aliveDot+(s.alive?'live':'DOWN')+gate;
   document.getElementById('cards').innerHTML=`
    <div class=card><div class=k>Equity</div><div class=v>$${fmt(s.equity)}</div></div>
    <div class=card><div class=k>Total PnL</div><div class="v ${cls(pnl)}">$${fmt(pnl)} (${fmt(pnlpct*100)}%)</div></div>
+   <div class=card><div class=k>Realized</div><div class="v ${cls(p.realized_pnl)}">$${fmt(p.realized_pnl)}</div></div>
    <div class=card><div class=k>Unrealized</div><div class="v ${cls(s.unrealized)}">$${fmt(s.unrealized)}</div></div>
-   <div class=card><div class=k>Open</div><div class=v>${s.n_open??0}</div></div>
-   <div class=card><div class=k>Cash</div><div class=v>$${fmt(s.cash)}</div></div>`;
+   <div class=card><div class=k>Commissions</div><div class="v neg">-$${fmt(p.commissions)}</div></div>
+   <div class=card><div class=k>Funding</div><div class="v ${cls(p.funding_payments)}">$${fmt(p.funding_payments)}</div></div>
+   <div class=card><div class=k>Slippage</div><div class="v ${p.slippage>0?'neg':'pos'}">$${fmt(p.slippage)}</div></div>
+   <div class=card><div class=k>Residual</div><div class="v ${cls(p.reconciliation_residual)}">$${fmt(p.reconciliation_residual)}</div></div>
+   <div class=card><div class=k>Open</div><div class=v>${s.n_open??0}</div></div>`;
   document.getElementById('pos').innerHTML='<tr><th>Symbol</th><th>Qty</th><th>Entry</th><th>uPnL</th></tr>'+
     (s.positions||[]).map(p=>`<tr><td>${p.symbol}</td><td>${fmt(p.qty,4)}</td><td>${fmt(p.entry,4)}</td><td class="${cls(p.unrealized)}">$${fmt(p.unrealized)}</td></tr>`).join('');
-  document.getElementById('fills').innerHTML='<tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Price</th></tr>'+
-    fills.map(f=>`<tr><td>${(f.ts||'').slice(0,19).replace('T',' ')}</td><td>${f.symbol}</td><td class="${f.side=='BUY'?'pos':'neg'}">${f.side}</td><td>${fmt(f.qty,4)}</td><td>${fmt(f.price,4)}</td></tr>`).join('');
+  document.getElementById('fills').innerHTML='<tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Price</th><th>Fee</th><th>Slip</th></tr>'+
+    fills.map(f=>`<tr><td>${(f.ts||'').slice(0,19).replace('T',' ')}</td><td>${f.symbol}</td><td class="${f.side=='BUY'?'pos':'neg'}">${f.side}</td><td>${fmt(f.qty,4)}</td><td>${fmt(f.price,4)}</td><td>$${fmt(f.commission,4)}</td><td class="${f.slippage>0?'neg':'pos'}">$${fmt(f.slippage,4)}</td></tr>`).join('');
   const labels=eq.map(e=>e.ts.slice(5,16).replace('T',' ')), data=eq.map(e=>e.equity);
   if(!chart){chart=new Chart(document.getElementById('chart'),{type:'line',
     data:{labels,datasets:[{data,borderColor:'#3fb950',borderWidth:1.5,pointRadius:0,fill:false}]},

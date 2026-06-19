@@ -7,8 +7,9 @@ RiskState the strategies read. Only local SQLite writes — never blocks trading
 """
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
+from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.currencies import USDT
 from nautilus_trader.model.identifiers import InstrumentId, Venue
 from nautilus_trader.trading.strategy import Strategy, StrategyConfig
@@ -34,6 +35,7 @@ class Companion(Strategy):
     def on_start(self) -> None:
         store.init_db(self.config.db_path)
         store.heartbeat(self.config.db_path)
+        self._snapshot(None)  # establish the immutable accounting baseline promptly
         self.clock.set_timer("companion_snapshot",
                              timedelta(seconds=self.config.snapshot_secs), callback=self._snapshot)
         self.clock.set_timer("companion_control",
@@ -60,10 +62,11 @@ class Companion(Strategy):
     def _snapshot(self, event) -> None:  # noqa: ANN001
         try:
             acct = self.portfolio.account(self._venue)
-            cash = 0.0
-            if acct is not None:
-                bal = acct.balance_total(USDT)
-                cash = bal.as_double() if bal is not None else 0.0
+            if acct is None:
+                self.log.warning("companion snapshot: no account yet")
+                return
+            bal = acct.balance_total(USDT)
+            cash = bal.as_double() if bal is not None else 0.0
 
             positions, upnl_total = [], 0.0
             for iid in self._iids:
@@ -93,10 +96,19 @@ class Companion(Strategy):
 
             mark_stale = bool(self.risk_state and self.risk_state.market_data_stale)
             control_mode = self.risk_state.mode if self.risk_state else "run"
+            equity = cash + upnl_total
+            self._record_new_fills()
+            performance = store.performance_summary(
+                equity,
+                cash,
+                upnl_total,
+                self.config.db_path,
+            )
             store.write_snapshot(
                 {
-                    "equity": cash + upnl_total, "cash": cash, "unrealized": upnl_total,
+                    "equity": equity, "cash": cash, "unrealized": upnl_total,
                     "n_open": len(positions),
+                    "performance": performance,
                     "mode": "halt" if mark_stale and control_mode == "run" else control_mode,
                     "control_mode": control_mode,
                     "mark_data_stale": mark_stale,
@@ -110,8 +122,18 @@ class Companion(Strategy):
                 },
                 self.config.db_path,
             )
-            store.append_equity(cash + upnl_total, cash, upnl_total, len(positions), self.config.db_path)
-            self._record_new_fills()
+            store.append_equity(
+                equity,
+                cash,
+                upnl_total,
+                len(positions),
+                self.config.db_path,
+                realized=performance["realized_pnl"],
+                commissions=performance["commissions"],
+                funding=performance["funding_payments"],
+                slippage=performance["slippage"],
+                total_pnl=performance["total_pnl"],
+            )
             store.heartbeat(self.config.db_path)
         except Exception as exc:  # noqa: BLE001
             self.log.warning(f"companion snapshot failed: {exc!r}")
@@ -139,12 +161,6 @@ class Companion(Strategy):
 
     def _record_new_fills(self) -> None:
         for order in self.cache.orders():
-            try:
-                filled = float(order.filled_qty)
-            except Exception:  # noqa: BLE001
-                filled = 0.0
-            if filled <= 0 or order.avg_px is None:
-                continue
             ot = order.order_type.name
             if ot == "STOP_MARKET":
                 kind = "STOP"
@@ -154,12 +170,53 @@ class Companion(Strategy):
                 kind = "TP" if ot == "LIMIT" else "STOP"
             else:
                 kind = "TREND"
-            store.record_fill(
-                fill_id=order.client_order_id.value,
-                symbol=order.instrument_id.symbol.value,
-                side=order.side.name,
-                qty=filled,
-                price=float(order.avg_px),
-                kind=kind,
-                db_path=self.config.db_path,
-            )
+            reference = self._reference_price(order)
+            for index, event in enumerate(order.events()):
+                if not isinstance(event, OrderFilled):
+                    continue
+                qty = float(event.last_qty)
+                price = float(event.last_px)
+                trade_id = event.trade_id.value if event.trade_id is not None else ""
+                fill_id = (
+                    f"{order.instrument_id.symbol.value}:{trade_id}"
+                    if trade_id
+                    else f"{order.client_order_id.value}:{event.ts_event}:{index}"
+                )
+                slippage = None
+                if reference is not None:
+                    slippage = (
+                        (price - reference) * qty
+                        if event.is_buy
+                        else (reference - price) * qty
+                    )
+                commission = event.commission.as_double() if event.commission is not None else None
+                ts = datetime.fromtimestamp(event.ts_event / 1e9, tz=timezone.utc).isoformat()
+                store.record_fill(
+                    fill_id=fill_id,
+                    symbol=order.instrument_id.symbol.value,
+                    side=event.order_side.name,
+                    qty=qty,
+                    price=price,
+                    kind=kind,
+                    ts=ts,
+                    trade_id=trade_id,
+                    commission=commission,
+                    reference_price=reference,
+                    slippage=slippage,
+                    reconciliation=bool(event.reconciliation),
+                    db_path=self.config.db_path,
+                )
+
+    @staticmethod
+    def _reference_price(order) -> float | None:  # noqa: ANN001
+        for tag in order.tags or []:
+            if tag.startswith("REF_PX="):
+                try:
+                    return float(tag.removeprefix("REF_PX="))
+                except ValueError:
+                    pass
+        for name in ("trigger_price", "price", "activation_price"):
+            value = getattr(order, name, None)
+            if value is not None:
+                return float(value)
+        return None

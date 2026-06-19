@@ -73,6 +73,11 @@ bash scripts/run_live.sh                 # auto-restarts on crash
 - **logs/kronos_trend*.log** — rotating engine logs (100 MB × 10).
 - **logs/live_equity.csv** — hourly `timestamp,equity,cash,unrealized_pnl,n_open`.
   This is your forward-test record — plot it / compare to backtest after weeks.
+- **logs/companion.db** — immutable starting-equity baseline, per-execution fills
+  and slippage, Binance income rows (`REALIZED_PNL`, `COMMISSION`, `FUNDING_FEE`,
+  transfers/rebates), and minute-by-minute attributed performance. `/pnl` and
+  `/api/performance` show the breakdown plus an unexplained reconciliation residual.
+  The income ledger refreshes every `BINANCE_INCOME_POLL_SECS` (default five minutes).
 - **logs/supervisor.log** — restarts (only present with the tmux wrapper).
 - Binance testnet UI: 8 positions + 8 hard reduce-only stops (one per coin).
   With `BINANCE_USE_TRAILING_STOP=true`, expect one additional dormant/active
@@ -98,7 +103,8 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now kronos-companion
 ```
 Open `http://<vps-ip>:8000/` (append `?token=<API_TOKEN>` if you set one).
-- **Dashboard**: equity card + total/unrealized PnL, open positions, equity chart, recent fills, live/HALTED status.
+- **Dashboard**: starting/current equity, net/realized/unrealized PnL, commissions,
+  funding, measured slippage, reconciliation residual, positions, chart, and fills.
 - **⛔ KILL button** (or `curl -X POST http://<vps-ip>:8000/kill?token=...`): flattens + halts. Persisted in the DB, so it **survives a bot restart** — the bot stays halted until you hit **Resume**.
 - **Telegram alerts**: each fill, drawdown crossing `API_DD_WARN_PCT`, and **bot-down** (no heartbeat for `API_BOT_DOWN_SECS` — detected by the API, since a dead bot can't alert).
 - **Telegram commands (two-way control — no URL/token needed)**: once `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` are set, message your bot (only **your** chat id is obeyed = the auth):

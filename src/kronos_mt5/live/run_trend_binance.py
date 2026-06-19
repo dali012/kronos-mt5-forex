@@ -44,6 +44,7 @@ from nautilus_trader.portfolio.config import PortfolioConfig
 from nautilus_trader.trading.strategy import Strategy, StrategyConfig
 
 from config.settings import settings
+from kronos_mt5.companion.accounting import IncomePoller, IncomePollerConfig
 from kronos_mt5.companion.recorder import Companion, CompanionConfig
 from kronos_mt5.strategies.risk_manager import (
     MarkPriceMonitor,
@@ -56,6 +57,7 @@ from kronos_mt5.strategies.trend_strategy import TrendStrategy, TrendStrategyCon
 
 VENUE = "BINANCE"
 PREMIUM_INDEX_URL = "https://fapi.binance.com/fapi/v1/premiumIndex"
+TESTNET_FUTURES_REST_URL = "https://demo-fapi.binance.com"
 
 
 class HeartbeatConfig(StrategyConfig, frozen=True):
@@ -292,6 +294,17 @@ def build_node() -> TradingNode:
     )
     companion.risk_state = risk
     node.trader.add_strategy(companion)
+
+    income_poller = IncomePoller(
+        IncomePollerConfig(
+            db_path=settings.companion_db,
+            base_url=TESTNET_FUTURES_REST_URL,
+            interval_secs=settings.binance_income_poll_secs,
+        )
+    )
+    income_poller.api_key = settings.binance_api_key
+    income_poller.api_secret = settings.binance_api_secret
+    node.trader.add_strategy(income_poller)
 
     node.trader.add_strategy(
         Heartbeat(

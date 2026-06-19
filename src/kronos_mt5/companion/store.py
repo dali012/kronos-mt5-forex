@@ -44,18 +44,40 @@ def init_db(db_path: str = DEFAULT_DB) -> None:
         con.executescript(
             """
             CREATE TABLE IF NOT EXISTS snapshot (id INTEGER PRIMARY KEY CHECK (id=1), ts TEXT, data TEXT);
-            CREATE TABLE IF NOT EXISTS equity (ts TEXT, equity REAL, cash REAL, unrealized REAL, n_open INTEGER);
+            CREATE TABLE IF NOT EXISTS equity (
+                ts TEXT, equity REAL, cash REAL, unrealized REAL, n_open INTEGER,
+                realized REAL, commissions REAL, funding REAL, slippage REAL, total_pnl REAL
+            );
             CREATE TABLE IF NOT EXISTS fills (
                 fill_id TEXT PRIMARY KEY, ts TEXT, symbol TEXT, side TEXT,
-                qty REAL, price REAL, kind TEXT
+                qty REAL, price REAL, kind TEXT, trade_id TEXT, commission REAL,
+                reference_price REAL, slippage REAL, reconciliation INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS income (
+                income_id TEXT PRIMARY KEY, ts TEXT, time_ms INTEGER, income_type TEXT,
+                symbol TEXT, asset TEXT, amount REAL, trade_id TEXT, tran_id TEXT, info TEXT
             );
             CREATE TABLE IF NOT EXISTS kv (name TEXT PRIMARY KEY, value TEXT, ts TEXT);
+            CREATE INDEX IF NOT EXISTS idx_income_ts_type ON income(ts, income_type);
+            CREATE INDEX IF NOT EXISTS idx_fills_ts ON fills(ts);
             """
         )
-        # migrate older DBs that predate the `kind` column
-        cols = {r["name"] for r in con.execute("PRAGMA table_info(fills)")}
-        if "kind" not in cols:
-            con.execute("ALTER TABLE fills ADD COLUMN kind TEXT")
+        # Additive migrations preserve VPS databases created by earlier versions.
+        fill_cols = {r["name"] for r in con.execute("PRAGMA table_info(fills)")}
+        for name, sql_type in {
+            "kind": "TEXT",
+            "trade_id": "TEXT",
+            "commission": "REAL",
+            "reference_price": "REAL",
+            "slippage": "REAL",
+            "reconciliation": "INTEGER",
+        }.items():
+            if name not in fill_cols:
+                con.execute(f"ALTER TABLE fills ADD COLUMN {name} {sql_type}")
+        equity_cols = {r["name"] for r in con.execute("PRAGMA table_info(equity)")}
+        for name in ("realized", "commissions", "funding", "slippage", "total_pnl"):
+            if name not in equity_cols:
+                con.execute(f"ALTER TABLE equity ADD COLUMN {name} REAL")
 
 
 # --- writer side (bot) -------------------------------------------------------
@@ -68,26 +90,178 @@ def write_snapshot(data: dict, db_path: str = DEFAULT_DB) -> None:
         )
 
 
-def append_equity(equity: float, cash: float, unrealized: float, n_open: int,
-                  db_path: str = DEFAULT_DB) -> None:
+def append_equity(
+    equity: float,
+    cash: float,
+    unrealized: float,
+    n_open: int,
+    db_path: str = DEFAULT_DB,
+    *,
+    realized: float | None = None,
+    commissions: float | None = None,
+    funding: float | None = None,
+    slippage: float | None = None,
+    total_pnl: float | None = None,
+) -> None:
     with _conn(db_path) as con:
         con.execute(
-            "INSERT INTO equity (ts, equity, cash, unrealized, n_open) VALUES (?, ?, ?, ?, ?)",
-            (_now(), equity, cash, unrealized, n_open),
+            "INSERT INTO equity "
+            "(ts, equity, cash, unrealized, n_open, realized, commissions, funding, slippage, total_pnl) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                _now(), equity, cash, unrealized, n_open, realized,
+                commissions, funding, slippage, total_pnl,
+            ),
         )
 
 
-def record_fill(fill_id: str, symbol: str, side: str, qty: float, price: float,
-                kind: str = "TREND", ts: str | None = None, db_path: str = DEFAULT_DB) -> bool:
+def record_fill(
+    fill_id: str,
+    symbol: str,
+    side: str,
+    qty: float,
+    price: float,
+    kind: str = "TREND",
+    ts: str | None = None,
+    db_path: str = DEFAULT_DB,
+    *,
+    trade_id: str | None = None,
+    commission: float | None = None,
+    reference_price: float | None = None,
+    slippage: float | None = None,
+    reconciliation: bool = False,
+) -> bool:
     """Insert a fill (idempotent on fill_id). kind='STOP' for stop-loss fills.
     Returns True if newly inserted."""
     with _conn(db_path) as con:
         cur = con.execute(
-            "INSERT OR IGNORE INTO fills (fill_id, ts, symbol, side, qty, price, kind) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (fill_id, ts or _now(), symbol, side, qty, price, kind),
+            "INSERT OR IGNORE INTO fills "
+            "(fill_id, ts, symbol, side, qty, price, kind, trade_id, commission, "
+            "reference_price, slippage, reconciliation) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                fill_id, ts or _now(), symbol, side, qty, price, kind, trade_id,
+                commission, reference_price, slippage, int(reconciliation),
+            ),
         )
         return cur.rowcount > 0
+
+
+def record_income(
+    income_id: str,
+    time_ms: int,
+    income_type: str,
+    amount: float,
+    *,
+    symbol: str = "",
+    asset: str = "USDT",
+    trade_id: str = "",
+    tran_id: str = "",
+    info: str = "",
+    db_path: str = DEFAULT_DB,
+) -> bool:
+    ts = datetime.fromtimestamp(time_ms / 1000, tz=timezone.utc).isoformat()
+    with _conn(db_path) as con:
+        cur = con.execute(
+            "INSERT OR IGNORE INTO income "
+            "(income_id, ts, time_ms, income_type, symbol, asset, amount, trade_id, tran_id, info) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                income_id, ts, time_ms, income_type, symbol, asset, amount,
+                trade_id, tran_id, info,
+            ),
+        )
+        return cur.rowcount > 0
+
+
+def ensure_accounting_baseline(
+    equity: float,
+    cash: float,
+    unrealized: float,
+    db_path: str = DEFAULT_DB,
+) -> dict:
+    """Persist one immutable accounting baseline, preferring existing equity history."""
+    with _conn(db_path) as con:
+        existing = {
+            row["name"]: row["value"]
+            for row in con.execute(
+                "SELECT name, value FROM kv WHERE name LIKE 'accounting_start_%'"
+            )
+        }
+        if "accounting_start_equity" not in existing:
+            row = con.execute(
+                "SELECT ts, equity, cash, unrealized FROM equity ORDER BY ts ASC LIMIT 1"
+            ).fetchone()
+            values = {
+                "accounting_start_ts": row["ts"] if row else _now(),
+                "accounting_start_equity": str(row["equity"] if row else equity),
+                "accounting_start_cash": str(row["cash"] if row else cash),
+                "accounting_start_unrealized": str(row["unrealized"] if row else unrealized),
+            }
+            now = _now()
+            con.executemany(
+                "INSERT OR IGNORE INTO kv (name, value, ts) VALUES (?, ?, ?)",
+                [(name, value, now) for name, value in values.items()],
+            )
+            existing.update(values)
+    return {
+        "ts": existing["accounting_start_ts"],
+        "equity": float(existing["accounting_start_equity"]),
+        "cash": float(existing["accounting_start_cash"]),
+        "unrealized": float(existing["accounting_start_unrealized"]),
+    }
+
+
+def performance_summary(
+    equity: float,
+    cash: float,
+    unrealized: float,
+    db_path: str = DEFAULT_DB,
+) -> dict:
+    baseline = ensure_accounting_baseline(equity, cash, unrealized, db_path)
+    start_ts = baseline["ts"]
+    with _conn(db_path) as con:
+        rows = con.execute(
+            "SELECT income_type, COALESCE(SUM(amount), 0) AS amount "
+            "FROM income WHERE ts >= ? GROUP BY income_type",
+            (start_ts,),
+        ).fetchall()
+        by_type = {row["income_type"]: float(row["amount"]) for row in rows}
+        slip = con.execute(
+            "SELECT COALESCE(SUM(slippage), 0) AS total, COUNT(slippage) AS known "
+            "FROM fills WHERE ts >= ?",
+            (start_ts,),
+        ).fetchone()
+
+    realized = by_type.get("REALIZED_PNL", 0.0)
+    commission_income = by_type.get("COMMISSION", 0.0)
+    commissions = -commission_income  # positive means a cost
+    funding = by_type.get("FUNDING_FEE", 0.0)  # signed: received +, paid -
+    attributed = {"REALIZED_PNL", "COMMISSION", "FUNDING_FEE"}
+    other_income = sum(value for key, value in by_type.items() if key not in attributed)
+    total_pnl = equity - baseline["equity"]
+    unrealized_change = unrealized - baseline["unrealized"]
+    explained = realized - commissions + funding + other_income + unrealized_change
+    return {
+        "starting_ts": start_ts,
+        "starting_equity": baseline["equity"],
+        "starting_cash": baseline["cash"],
+        "starting_unrealized": baseline["unrealized"],
+        "current_equity": equity,
+        "current_cash": cash,
+        "total_pnl": total_pnl,
+        "realized_pnl": realized,
+        "unrealized_pnl": unrealized,
+        "unrealized_change": unrealized_change,
+        "commissions": commissions,
+        "funding_payments": funding,
+        "other_income": other_income,
+        "slippage": float(slip["total"]),
+        "slippage_known_fills": int(slip["known"]),
+        "reconciliation_residual": total_pnl - explained,
+        "income_last_update": get_kv("accounting_income_last_success_ts", None, db_path),
+        "income_error": get_kv("accounting_income_error", "", db_path) or None,
+    }
 
 
 def heartbeat(db_path: str = DEFAULT_DB) -> None:
@@ -148,7 +322,8 @@ def read_snapshot(db_path: str = DEFAULT_DB) -> dict | None:
 def read_equity(limit: int = 5000, db_path: str = DEFAULT_DB) -> list[dict]:
     with _conn(db_path) as con:
         rows = con.execute(
-            "SELECT ts, equity, cash, unrealized, n_open FROM equity ORDER BY ts DESC LIMIT ?",
+            "SELECT ts, equity, cash, unrealized, n_open, realized, commissions, "
+            "funding, slippage, total_pnl FROM equity ORDER BY ts DESC LIMIT ?",
             (limit,),
         ).fetchall()
     return [dict(r) for r in reversed(rows)]
@@ -157,8 +332,19 @@ def read_equity(limit: int = 5000, db_path: str = DEFAULT_DB) -> list[dict]:
 def read_fills(limit: int = 200, after_rowid: int = 0, db_path: str = DEFAULT_DB) -> list[dict]:
     with _conn(db_path) as con:
         rows = con.execute(
-            "SELECT rowid, ts, symbol, side, qty, price, kind FROM fills "
+            "SELECT rowid, ts, symbol, side, qty, price, kind, trade_id, commission, "
+            "reference_price, slippage, reconciliation FROM fills "
             "WHERE rowid > ? ORDER BY rowid DESC LIMIT ?",
             (after_rowid, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def read_income(limit: int = 500, db_path: str = DEFAULT_DB) -> list[dict]:
+    with _conn(db_path) as con:
+        rows = con.execute(
+            "SELECT income_id, ts, time_ms, income_type, symbol, asset, amount, "
+            "trade_id, tran_id, info FROM income ORDER BY time_ms DESC LIMIT ?",
+            (limit,),
         ).fetchall()
     return [dict(r) for r in rows]

@@ -380,6 +380,7 @@ class TrendStrategy(Strategy):
         return threshold
 
     def _submit_entry_order(self, side: OrderSide, qty, price: float) -> None:  # noqa: ANN001
+        reference_tags = [f"REF_PX={price:.12g}"]
         if self.cfg().use_patient_limit:
             offset = self.cfg().patient_limit_offset_bps / 1e4
             limit_price = price * (1 - offset) if side == OrderSide.BUY else price * (1 + offset)
@@ -388,6 +389,7 @@ class TrendStrategy(Strategy):
                 order_side=side,
                 quantity=qty,
                 price=self.instrument.make_price(limit_price),
+                tags=reference_tags,
             )
             self._pending_entry_order = order
             self.submit_order(order)
@@ -400,7 +402,10 @@ class TrendStrategy(Strategy):
             return
         self.submit_order(
             self.order_factory.market(
-                instrument_id=self.instrument_id, order_side=side, quantity=qty
+                instrument_id=self.instrument_id,
+                order_side=side,
+                quantity=qty,
+                tags=reference_tags,
             )
         )
 
@@ -418,6 +423,7 @@ class TrendStrategy(Strategy):
                     instrument_id=self.instrument_id,
                     order_side=order.side,
                     quantity=order.quantity,
+                    tags=order.tags,
                 )
             )
 

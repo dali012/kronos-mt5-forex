@@ -98,7 +98,9 @@ funding rows need `scripts/download_funding.py` first.
   Live PnL and drawdown use Binance's 1-second futures mark stream; a fail-closed
   freshness watchdog blocks new entries if any mark goes stale.
 - **Companion** — decoupled via SQLite so neither process can crash the other:
-  dashboard, equity curve, trade log, bearer‑auth API, Telegram alerts (fills,
+  dashboard, attributed performance ledger (starting equity, realized/unrealized
+  PnL, commissions, funding, slippage, reconciliation residual), equity curve,
+  trade log, bearer‑auth API, Telegram alerts (fills,
   drawdown, **bot‑down via heartbeat**), and **two‑way Telegram control**
   (`/status /pnl /chart /stops /kill …` with inline confirm buttons).
 
