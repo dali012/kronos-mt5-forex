@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import numpy as np
 import pandas as pd
+import pytest
 from nautilus_trader.model.data import MarkPriceUpdate
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.objects import Price
@@ -116,6 +118,20 @@ def test_mark_watchdog_only_flags_the_stale_symbol():
     assert risk.evaluate_mark_freshness(
         (btc, eth), now_ns=21_000_000_000, stale_after_secs=15
     ) == ("ETHUSDT-PERP",)
+
+
+def test_correlation_metrics_count_effective_bets_not_symbols():
+    risk = RiskState()
+    base = np.linspace(-0.02, 0.02, 90)
+    for symbol in ("BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "LTC", "LINK"):
+        risk.update_returns(symbol, base.copy())
+
+    metrics = risk.correlation_metrics(window=90, threshold=0.65, min_scalar=0.50)
+    assert metrics["series_count"] == 8
+    assert metrics["average_abs_correlation"] == pytest.approx(1.0)
+    assert metrics["effective_bets"] == pytest.approx(1.0)
+    assert metrics["risk_scalar"] == pytest.approx(0.50)
+    assert metrics["volatility_regime"] == "LOW_VOL"
 
 
 # --- protection idempotency (the live duplicate-stop bug) --------------------

@@ -100,8 +100,12 @@ funding rows need `scripts/download_funding.py` first.
 - **Companion** — decoupled via SQLite so neither process can crash the other:
   dashboard, attributed performance ledger (starting equity, realized/unrealized
   PnL, commissions, funding, slippage, reconciliation residual), equity curve,
-  trade log, bearer‑auth API, Telegram alerts (fills,
-  drawdown, **bot‑down via heartbeat**), and **two‑way Telegram control**
+  trade log, and a 30–50 cycle forward-test scorecard. Simultaneous crypto legs
+  are attributed as one correlated basket; average R, maximum drawdown, costs,
+  exit behavior, restarts, stale-data incidents, and direction/volatility regimes are
+  persisted and exposed at `/api/forward-test` and Telegram `/forward`.
+  The bearer‑auth API, Telegram alerts (fills, drawdown,
+  **bot‑down via heartbeat**), and **two‑way Telegram control**
   (`/status /pnl /chart /stops /kill …` with inline confirm buttons).
 
 ## Quickstart

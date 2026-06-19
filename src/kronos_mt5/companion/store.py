@@ -57,9 +57,33 @@ def init_db(db_path: str = DEFAULT_DB) -> None:
                 income_id TEXT PRIMARY KEY, ts TEXT, time_ms INTEGER, income_type TEXT,
                 symbol TEXT, asset TEXT, amount REAL, trade_id TEXT, tran_id TEXT, info TEXT
             );
+            CREATE TABLE IF NOT EXISTS closed_positions (
+                position_key TEXT PRIMARY KEY, opened_ts TEXT, closed_ts TEXT,
+                symbol TEXT, side TEXT, peak_qty REAL, entry_price REAL, exit_price REAL,
+                net_pnl REAL, commissions REAL, initial_risk REAL, r_multiple REAL,
+                exit_reason TEXT
+            );
+            CREATE TABLE IF NOT EXISTS basket_cycles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, started_ts TEXT NOT NULL,
+                ended_ts TEXT, direction TEXT NOT NULL, symbols TEXT NOT NULL,
+                starting_equity REAL NOT NULL, ending_equity REAL,
+                peak_equity REAL NOT NULL, trough_equity REAL NOT NULL,
+                initial_risk REAL, net_pnl REAL, r_multiple REAL,
+                exit_reasons TEXT, status TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS incidents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL,
+                started_ts TEXT NOT NULL, ended_ts TEXT, details TEXT
+            );
+            CREATE TABLE IF NOT EXISTS ops_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,
+                kind TEXT NOT NULL, details TEXT
+            );
             CREATE TABLE IF NOT EXISTS kv (name TEXT PRIMARY KEY, value TEXT, ts TEXT);
             CREATE INDEX IF NOT EXISTS idx_income_ts_type ON income(ts, income_type);
             CREATE INDEX IF NOT EXISTS idx_fills_ts ON fills(ts);
+            CREATE INDEX IF NOT EXISTS idx_basket_status ON basket_cycles(status);
+            CREATE INDEX IF NOT EXISTS idx_incidents_kind ON incidents(kind, started_ts);
             """
         )
         # Additive migrations preserve VPS databases created by earlier versions.
@@ -78,6 +102,14 @@ def init_db(db_path: str = DEFAULT_DB) -> None:
         for name in ("realized", "commissions", "funding", "slippage", "total_pnl"):
             if name not in equity_cols:
                 con.execute(f"ALTER TABLE equity ADD COLUMN {name} REAL")
+        for name, sql_type in {
+            "basket_direction": "TEXT",
+            "average_correlation": "REAL",
+            "effective_bets": "REAL",
+            "market_regime": "TEXT",
+        }.items():
+            if name not in equity_cols:
+                con.execute(f"ALTER TABLE equity ADD COLUMN {name} {sql_type}")
 
 
 # --- writer side (bot) -------------------------------------------------------
@@ -102,15 +134,21 @@ def append_equity(
     funding: float | None = None,
     slippage: float | None = None,
     total_pnl: float | None = None,
+    basket_direction: str | None = None,
+    average_correlation: float | None = None,
+    effective_bets: float | None = None,
+    market_regime: str | None = None,
 ) -> None:
     with _conn(db_path) as con:
         con.execute(
             "INSERT INTO equity "
-            "(ts, equity, cash, unrealized, n_open, realized, commissions, funding, slippage, total_pnl) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(ts, equity, cash, unrealized, n_open, realized, commissions, funding, slippage, "
+            "total_pnl, basket_direction, average_correlation, effective_bets, market_regime) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 _now(), equity, cash, unrealized, n_open, realized,
-                commissions, funding, slippage, total_pnl,
+                commissions, funding, slippage, total_pnl, basket_direction,
+                average_correlation, effective_bets, market_regime,
             ),
         )
 
@@ -172,6 +210,160 @@ def record_income(
             ),
         )
         return cur.rowcount > 0
+
+
+def record_closed_position(
+    position_key: str,
+    opened_ts: str,
+    closed_ts: str,
+    symbol: str,
+    side: str,
+    peak_qty: float,
+    entry_price: float,
+    exit_price: float,
+    net_pnl: float,
+    commissions: float,
+    *,
+    initial_risk: float | None = None,
+    exit_reason: str = "OTHER",
+    db_path: str = DEFAULT_DB,
+) -> bool:
+    """Persist one fully closed position cycle, idempotently."""
+    r_multiple = net_pnl / initial_risk if initial_risk and initial_risk > 0 else None
+    with _conn(db_path) as con:
+        cur = con.execute(
+            "INSERT OR IGNORE INTO closed_positions "
+            "(position_key, opened_ts, closed_ts, symbol, side, peak_qty, entry_price, "
+            "exit_price, net_pnl, commissions, initial_risk, r_multiple, exit_reason) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                position_key, opened_ts, closed_ts, symbol, side, peak_qty,
+                entry_price, exit_price, net_pnl, commissions, initial_risk,
+                r_multiple, exit_reason,
+            ),
+        )
+        return cur.rowcount > 0
+
+
+def update_basket_cycle(
+    direction: str,
+    symbols: list[str],
+    equity: float,
+    initial_risk: float | None,
+    db_path: str = DEFAULT_DB,
+    *,
+    started_ts: str | None = None,
+) -> dict | None:
+    """Advance the one correlated crypto-basket lifecycle.
+
+    A basket begins when the portfolio goes from flat to invested and completes
+    only when it becomes flat or directly reverses direction. Individual coin
+    positions remain diagnostics; they do not inflate the forward-test count.
+    """
+    now = _now()
+    direction = direction.upper()
+    with _conn(db_path) as con:
+        active = con.execute(
+            "SELECT * FROM basket_cycles WHERE status='active' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        reverses = bool(
+            active
+            and direction in {"LONG", "SHORT"}
+            and active["direction"] in {"LONG", "SHORT"}
+            and direction != active["direction"]
+        )
+        if active and (direction == "FLAT" or reverses):
+            pnl = equity - float(active["starting_equity"])
+            risk = active["initial_risk"]
+            r_multiple = pnl / risk if risk and risk > 0 else None
+            reason_rows = con.execute(
+                "SELECT kind, COUNT(*) AS n FROM fills WHERE ts >= ? "
+                "AND kind IN ('STOP', 'TRAIL', 'TP') GROUP BY kind",
+                (active["started_ts"],),
+            ).fetchall()
+            reasons = {row["kind"]: int(row["n"]) for row in reason_rows}
+            if not reasons:
+                reasons = {"TREND_OR_MANUAL": 1}
+            con.execute(
+                "UPDATE basket_cycles SET ended_ts=?, ending_equity=?, "
+                "peak_equity=MAX(peak_equity, ?), trough_equity=MIN(trough_equity, ?), "
+                "net_pnl=?, r_multiple=?, exit_reasons=?, status='completed' WHERE id=?",
+                (now, equity, equity, equity, pnl, r_multiple, json.dumps(reasons), active["id"]),
+            )
+            active = None
+        if direction != "FLAT":
+            if active is None:
+                inferred_start_ts = started_ts or now
+                historical = con.execute(
+                    "SELECT equity FROM equity WHERE ts >= ? ORDER BY ts ASC LIMIT 1",
+                    (inferred_start_ts,),
+                ).fetchone()
+                if historical is None:
+                    historical = con.execute(
+                        "SELECT equity FROM equity WHERE ts < ? ORDER BY ts DESC LIMIT 1",
+                        (inferred_start_ts,),
+                    ).fetchone()
+                starting_equity = float(historical["equity"]) if historical else equity
+                extrema = con.execute(
+                    "SELECT MIN(equity) AS trough, MAX(equity) AS peak FROM equity WHERE ts >= ?",
+                    (inferred_start_ts,),
+                ).fetchone()
+                peak_equity = max(equity, float(extrema["peak"] or equity), starting_equity)
+                trough_equity = min(equity, float(extrema["trough"] or equity), starting_equity)
+                cur = con.execute(
+                    "INSERT INTO basket_cycles "
+                    "(started_ts, direction, symbols, starting_equity, peak_equity, "
+                    "trough_equity, initial_risk, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'active')",
+                    (
+                        inferred_start_ts, direction, json.dumps(sorted(symbols)),
+                        starting_equity, peak_equity, trough_equity, initial_risk,
+                    ),
+                )
+                basket_id = cur.lastrowid
+            else:
+                basket_id = int(active["id"])
+                known_symbols = set(json.loads(active["symbols"])) | set(symbols)
+                con.execute(
+                    "UPDATE basket_cycles SET symbols=?, peak_equity=MAX(peak_equity, ?), "
+                    "trough_equity=MIN(trough_equity, ?), initial_risk=COALESCE(initial_risk, ?) "
+                    "WHERE id=?",
+                    (json.dumps(sorted(known_symbols)), equity, equity, initial_risk, basket_id),
+                )
+            row = con.execute("SELECT * FROM basket_cycles WHERE id=?", (basket_id,)).fetchone()
+            return dict(row)
+    return None
+
+
+def record_event(kind: str, details: str = "", db_path: str = DEFAULT_DB) -> None:
+    with _conn(db_path) as con:
+        con.execute(
+            "INSERT INTO ops_events (ts, kind, details) VALUES (?, ?, ?)",
+            (_now(), kind, details),
+        )
+
+
+def start_incident(kind: str, details: str = "", db_path: str = DEFAULT_DB) -> int:
+    """Open an incident once; repeated watchdog polls remain idempotent."""
+    with _conn(db_path) as con:
+        row = con.execute(
+            "SELECT id FROM incidents WHERE kind=? AND ended_ts IS NULL ORDER BY id DESC LIMIT 1",
+            (kind,),
+        ).fetchone()
+        if row:
+            return int(row["id"])
+        cur = con.execute(
+            "INSERT INTO incidents (kind, started_ts, details) VALUES (?, ?, ?)",
+            (kind, _now(), details),
+        )
+        return int(cur.lastrowid)
+
+
+def resolve_incident(kind: str, db_path: str = DEFAULT_DB) -> None:
+    with _conn(db_path) as con:
+        con.execute(
+            "UPDATE incidents SET ended_ts=? WHERE kind=? AND ended_ts IS NULL",
+            (_now(), kind),
+        )
 
 
 def ensure_accounting_baseline(
@@ -323,7 +515,8 @@ def read_equity(limit: int = 5000, db_path: str = DEFAULT_DB) -> list[dict]:
     with _conn(db_path) as con:
         rows = con.execute(
             "SELECT ts, equity, cash, unrealized, n_open, realized, commissions, "
-            "funding, slippage, total_pnl FROM equity ORDER BY ts DESC LIMIT ?",
+            "funding, slippage, total_pnl, basket_direction, average_correlation, "
+            "effective_bets, market_regime FROM equity ORDER BY ts DESC LIMIT ?",
             (limit,),
         ).fetchall()
     return [dict(r) for r in reversed(rows)]
@@ -348,3 +541,141 @@ def read_income(limit: int = 500, db_path: str = DEFAULT_DB) -> list[dict]:
             (limit,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def read_closed_positions(limit: int = 500, db_path: str = DEFAULT_DB) -> list[dict]:
+    with _conn(db_path) as con:
+        rows = con.execute(
+            "SELECT * FROM closed_positions ORDER BY closed_ts DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def read_basket_cycles(limit: int = 200, db_path: str = DEFAULT_DB) -> list[dict]:
+    with _conn(db_path) as con:
+        rows = con.execute(
+            "SELECT * FROM basket_cycles ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["symbols"] = json.loads(item["symbols"] or "[]")
+        item["exit_reasons"] = json.loads(item["exit_reasons"] or "{}")
+        result.append(item)
+    return result
+
+
+def read_incidents(limit: int = 500, db_path: str = DEFAULT_DB) -> list[dict]:
+    with _conn(db_path) as con:
+        rows = con.execute(
+            "SELECT * FROM incidents ORDER BY started_ts DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def forward_test_report(db_path: str = DEFAULT_DB) -> dict:
+    """Return the acceptance scorecard for the 30–50 basket-cycle test."""
+    snap = read_snapshot(db_path) or {}
+    perf = snap.get("performance") or {}
+    equity_rows = read_equity(limit=100000, db_path=db_path)
+    baskets = read_basket_cycles(limit=100000, db_path=db_path)
+    closed = [row for row in baskets if row["status"] == "completed"]
+    active = next((row for row in baskets if row["status"] == "active"), None)
+    known_r = [float(row["r_multiple"]) for row in closed if row["r_multiple"] is not None]
+
+    peak = None
+    max_drawdown = 0.0
+    for row in equity_rows:
+        value = float(row["equity"])
+        peak = value if peak is None else max(peak, value)
+        if peak:
+            max_drawdown = min(max_drawdown, value / peak - 1.0)
+
+    regimes = sorted(
+        {
+            str(row["basket_direction"])
+            for row in equity_rows
+            if row.get("basket_direction") in {"LONG", "SHORT", "MIXED"}
+        }
+    )
+    market_regimes = sorted(
+        {
+            str(row["market_regime"])
+            for row in equity_rows
+            if row.get("market_regime") and "UNKNOWN" not in str(row["market_regime"])
+        }
+    )
+    volatility_regimes = sorted({regime.rsplit("_", 2)[-2] + "_VOL" for regime in market_regimes})
+    incidents = read_incidents(limit=100000, db_path=db_path)
+    incident_stats = {}
+    now = datetime.now(timezone.utc)
+    for kind in ("MARK_STALE", "BOT_DOWN"):
+        selected = [row for row in incidents if row["kind"] == kind]
+        seconds = 0.0
+        for row in selected:
+            start = datetime.fromisoformat(row["started_ts"])
+            end = datetime.fromisoformat(row["ended_ts"]) if row["ended_ts"] else now
+            seconds += max(0.0, (end - start).total_seconds())
+        incident_stats[kind] = {
+            "count": len(selected),
+            "open": sum(row["ended_ts"] is None for row in selected),
+            "duration_secs": seconds,
+        }
+
+    with _conn(db_path) as con:
+        starts = int(
+            con.execute("SELECT COUNT(*) AS n FROM ops_events WHERE kind='BOT_START'").fetchone()["n"]
+        )
+        exits = {
+            row["exit_reason"]: int(row["n"])
+            for row in con.execute(
+                "SELECT exit_reason, COUNT(*) AS n FROM closed_positions GROUP BY exit_reason"
+            ).fetchall()
+        }
+
+    count = len(closed)
+    if count < 30:
+        status = "COLLECTING"
+    elif len(market_regimes) < 2:
+        status = "REGIME_COVERAGE_REQUIRED"
+    elif len(known_r) < count:
+        status = "R_DATA_INCOMPLETE"
+    elif count < 50:
+        status = "MINIMUM_REACHED"
+    else:
+        status = "REVIEW_READY"
+    start_equity = float(perf.get("starting_equity") or 0.0)
+    total_pnl = float(perf.get("total_pnl") or 0.0)
+    return {
+        "status": status,
+        "completed_basket_cycles": count,
+        "completed_symbol_positions": len(read_closed_positions(limit=100000, db_path=db_path)),
+        "minimum_target": 30,
+        "preferred_target": 50,
+        "minimum_progress_pct": min(100.0, count / 30 * 100.0),
+        "preferred_progress_pct": min(100.0, count / 50 * 100.0),
+        "active_basket": active,
+        "net_return_pct": total_pnl / start_equity * 100.0 if start_equity else None,
+        "maximum_drawdown_pct": max_drawdown * 100.0,
+        "average_r": sum(known_r) / len(known_r) if known_r else None,
+        "r_known_cycles": len(known_r),
+        "commissions": perf.get("commissions"),
+        "funding_payments": perf.get("funding_payments"),
+        "slippage": perf.get("slippage"),
+        "exit_reason_counts": exits,
+        "bot_starts": starts,
+        "restart_count": max(0, starts - 1),
+        "incidents": incident_stats,
+        "directional_regimes_seen": regimes,
+        "multiple_directional_regimes_seen": len(regimes) >= 2,
+        "market_regimes_seen": market_regimes,
+        "volatility_regimes_seen": volatility_regimes,
+        "multiple_market_regimes_seen": len(market_regimes) >= 2,
+        "qualification_note": (
+            "Each simultaneous correlated crypto book counts as one basket cycle; "
+            "symbol positions are diagnostic only. Passing the trade count alone is not approval."
+        ),
+    }

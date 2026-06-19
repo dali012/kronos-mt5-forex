@@ -380,7 +380,10 @@ class TrendStrategy(Strategy):
         return threshold
 
     def _submit_entry_order(self, side: OrderSide, qty, price: float) -> None:  # noqa: ANN001
-        reference_tags = [f"REF_PX={price:.12g}"]
+        reference_tags = [
+            f"REF_PX={price:.12g}",
+            f"RISK_PCT={self._dynamic_stop_pct:.12g}",
+        ]
         if self.cfg().use_patient_limit:
             offset = self.cfg().patient_limit_offset_bps / 1e4
             limit_price = price * (1 - offset) if side == OrderSide.BUY else price * (1 + offset)

@@ -23,6 +23,9 @@ class CompanionConfig(StrategyConfig, frozen=True):
     db_path: str = store.DEFAULT_DB
     snapshot_secs: int = 60
     control_secs: int = 15
+    corr_window: int = 90
+    corr_threshold: float = 0.65
+    corr_min_scalar: float = 0.50
 
 
 class Companion(Strategy):
@@ -34,6 +37,7 @@ class Companion(Strategy):
 
     def on_start(self) -> None:
         store.init_db(self.config.db_path)
+        store.record_event("BOT_START", db_path=self.config.db_path)
         store.heartbeat(self.config.db_path)
         self._snapshot(None)  # establish the immutable accounting baseline promptly
         self.clock.set_timer("companion_snapshot",
@@ -85,6 +89,13 @@ class Companion(Strategy):
                         "symbol": iid.symbol.value,
                         "qty": net,
                         "entry": entry,
+                        "opened_ts": (
+                            datetime.fromtimestamp(
+                                open_pos[0].ts_opened / 1e9, tz=timezone.utc
+                            ).isoformat()
+                            if open_pos
+                            else None
+                        ),
                         "mark": (
                             self.risk_state.mark_prices.get(str(iid))
                             if self.risk_state is not None
@@ -94,10 +105,28 @@ class Companion(Strategy):
                     }
                 )
 
+            orders = self._open_orders()
+            self._record_new_fills()
+            self._record_closed_positions()
+
+            direction = self._basket_direction(positions)
+            correlation = self._correlation_metrics()
+            basket = self._basket_metrics(positions, orders, direction, correlation)
+            store.update_basket_cycle(
+                direction,
+                [p["symbol"] for p in positions],
+                cash + upnl_total,
+                basket["hard_stop_risk"],
+                self.config.db_path,
+                started_ts=min(
+                    (p["opened_ts"] for p in positions if p.get("opened_ts")),
+                    default=None,
+                ),
+            )
+
             mark_stale = bool(self.risk_state and self.risk_state.market_data_stale)
             control_mode = self.risk_state.mode if self.risk_state else "run"
             equity = cash + upnl_total
-            self._record_new_fills()
             performance = store.performance_summary(
                 equity,
                 cash,
@@ -118,7 +147,8 @@ class Companion(Strategy):
                     "mark_age_secs": (
                         self.risk_state.mark_age_secs if self.risk_state else {}
                     ),
-                    "positions": positions, "orders": self._open_orders(),
+                    "basket": basket,
+                    "positions": positions, "orders": orders,
                 },
                 self.config.db_path,
             )
@@ -133,10 +163,87 @@ class Companion(Strategy):
                 funding=performance["funding_payments"],
                 slippage=performance["slippage"],
                 total_pnl=performance["total_pnl"],
+                basket_direction=direction,
+                average_correlation=correlation["average_abs_correlation"],
+                effective_bets=correlation["effective_bets"],
+                market_regime=(
+                    f"{direction}_{correlation['volatility_regime']}"
+                    if direction != "FLAT"
+                    else None
+                ),
             )
             store.heartbeat(self.config.db_path)
         except Exception as exc:  # noqa: BLE001
             self.log.warning(f"companion snapshot failed: {exc!r}")
+
+    def on_stop(self) -> None:
+        try:
+            store.record_event("BOT_STOP", db_path=self.config.db_path)
+        except Exception as exc:  # noqa: BLE001
+            self.log.warning(f"companion stop event failed: {exc!r}")
+
+    def _correlation_metrics(self) -> dict:
+        if self.risk_state is None or not hasattr(self.risk_state, "correlation_metrics"):
+            return {
+                "series_count": 0,
+                "average_abs_correlation": None,
+                "effective_bets": None,
+                "risk_scalar": 1.0,
+                "average_annualized_volatility": None,
+                "volatility_regime": "UNKNOWN",
+            }
+        return self.risk_state.correlation_metrics(
+            self.config.corr_window,
+            self.config.corr_threshold,
+            self.config.corr_min_scalar,
+        )
+
+    @staticmethod
+    def _basket_direction(positions: list[dict]) -> str:
+        sides = {1 if p["qty"] > 0 else -1 for p in positions if p["qty"] != 0}
+        if not sides:
+            return "FLAT"
+        if sides == {1}:
+            return "LONG"
+        if sides == {-1}:
+            return "SHORT"
+        return "MIXED"
+
+    @staticmethod
+    def _basket_metrics(
+        positions: list[dict],
+        orders: list[dict],
+        direction: str,
+        correlation: dict,
+    ) -> dict:
+        gross_notional = 0.0
+        net_notional = 0.0
+        hard_stop_risk = 0.0
+        stops = {
+            order["symbol"]: order["trigger"]
+            for order in orders
+            if order["type"] == "STOP_MARKET" and order["trigger"] is not None
+        }
+        for position in positions:
+            reference = position.get("mark") or position.get("entry")
+            if reference is not None:
+                signed = float(position["qty"]) * float(reference)
+                gross_notional += abs(signed)
+                net_notional += signed
+            stop = stops.get(position["symbol"])
+            entry = position.get("entry")
+            if stop is not None and entry is not None:
+                hard_stop_risk += abs(float(stop) - float(entry)) * abs(float(position["qty"]))
+        return {
+            "direction": direction,
+            "symbol_positions": len(positions),
+            "gross_notional": gross_notional,
+            "net_notional": net_notional,
+            "unrealized_pnl": sum(float(p.get("unrealized") or 0.0) for p in positions),
+            "hard_stop_risk": hard_stop_risk or None,
+            **correlation,
+            "interpretation": "one correlated crypto basket, not independent symbol wins",
+        }
 
     def _open_orders(self) -> list[dict]:
         out = []
@@ -206,6 +313,67 @@ class Companion(Strategy):
                     reconciliation=bool(event.reconciliation),
                     db_path=self.config.db_path,
                 )
+
+    def _record_closed_positions(self) -> None:
+        for position in self.cache.positions_closed(venue=self._venue):
+            opening = self.cache.order(position.opening_order_id)
+            closing = (
+                self.cache.order(position.closing_order_id)
+                if position.closing_order_id is not None
+                else None
+            )
+            risk_pct = self._tag_float(opening, "RISK_PCT=")
+            peak_qty = float(position.peak_qty)
+            entry = float(position.avg_px_open)
+            initial_risk = peak_qty * entry * risk_pct if risk_pct else None
+            commissions = sum(money.as_double() for money in position.commissions())
+            realized = position.realized_pnl
+            net_pnl = realized.as_double() if realized is not None else 0.0
+            reason = self._exit_reason(closing)
+            opened_ts = datetime.fromtimestamp(position.ts_opened / 1e9, tz=timezone.utc).isoformat()
+            closed_ts = datetime.fromtimestamp(position.ts_closed / 1e9, tz=timezone.utc).isoformat()
+            store.record_closed_position(
+                position_key=f"{position.id.value}:{position.ts_opened}",
+                opened_ts=opened_ts,
+                closed_ts=closed_ts,
+                symbol=position.instrument_id.symbol.value,
+                # Closed Nautilus positions have side=FLAT; entry preserves the
+                # original BUY/SELL direction for lifecycle attribution.
+                side="LONG" if position.entry.name == "BUY" else "SHORT",
+                peak_qty=peak_qty,
+                entry_price=entry,
+                exit_price=float(position.avg_px_close),
+                net_pnl=net_pnl,
+                commissions=commissions,
+                initial_risk=initial_risk,
+                exit_reason=reason,
+                db_path=self.config.db_path,
+            )
+
+    @staticmethod
+    def _tag_float(order, prefix: str) -> float | None:  # noqa: ANN001
+        if order is None:
+            return None
+        for tag in order.tags or []:
+            if tag.startswith(prefix):
+                try:
+                    return float(tag.removeprefix(prefix))
+                except ValueError:
+                    return None
+        return None
+
+    @staticmethod
+    def _exit_reason(order) -> str:  # noqa: ANN001
+        if order is None:
+            return "OTHER"
+        kind = order.order_type.name
+        if kind == "STOP_MARKET":
+            return "HARD_STOP"
+        if kind == "TRAILING_STOP_MARKET":
+            return "TRAILING_STOP"
+        if kind == "LIMIT" and getattr(order, "is_reduce_only", False):
+            return "TAKE_PROFIT"
+        return "TREND_OR_MANUAL"
 
     @staticmethod
     def _reference_price(order) -> float | None:  # noqa: ANN001

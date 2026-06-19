@@ -83,21 +83,69 @@ class RiskState:
         threshold: float,
         min_scalar: float,
     ) -> float:
+        return float(self.correlation_metrics(window, threshold, min_scalar)["risk_scalar"])
+
+    def correlation_metrics(
+        self,
+        window: int,
+        threshold: float,
+        min_scalar: float,
+    ) -> dict[str, float | int | str | None]:
+        """Describe the book as correlated bets, not a count of symbols.
+
+        ``effective_bets`` uses the standard equal-correlation approximation
+        N / (1 + (N - 1) rho). Eight perfectly correlated coins therefore count
+        as one effective bet, while genuinely independent series approach eight.
+        """
         series = [r[-window:] for r in self.returns_by_symbol.values() if len(r) >= window]
+        vols = [float(np.std(r, ddof=1) * np.sqrt(365)) for r in series if len(r) > 1]
+        average_vol = float(np.mean(vols)) if vols else None
+        if average_vol is None:
+            vol_regime = "UNKNOWN"
+        elif average_vol < 0.40:
+            vol_regime = "LOW_VOL"
+        elif average_vol > 0.80:
+            vol_regime = "HIGH_VOL"
+        else:
+            vol_regime = "NORMAL_VOL"
         if len(series) < 2:
-            return 1.0
+            return {
+                "series_count": len(series),
+                "average_abs_correlation": None,
+                "effective_bets": None,
+                "risk_scalar": 1.0,
+                "average_annualized_volatility": average_vol,
+                "volatility_regime": vol_regime,
+            }
         arr = np.vstack(series)
         corr = np.corrcoef(arr)
         upper = corr[np.triu_indices_from(corr, k=1)]
         upper = upper[np.isfinite(upper)]
         if len(upper) == 0:
-            return 1.0
+            return {
+                "series_count": len(series),
+                "average_abs_correlation": None,
+                "effective_bets": None,
+                "risk_scalar": 1.0,
+                "average_annualized_volatility": average_vol,
+                "volatility_regime": vol_regime,
+            }
         avg_corr = float(np.mean(np.abs(upper)))
+        effective = len(series) / (1.0 + (len(series) - 1.0) * avg_corr)
         if avg_corr <= threshold:
-            return 1.0
-        span = max(1e-9, 1.0 - threshold)
-        pressure = min(1.0, (avg_corr - threshold) / span)
-        return max(min_scalar, 1.0 - pressure * (1.0 - min_scalar))
+            scalar = 1.0
+        else:
+            span = max(1e-9, 1.0 - threshold)
+            pressure = min(1.0, (avg_corr - threshold) / span)
+            scalar = max(min_scalar, 1.0 - pressure * (1.0 - min_scalar))
+        return {
+            "series_count": len(series),
+            "average_abs_correlation": avg_corr,
+            "effective_bets": float(effective),
+            "risk_scalar": float(scalar),
+            "average_annualized_volatility": average_vol,
+            "volatility_regime": vol_regime,
+        }
 
 
 class RiskManagerConfig(StrategyConfig, frozen=True):
@@ -113,6 +161,7 @@ class MarkPriceMonitorConfig(StrategyConfig, frozen=True):
     instrument_ids: tuple[str, ...]
     check_secs: int = 5
     stale_after_secs: int = 15
+    db_path: str = store.DEFAULT_DB
 
 
 class MarkPriceMonitor(Strategy):
@@ -164,11 +213,19 @@ class MarkPriceMonitor(Strategy):
             self.config.stale_after_secs,
         )
         if stale and not was_stale:
+            try:
+                store.start_incident("MARK_STALE", ",".join(stale), self.config.db_path)
+            except Exception as exc:  # noqa: BLE001
+                self.log.warning(f"record stale-mark incident failed: {exc!r}")
             self.log.error(
                 "MARK WATCHDOG: stale streams "
                 f"({', '.join(stale)}); new entries halted, positions/stops kept"
             )
         elif not stale and was_stale:
+            try:
+                store.resolve_incident("MARK_STALE", self.config.db_path)
+            except Exception as exc:  # noqa: BLE001
+                self.log.warning(f"resolve stale-mark incident failed: {exc!r}")
             self.log.warning("MARK WATCHDOG: all mark streams fresh; entry gate released")
 
     def on_stop(self) -> None:

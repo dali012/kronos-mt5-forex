@@ -7,6 +7,7 @@ Runs as a SEPARATE process next to the bot, reading the shared SQLite store.
 - GET  /api/fills        trade log
 - GET  /api/performance  attributed PnL / costs / reconciliation
 - GET  /api/income       exchange income ledger
+- GET  /api/forward-test basket-cycle qualification scorecard
 - POST /kill   /resume   flip the shared control flag (panic switch; survives
                          bot restarts because the bot reads it from the DB)
 
@@ -112,9 +113,11 @@ def _check_bot_down() -> None:
     alive, age = _alive()
     down_alerted = store.get_kv("alert_bot_down", "0", DB) == "1"
     if not alive and not down_alerted:
+        store.start_incident("BOT_DOWN", f"heartbeat_age_secs={age}", DB)
         tg.send(f"🛑 BOT DOWN — no heartbeat for {int(age) if age else '∞'}s")
         store.set_kv("alert_bot_down", "1", DB)
     elif alive and down_alerted:
+        store.resolve_incident("BOT_DOWN", DB)
         tg.send("🟢 BOT RECOVERED — heartbeat resumed")
         store.set_kv("alert_bot_down", "0", DB)
 
@@ -126,8 +129,10 @@ def _check_mark_data() -> None:
     if stale and not alerted:
         symbols = ", ".join(snap.get("stale_mark_symbols", [])) or "unknown"
         tg.send(f"🟠 MARK DATA STALE — entries halted ({symbols}); positions/stops kept")
+        store.start_incident("MARK_STALE", symbols, DB)
         store.set_kv("alert_mark_stale", "1", DB)
     elif not stale and alerted:
+        store.resolve_incident("MARK_STALE", DB)
         tg.send("🟢 MARK DATA RECOVERED — entry gate released")
         store.set_kv("alert_mark_stale", "0", DB)
 
@@ -143,6 +148,7 @@ HELP = (
     "📊 /status — live/halted + equity\n"
     "📦 /positions — open positions\n"
     "💹 /pnl · /equity — P&amp;L &amp; equity deltas\n"
+    "🧪 /forward — 30–50 basket-cycle scorecard\n"
     "📈 /chart — equity sparkline\n"
     "🛡 /stops · /orders — protective orders\n"
     "🧹 /flatten · /close BTC — flatten all / one\n"
@@ -339,6 +345,28 @@ def _daily_summary_text() -> str:
     )
 
 
+def _forward_test_text() -> str:
+    report = store.forward_test_report(DB)
+    completed = report["completed_basket_cycles"]
+    average_r = report["average_r"]
+    avg_r_text = f"{average_r:+.2f}R" if average_r is not None else "not known yet"
+    regimes = ", ".join(report["market_regimes_seen"]) or "none yet"
+    stale = report["incidents"]["MARK_STALE"]
+    return (
+        "<b>🧪 Forward-test scorecard</b>\n\n"
+        f"<b>Status</b>: {report['status']}\n"
+        f"<b>Completed baskets</b>: {completed}/30 minimum · /50 preferred\n"
+        f"<b>Symbol closes</b>: {report['completed_symbol_positions']} (diagnostic only)\n"
+        f"<b>Net return</b>: {(report['net_return_pct'] or 0):+.2f}%\n"
+        f"<b>Maximum drawdown</b>: {report['maximum_drawdown_pct']:.2f}%\n"
+        f"<b>Average result</b>: {avg_r_text}\n"
+        f"<b>Regimes observed</b>: {regimes}\n"
+        f"<b>Restarts</b>: {report['restart_count']} · "
+        f"<b>Stale marks</b>: {stale['count']} incidents\n\n"
+        "<i>Simultaneous correlated coins count as one basket cycle.</i>"
+    )
+
+
 def _command_parts(text: str) -> tuple[str, list[str]]:
     parts = text.lstrip("/").split()
     cmd = parts[0].split("@")[0].lower() if parts else ""
@@ -384,6 +412,8 @@ def _handle(text: str) -> tuple[str, dict | None]:
         return f"<b>📦 Open positions ({len(pos)})</b>\n<pre>{head}\n{rows}</pre>", None
     if cmd == "pnl":
         return _performance_text(snap), None
+    if cmd == "forward":
+        return _forward_test_text(), None
     if cmd == "equity":
         return _equity_summary(), None
     if cmd == "chart":
@@ -596,6 +626,11 @@ def api_income() -> JSONResponse:
     return JSONResponse(store.read_income(limit=500, db_path=DB))
 
 
+@app.get("/api/forward-test", dependencies=[Depends(require_auth)])
+def api_forward_test() -> JSONResponse:
+    return JSONResponse(store.forward_test_report(DB))
+
+
 @app.post("/kill", dependencies=[Depends(require_auth)])
 def kill() -> dict:
     store.set_mode("kill", DB)
@@ -663,7 +698,9 @@ async function refresh(){
   const s=await sr.json();
   const eq=await (await api('/api/equity')).json();
   const fills=await (await api('/api/fills')).json();
+  const ft=await (await api('/api/forward-test')).json();
   const p=s.performance||{}, base=p.starting_equity??s.equity, pnl=p.total_pnl??((s.equity||0)-(base||0)), pnlpct=base?pnl/base:0;
+  const basket=s.basket||{};
   const aliveDot=`<span class=dot style="background:${s.alive?'#3fb950':'#f85149'}"></span>`;
   const gate=s.mark_data_stale?' · <b style=color:#d29922>MARKS STALE · ENTRIES HALTED</b>':(s.halted?' · <b style=color:#f85149>HALTED</b>':'');
   document.getElementById('status').innerHTML=aliveDot+(s.alive?'live':'DOWN')+gate;
@@ -676,7 +713,10 @@ async function refresh(){
    <div class=card><div class=k>Funding</div><div class="v ${cls(p.funding_payments)}">$${fmt(p.funding_payments)}</div></div>
    <div class=card><div class=k>Slippage</div><div class="v ${p.slippage>0?'neg':'pos'}">$${fmt(p.slippage)}</div></div>
    <div class=card><div class=k>Residual</div><div class="v ${cls(p.reconciliation_residual)}">$${fmt(p.reconciliation_residual)}</div></div>
-   <div class=card><div class=k>Open</div><div class=v>${s.n_open??0}</div></div>`;
+   <div class=card><div class=k>Crypto basket</div><div class=v>${basket.direction||'FLAT'} · ${s.n_open??0} legs</div></div>
+   <div class=card><div class=k>Effective bets</div><div class=v>${fmt(basket.effective_bets)}</div></div>
+   <div class=card><div class=k>Forward test</div><div class=v>${ft.completed_basket_cycles??0}/30 baskets</div></div>
+   <div class=card><div class=k>Max drawdown</div><div class="v ${cls(ft.maximum_drawdown_pct)}">${fmt(ft.maximum_drawdown_pct)}%</div></div>`;
   document.getElementById('pos').innerHTML='<tr><th>Symbol</th><th>Qty</th><th>Entry</th><th>uPnL</th></tr>'+
     (s.positions||[]).map(p=>`<tr><td>${p.symbol}</td><td>${fmt(p.qty,4)}</td><td>${fmt(p.entry,4)}</td><td class="${cls(p.unrealized)}">$${fmt(p.unrealized)}</td></tr>`).join('');
   document.getElementById('fills').innerHTML='<tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Price</th><th>Fee</th><th>Slip</th></tr>'+

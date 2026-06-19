@@ -78,6 +78,9 @@ bash scripts/run_live.sh                 # auto-restarts on crash
   transfers/rebates), and minute-by-minute attributed performance. `/pnl` and
   `/api/performance` show the breakdown plus an unexplained reconciliation residual.
   The income ledger refreshes every `BINANCE_INCOME_POLL_SECS` (default five minutes).
+  `/forward` and `/api/forward-test` show the qualification record. The eight
+  correlated coin legs count as one completed basket only when the book goes flat
+  or reverses; symbol-level closes remain diagnostics for stop/exit behavior.
 - **logs/supervisor.log** — restarts (only present with the tmux wrapper).
 - Binance testnet UI: 8 positions + 8 hard reduce-only stops (one per coin).
   With `BINANCE_USE_TRAILING_STOP=true`, expect one additional dormant/active
@@ -87,6 +90,10 @@ bash scripts/run_live.sh                 # auto-restarts on crash
   If any configured mark is older than `BINANCE_MARK_STALE_SECS`, the watchdog
   blocks new entries (and pending patient entries), keeps positions/stops intact,
   and reports `MARKS STALE` until every stream recovers.
+- Keep the bot on testnet until at least 30 completed basket cycles (preferably 50)
+  across more than one directional regime. Review net return, maximum drawdown,
+  average R, fees/funding/slippage, stop exits, restarts, and stale-mark incidents;
+  a few profitable days are not an acceptance test.
 
 ## 5. Companion dashboard + Telegram alerts + remote kill (optional but recommended)
 A separate FastAPI process gives a live dashboard (PnL, positions, equity curve,

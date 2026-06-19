@@ -74,6 +74,8 @@ def test_accounting_migrates_old_db(tmp_path):
     assert {"commission", "reference_price", "slippage", "trade_id", "reconciliation"} <= fill_cols
     assert {"realized", "commissions", "funding", "slippage", "total_pnl"} <= equity_cols
     assert "income" in tables
+    assert {"closed_positions", "basket_cycles", "incidents", "ops_events"} <= tables
+    assert {"basket_direction", "average_correlation", "effective_bets", "market_regime"} <= equity_cols
 
 
 def test_performance_accounting_reconciles_components(db):
@@ -114,6 +116,68 @@ def test_performance_accounting_reconciles_components(db):
     # Baseline is immutable across restarts/snapshots.
     again = store.ensure_accounting_baseline(2000.0, 2000.0, 0.0, db)
     assert again == baseline
+
+
+def test_forward_test_counts_eight_correlated_legs_as_one_basket(db):
+    coins = ("BTC", "ETH", "BNB", "XRP", "ADA", "SOL", "LTC", "LINK")
+    symbols = [f"{coin}USDT-PERP" for coin in coins]
+    store.write_snapshot(
+        {
+            "equity": 1100.0,
+            "performance": {
+                "starting_equity": 1000.0,
+                "total_pnl": 100.0,
+                "commissions": 2.0,
+                "funding_payments": -1.0,
+                "slippage": 0.5,
+            },
+        },
+        db,
+    )
+    store.append_equity(
+        1000.0, 1000.0, 0.0, 8, db,
+        basket_direction="SHORT", market_regime="SHORT_LOW_VOL",
+    )
+    store.update_basket_cycle("SHORT", symbols, 1000.0, 100.0, db)
+    store.update_basket_cycle("SHORT", symbols, 950.0, 100.0, db)
+    store.append_equity(
+        950.0, 950.0, 0.0, 8, db,
+        basket_direction="SHORT", market_regime="SHORT_LOW_VOL",
+    )
+    store.update_basket_cycle("FLAT", [], 1100.0, None, db)
+    store.append_equity(1100.0, 1100.0, 0.0, 0, db, basket_direction="FLAT")
+
+    store.record_closed_position(
+        "BTC:1",
+        "2026-01-01T00:00:00+00:00",
+        "2026-01-02T00:00:00+00:00",
+        "BTCUSDT-PERP",
+        "SHORT",
+        1.0,
+        100.0,
+        90.0,
+        10.0,
+        0.1,
+        initial_risk=10.0,
+        exit_reason="HARD_STOP",
+        db_path=db,
+    )
+    store.record_event("BOT_START", db_path=db)
+    store.record_event("BOT_START", db_path=db)
+    store.start_incident("MARK_STALE", "ETH", db)
+    store.resolve_incident("MARK_STALE", db)
+
+    report = store.forward_test_report(db)
+    assert report["completed_basket_cycles"] == 1
+    assert report["completed_symbol_positions"] == 1
+    assert report["average_r"] == pytest.approx(1.0)
+    assert report["maximum_drawdown_pct"] == pytest.approx(-5.0)
+    assert report["restart_count"] == 1
+    assert report["incidents"]["MARK_STALE"]["count"] == 1
+    assert report["directional_regimes_seen"] == ["SHORT"]
+    assert report["multiple_directional_regimes_seen"] is False
+    assert report["market_regimes_seen"] == ["SHORT_LOW_VOL"]
+    assert report["multiple_market_regimes_seen"] is False
 
 
 def test_binance_income_client_signs_request():
@@ -227,6 +291,7 @@ def test_api_endpoints_and_kill(tmp_path, monkeypatch):
         st = client.get("/api/state").json()
         assert st["equity"] == 10500.0 and st["alive"] is True and st["halted"] is False
         assert len(client.get("/api/equity").json()) == 1
+        assert client.get("/api/forward-test").json()["minimum_target"] == 30
 
         assert client.post("/kill").json()["mode"] == "kill"
         assert store.is_halted(p) is True

@@ -214,6 +214,7 @@ def build_node() -> TradingNode:
             instrument_ids=tuple(iids),
             check_secs=settings.binance_mark_check_secs,
             stale_after_secs=settings.binance_mark_stale_secs,
+            db_path=settings.companion_db,
         )
     )
     mark_monitor.risk_state = risk
@@ -290,6 +291,9 @@ def build_node() -> TradingNode:
             db_path=settings.companion_db,
             snapshot_secs=settings.companion_snapshot_secs,
             control_secs=settings.companion_control_secs,
+            corr_window=settings.binance_corr_window,
+            corr_threshold=settings.binance_corr_threshold,
+            corr_min_scalar=settings.binance_corr_min_scalar,
         )
     )
     companion.risk_state = risk
