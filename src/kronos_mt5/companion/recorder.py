@@ -278,7 +278,7 @@ class Companion(Strategy):
             else:
                 kind = "TREND"
             reference = self._reference_price(order)
-            for index, event in enumerate(order.events()):
+            for index, event in enumerate(order.events):
                 if not isinstance(event, OrderFilled):
                     continue
                 qty = float(event.last_qty)

@@ -232,6 +232,45 @@ def test_fill_reference_price_prefers_decision_tag():
     assert Companion._reference_price(order) == 100.25
 
 
+def test_companion_records_fill_events_from_order_event_list(db, monkeypatch):
+    from kronos_mt5.companion import recorder
+
+    class FakeOrderFilled:
+        last_qty = 0.01
+        last_px = 65000.0
+        trade_id = SimpleNamespace(value="trade-1")
+        is_buy = True
+        commission = None
+        ts_event = 1_750_000_000_000_000_000
+        order_side = SimpleNamespace(name="BUY")
+        reconciliation = False
+
+    order = SimpleNamespace(
+        order_type=SimpleNamespace(name="MARKET"),
+        is_reduce_only=False,
+        tags=[],
+        trigger_price=None,
+        price=None,
+        activation_price=None,
+        events=[FakeOrderFilled()],
+        instrument_id=SimpleNamespace(symbol=SimpleNamespace(value="BTCUSDT-PERP")),
+        client_order_id=SimpleNamespace(value="order-1"),
+    )
+    companion = SimpleNamespace(
+        cache=SimpleNamespace(orders=lambda: [order]),
+        config=SimpleNamespace(db_path=db),
+        _reference_price=recorder.Companion._reference_price,
+    )
+    monkeypatch.setattr(recorder, "OrderFilled", FakeOrderFilled)
+
+    recorder.Companion._record_new_fills(companion)
+
+    fills = store.read_fills(db_path=db)
+    assert len(fills) == 1
+    assert fills[0]["symbol"] == "BTCUSDT-PERP"
+    assert fills[0]["trade_id"] == "trade-1"
+
+
 def test_reconciliation_fill_is_stored_but_not_alerted(tmp_path, monkeypatch):
     from kronos_mt5.companion import api
 
