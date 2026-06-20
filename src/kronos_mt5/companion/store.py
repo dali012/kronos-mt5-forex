@@ -616,23 +616,29 @@ def shadow_report(db_path: str = DEFAULT_DB) -> dict:
 
     models = {}
     for model, cycles_by_id in grouped.items():
-        cycles = sorted(
+        all_cycles = sorted(
             cycles_by_id.values(),
             key=lambda cycle: datetime.fromisoformat(str(cycle[0]["cycle_ts"])),
         )
-        if not cycles:
+        if not all_cycles:
             continue
+        # Live market-bar cycle IDs are integer nanosecond timestamps. Startup
+        # observations contain a run UUID and are useful for showing current
+        # targets, but restarts are not independent performance periods.
+        cycles = [cycle for cycle in all_cycles if str(cycle[0]["cycle_id"]).isdigit()]
         virtual_equity = 1.0
         peak = 1.0
         max_drawdown = 0.0
         period_returns: list[float] = []
         previous: dict[str, dict] | None = None
-        first_ts = datetime.fromisoformat(str(cycles[0][0]["cycle_ts"]))
+        first_ts = (
+            datetime.fromisoformat(str(cycles[0][0]["cycle_ts"])) if cycles else None
+        )
         last_ts = first_ts
         for cycle in cycles:
             current = {str(row["symbol"]): row for row in cycle}
             current_ts = datetime.fromisoformat(str(cycle[0]["cycle_ts"]))
-            last_ts = max(last_ts, current_ts)
+            last_ts = max(last_ts, current_ts) if last_ts is not None else current_ts
             if previous is None:
                 entry_turnover = sum(abs(float(row["portfolio_weight"])) for row in current.values())
                 cost_bps = max((float(row["cost_bps"]) for row in current.values()), default=0.0)
@@ -662,14 +668,19 @@ def shadow_report(db_path: str = DEFAULT_DB) -> dict:
                 max_drawdown = min(max_drawdown, virtual_equity / peak - 1.0)
             previous = current
 
-        elapsed_days = max(0.0, (last_ts - first_ts).total_seconds() / 86400.0)
+        elapsed_days = (
+            max(0.0, (last_ts - first_ts).total_seconds() / 86400.0)
+            if first_ts is not None and last_ts is not None
+            else 0.0
+        )
+        enough_history = len(period_returns) >= 7 and elapsed_days >= 7.0
         annualized_return = (
             virtual_equity ** (365.0 / elapsed_days) - 1.0
-            if elapsed_days > 0 and virtual_equity > 0
+            if enough_history and virtual_equity > 0
             else None
         )
         sharpe = None
-        if len(period_returns) > 1 and elapsed_days > 0:
+        if enough_history:
             mean_return = sum(period_returns) / len(period_returns)
             variance = sum((value - mean_return) ** 2 for value in period_returns) / (
                 len(period_returns) - 1
@@ -677,6 +688,7 @@ def shadow_report(db_path: str = DEFAULT_DB) -> dict:
             periods_per_year = 365.0 / max(elapsed_days / len(period_returns), 1e-9)
             if variance > 0:
                 sharpe = mean_return / math.sqrt(variance) * math.sqrt(periods_per_year)
+        latest_cycle = all_cycles[-1]
         latest = {
             row["symbol"]: {
                 "signal": row["signal"],
@@ -686,21 +698,25 @@ def shadow_report(db_path: str = DEFAULT_DB) -> dict:
                 "funding_rate": row["funding_rate"],
                 "funding_scalar": row["funding_scalar"],
             }
-            for row in cycles[-1]
+            for row in latest_cycle
         }
         models[model] = {
             "cycles": len(cycles),
+            "startup_observations": len(all_cycles) - len(cycles),
             "scored_periods": len(period_returns),
             "total_return": virtual_equity - 1.0,
             "annualized_return": annualized_return,
             "sharpe": sharpe,
             "maximum_drawdown": max_drawdown,
-            "latest_cycle_ts": cycles[-1][0]["cycle_ts"],
+            "latest_cycle_ts": latest_cycle[0]["cycle_ts"],
             "latest_targets": latest,
         }
     return {
         "models": models,
-        "method": "next-cycle price return minus configured turnover cost",
+        "method": (
+            "next-market-cycle price return minus configured turnover cost; "
+            "startup/restart observations excluded"
+        ),
         "funding_note": "Shadow funding PnL is not simulated from point-in-time rates.",
     }
 

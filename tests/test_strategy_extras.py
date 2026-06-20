@@ -358,6 +358,20 @@ def test_set_protection_flat_cancels_all(monkeypatch):
     assert not s._has_live_protection()
 
 
+def test_entry_fill_reconciles_protection_after_position_resize(monkeypatch):
+    s = _protection_strat(monkeypatch)
+    pending = SimpleNamespace(client_order_id="entry-1")
+    s._pending_entry_order = pending
+    refreshed = []
+    s._refresh_protection = lambda: refreshed.append(True)
+    event = SimpleNamespace(instrument_id=s.instrument_id, client_order_id="entry-1")
+
+    s.on_order_filled(event)
+
+    assert s._pending_entry_order is None
+    assert refreshed == [True]
+
+
 def test_native_vol_trail_keeps_hard_stop_and_arms_at_one_r(monkeypatch):
     s = _protection_strat(monkeypatch, use_trail=True)
     s._set_protection(2.0, 100.0)
@@ -421,3 +435,13 @@ def test_funding_rate_updater_constructs():
     updater = FundingRateUpdater(FundingRateUpdaterConfig(symbols=("BTCUSDT", "ETHUSDT")), st)
     assert updater.funding_state is st
     assert updater.state == 0  # Component lifecycle property intact (pre-initialized)
+
+
+def test_funding_rate_state_normalizes_nautilus_perpetual_symbols():
+    from kronos_mt5.live.run_trend_binance import FundingRateState
+
+    state = FundingRateState()
+    state.rates["BTCUSDT"] = 0.0001
+    assert state.get("BTCUSDT") == 0.0001
+    assert state.get("BTCUSDT-PERP") == 0.0001
+    assert state.get("BTCUSDT-PERP.BINANCE") == 0.0001

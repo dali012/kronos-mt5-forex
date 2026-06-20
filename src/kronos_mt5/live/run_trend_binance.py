@@ -132,7 +132,8 @@ class FundingRateState:
         self.rates: dict[str, float] = {}
 
     def get(self, symbol: str) -> float | None:
-        return self.rates.get(symbol)
+        normalized = symbol.split(".", 1)[0].removesuffix("-PERP")
+        return self.rates.get(normalized)
 
 
 class FundingRateUpdaterConfig(StrategyConfig, frozen=True):
@@ -155,6 +156,7 @@ class FundingRateUpdater(Strategy):
         )
 
     def _refresh(self, event) -> None:  # noqa: ANN001
+        updated = 0
         for symbol in self.config.symbols:
             try:
                 params = urllib.parse.urlencode({"symbol": symbol})
@@ -162,9 +164,16 @@ class FundingRateUpdater(Strategy):
                     f"{PREMIUM_INDEX_URL}?{params}", timeout=10
                 ) as response:
                     payload = json.loads(response.read().decode("utf-8"))
-                self.funding_state.rates[symbol] = float(payload["lastFundingRate"])
+                normalized = symbol.split(".", 1)[0].removesuffix("-PERP")
+                self.funding_state.rates[normalized] = float(payload["lastFundingRate"])
+                updated += 1
             except Exception as exc:  # noqa: BLE001
                 self.log.warning(f"funding refresh failed for {symbol}: {exc!r}")
+        if updated:
+            self.log.info(f"funding rates refreshed: {updated}/{len(self.config.symbols)}")
+
+    def on_stop(self) -> None:
+        """No external subscription to release; the framework cancels our timer."""
 
 
 def _instrument_ids(symbols: list[str]) -> list[str]:

@@ -137,15 +137,19 @@ def test_shadow_targets_are_idempotent_and_scored(db):
         }
 
     rows = [
-        row("live", "d1", "2026-01-01T00:00:00+00:00", 100.0, 1.0),
-        row("live", "d2", "2026-01-02T00:00:00+00:00", 110.0, 1.0),
-        row("challenger", "d1", "2026-01-01T00:00:00+00:00", 100.0, 0.5),
-        row("challenger", "d2", "2026-01-02T00:00:00+00:00", 110.0, 0.5),
+        row("live", "run-1:startup", "2025-12-31T23:00:00+00:00", 100.0, 1.0),
+        row("live", "100", "2026-01-01T00:00:00+00:00", 100.0, 1.0),
+        row("live", "200", "2026-01-02T00:00:00+00:00", 110.0, 1.0),
+        row("challenger", "run-1:startup", "2025-12-31T23:00:00+00:00", 100.0, 0.5),
+        row("challenger", "100", "2026-01-01T00:00:00+00:00", 100.0, 0.5),
+        row("challenger", "200", "2026-01-02T00:00:00+00:00", 110.0, 0.5),
     ]
-    assert store.record_shadow_targets(rows, db) == 4
+    assert store.record_shadow_targets(rows, db) == 6
     assert store.record_shadow_targets(rows, db) == 0
     report = store.shadow_report(db)
     assert report["models"]["live"]["cycles"] == 2
+    assert report["models"]["live"]["startup_observations"] == 1
+    assert report["models"]["live"]["annualized_return"] is None
     assert report["models"]["live"]["total_return"] > 0.09
     assert 0.04 < report["models"]["challenger"]["total_return"] < 0.06
     assert "not simulated" in report["funding_note"]
@@ -355,6 +359,7 @@ def test_api_endpoints_and_kill(tmp_path, monkeypatch):
     p = str(tmp_path / "api.db")
     store.init_db(p)
     monkeypatch.setattr(api, "DB", p)
+    monkeypatch.setattr(api.settings, "api_token", "")
     store.write_snapshot({"equity": 10500.0, "cash": 10000.0, "n_open": 1, "positions": []}, p)
     store.append_equity(10500.0, 10000.0, 500.0, 1, p)
     store.heartbeat(p)
