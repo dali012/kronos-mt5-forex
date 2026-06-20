@@ -78,8 +78,21 @@ class Settings(BaseSettings):
     binance_corr_window: int = 90
     binance_corr_threshold: float = 0.65
     binance_corr_min_scalar: float = 0.50
+    binance_use_portfolio_allocator: bool = False
+    binance_portfolio_target_vol: float = 0.10
+    binance_portfolio_cov_window: int = 90
+    binance_portfolio_cov_shrinkage: float = 0.25
+    binance_portfolio_min_scale: float = 0.25
+    binance_portfolio_max_scale: float = 1.25
+    binance_portfolio_max_gross: float = 1.50
+    binance_portfolio_min_observations: int = 30
+    binance_portfolio_scale_up_alpha: float = 0.20
+    binance_portfolio_scale_deadband: float = 0.05
     binance_funding_filter_enabled: bool = False
     binance_funding_rate_limit: float = 0.0010
+    binance_funding_continuous_sizing: bool = False
+    binance_funding_rate_soft_limit: float = 0.0001
+    binance_funding_min_scalar: float = 0.0
     binance_funding_refresh_secs: int = 3600
     binance_cost_aware_rebalance: bool = False
     binance_round_trip_cost_bps: float = 8.0
@@ -88,6 +101,8 @@ class Settings(BaseSettings):
     binance_patient_limit_offset_bps: float = 2.0
     binance_patient_limit_timeout_secs: int = 300
     binance_patient_limit_market_fallback: bool = True
+    binance_shadow_enabled: bool = False
+    binance_shadow_lookbacks: str = "7,21,63,126"
 
     # --- companion dashboard / API / alerts ---
     companion_db: str = "logs/companion.db"

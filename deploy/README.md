@@ -32,12 +32,18 @@ the recommended set for a testnet forward test is:
 # Safe net-positives (backtested: lower DD / less churn, no downside):
 BINANCE_USE_VOL_STOP=true            # vol-adaptive stop — best stop variant
 BINANCE_USE_TRAILING_STOP=true       # native trail arms near +1R; hard stop remains
-BINANCE_USE_CORRELATION_SCALING=true # trim gross when the book gets crowded
+BINANCE_USE_CORRELATION_SCALING=false # covariance allocator below replaces this heuristic
 BINANCE_COST_AWARE_REBALANCE=true    # skip sub-cost rebalances
+BINANCE_USE_PORTFOLIO_ALLOCATOR=true # whole-book vol target + shrunk covariance + gross cap
 
 # Live-only paths — enable to OBSERVE (a daily-bar backtest can't exercise them):
 BINANCE_USE_PATIENT_LIMIT=true       # post-only entry; MARKET_FALLBACK=true so it can't hang
 BINANCE_FUNDING_FILTER_ENABLED=true  # fights the real ~0.15-Sharpe funding drag
+BINANCE_SHADOW_ENABLED=true          # compare challengers without sending their orders
+
+# Continuous funding remains a shadow challenger: the initial historical test did
+# not improve Sharpe, so do not let it size real orders without stronger evidence.
+BINANCE_FUNDING_CONTINUOUS_SIZING=false
 
 BINANCE_FLATTEN_ON_STOP=false        # keep positions across restarts (stops live on the exchange)
 ```
@@ -111,7 +117,8 @@ sudo systemctl enable --now kronos-companion
 ```
 Open `http://<vps-ip>:8000/` (append `?token=<API_TOKEN>` if you set one).
 - **Dashboard**: starting/current equity, net/realized/unrealized PnL, commissions,
-  funding, measured slippage, reconciliation residual, positions, chart, and fills.
+  funding, measured slippage, reconciliation residual, positions, chart, fills,
+  and no-order shadow challenger results (`/api/shadows`).
 - **⛔ KILL button** (or `curl -X POST http://<vps-ip>:8000/kill?token=...`): flattens + halts. Persisted in the DB, so it **survives a bot restart** — the bot stays halted until you hit **Resume**.
 - **Telegram alerts**: each fill, drawdown crossing `API_DD_WARN_PCT`, and **bot-down** (no heartbeat for `API_BOT_DOWN_SECS` — detected by the API, since a dead bot can't alert).
 - **Telegram commands (two-way control — no URL/token needed)**: once `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` are set, message your bot (only **your** chat id is obeyed = the auth):

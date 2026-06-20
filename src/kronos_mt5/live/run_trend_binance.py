@@ -44,6 +44,7 @@ from nautilus_trader.portfolio.config import PortfolioConfig
 from nautilus_trader.trading.strategy import Strategy, StrategyConfig
 
 from config.settings import settings
+from kronos_mt5.companion import store
 from kronos_mt5.companion.accounting import IncomePoller, IncomePollerConfig
 from kronos_mt5.companion.recorder import Companion, CompanionConfig
 from kronos_mt5.strategies.risk_manager import (
@@ -208,6 +209,37 @@ def build_node() -> TradingNode:
 
     n = len(symbols)
     risk = RiskState()  # shared halt flag (drawdown kill-switch -> blocks entries)
+    if settings.binance_use_portfolio_allocator:
+        try:
+            store.init_db(settings.companion_db)
+            allocator_context = "|".join(
+                (
+                    ",".join(symbols),
+                    f"target={settings.binance_portfolio_target_vol:.12g}",
+                    f"window={settings.binance_portfolio_cov_window}",
+                    f"shrink={settings.binance_portfolio_cov_shrinkage:.12g}",
+                    f"gross={settings.binance_portfolio_max_gross:.12g}",
+                )
+            )
+            stored_context = store.get_kv(
+                "portfolio_allocator_context", "", settings.companion_db
+            )
+            restored_scale = (
+                float(
+                    store.get_kv(
+                        "portfolio_allocator_scale", "1.0", settings.companion_db
+                    )
+                    or 1.0
+                )
+                if stored_context == allocator_context
+                else 1.0
+            )
+            risk.allocation_scales["live_allocator"] = max(0.0, restored_scale)
+            store.set_kv(
+                "portfolio_allocator_context", allocator_context, settings.companion_db
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"Allocator scale restore skipped: {exc!r}")
     funding = FundingRateState()
     mark_monitor = MarkPriceMonitor(
         MarkPriceMonitorConfig(
@@ -219,7 +251,7 @@ def build_node() -> TradingNode:
     )
     mark_monitor.risk_state = risk
     node.trader.add_strategy(mark_monitor)
-    if settings.binance_funding_filter_enabled:
+    if settings.binance_funding_filter_enabled or settings.binance_shadow_enabled:
         node.trader.add_strategy(
             FundingRateUpdater(
                 FundingRateUpdaterConfig(
@@ -256,8 +288,21 @@ def build_node() -> TradingNode:
                 corr_window=settings.binance_corr_window,
                 corr_threshold=settings.binance_corr_threshold,
                 corr_min_scalar=settings.binance_corr_min_scalar,
+                use_portfolio_allocator=settings.binance_use_portfolio_allocator,
+                portfolio_target_vol=settings.binance_portfolio_target_vol,
+                portfolio_cov_window=settings.binance_portfolio_cov_window,
+                portfolio_cov_shrinkage=settings.binance_portfolio_cov_shrinkage,
+                portfolio_min_scale=settings.binance_portfolio_min_scale,
+                portfolio_max_scale=settings.binance_portfolio_max_scale,
+                portfolio_max_gross=settings.binance_portfolio_max_gross,
+                portfolio_min_observations=settings.binance_portfolio_min_observations,
+                portfolio_scale_up_alpha=settings.binance_portfolio_scale_up_alpha,
+                portfolio_scale_deadband=settings.binance_portfolio_scale_deadband,
                 funding_filter_enabled=settings.binance_funding_filter_enabled,
                 funding_rate_limit=settings.binance_funding_rate_limit,
+                funding_continuous_sizing=settings.binance_funding_continuous_sizing,
+                funding_rate_soft_limit=settings.binance_funding_rate_soft_limit,
+                funding_min_scalar=settings.binance_funding_min_scalar,
                 cost_aware_rebalance=settings.binance_cost_aware_rebalance,
                 round_trip_cost_bps=settings.binance_round_trip_cost_bps,
                 slippage_bps=settings.binance_slippage_bps,
@@ -265,6 +310,12 @@ def build_node() -> TradingNode:
                 patient_limit_offset_bps=settings.binance_patient_limit_offset_bps,
                 patient_limit_timeout_secs=settings.binance_patient_limit_timeout_secs,
                 patient_limit_market_fallback=settings.binance_patient_limit_market_fallback,
+                shadow_enabled=settings.binance_shadow_enabled,
+                shadow_lookbacks=tuple(
+                    int(value.strip())
+                    for value in settings.binance_shadow_lookbacks.split(",")
+                    if value.strip()
+                ),
             )
         )
         strat.risk_state = risk

@@ -70,6 +70,14 @@ positives; cost‑aware rebalance is cheap insurance; patient‑limit is untesta
 (verify on testnet). Reproduce any row with `backtest/trend_engine.py` (see `--help`);
 funding rows need `scripts/download_funding.py` first.
 
+The newer shrunk-covariance portfolio allocator was compared against correlation
+scaling on the eight-coin live universe with vol stops, cost-aware rebalancing,
+fees/slippage, and funding. Over the full engine history it improved Sharpe
+**0.81→0.90**, annual return **6.6%→7.0%**, maxDD **−13.6%→−12.2%**, and used
+20 fewer fills. Over 2022+ it improved Sharpe **0.41→0.44** and maxDD
+**−12.2%→−11.4%**. Continuous funding sizing remains shadow-only: its first
+vectorized test did not improve Sharpe, so the bot does not enable it by default.
+
 ## Architecture
 
 ```
@@ -94,6 +102,9 @@ funding rows need `scripts/download_funding.py` first.
   kill‑switch** (flatten + halt, persisted so it survives restarts). Optional,
   off‑by‑default realism controls (funding costs, vol‑adaptive stops, correlation
   scaling, cost‑aware rebalancing, patient‑limit entries) are toggled in `.env`.
+  An opt-in shrunk-covariance allocator targets whole-portfolio volatility and
+  caps gross exposure; it replaces the simpler correlation scalar. Adverse
+  funding can be converted from a rare hard veto into continuous position sizing.
   An optional native volatility trail arms around +1R while retaining the hard stop.
   Live PnL and drawdown use Binance's 1-second futures mark stream; a fail-closed
   freshness watchdog blocks new entries if any mark goes stale.
@@ -104,6 +115,10 @@ funding rows need `scripts/download_funding.py` first.
   are attributed as one correlated basket; average R, maximum drawdown, costs,
   exit behavior, restarts, stale-data incidents, and direction/volatility regimes are
   persisted and exposed at `/api/forward-test` and Telegram `/forward`.
+  Opt-in shadow challengers persist no-order target portfolios for the live model,
+  covariance+continuous-funding model, and faster trend ensemble. Their virtual
+  price/cost scorecard is shown on the dashboard and at `/api/shadows` (shadow
+  funding PnL is intentionally not estimated from point-in-time rates).
   The bearer‑auth API, Telegram alerts (fills, drawdown,
   **bot‑down via heartbeat**), and **two‑way Telegram control**
   (`/status /pnl /chart /stops /kill …` with inline confirm buttons).

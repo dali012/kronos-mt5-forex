@@ -8,6 +8,7 @@ Runs as a SEPARATE process next to the bot, reading the shared SQLite store.
 - GET  /api/performance  attributed PnL / costs / reconciliation
 - GET  /api/income       exchange income ledger
 - GET  /api/forward-test basket-cycle qualification scorecard
+- GET  /api/shadows      no-order challenger target/performance scorecard
 - POST /kill   /resume   flip the shared control flag (panic switch; survives
                          bot restarts because the bot reads it from the DB)
 
@@ -631,6 +632,11 @@ def api_forward_test() -> JSONResponse:
     return JSONResponse(store.forward_test_report(DB))
 
 
+@app.get("/api/shadows", dependencies=[Depends(require_auth)])
+def api_shadows() -> JSONResponse:
+    return JSONResponse(store.shadow_report(DB))
+
+
 @app.post("/kill", dependencies=[Depends(require_auth)])
 def kill() -> dict:
     store.set_mode("kill", DB)
@@ -678,6 +684,7 @@ DASHBOARD_HTML = """<!doctype html><html><head><meta charset=utf-8>
 <div class=card style="flex:1"><div class=k>Equity</div><canvas id=chart></canvas></div>
 <div class=card style="flex:1;margin-top:16px"><div class=k>Open positions</div><table id=pos></table></div>
 <div class=card style="flex:1;margin-top:16px"><div class=k>Recent fills</div><table id=fills></table></div>
+<div class=card style="flex:1;margin-top:16px"><div class=k>Shadow challengers (no orders)</div><table id=shadows></table></div>
 <script>
 const params=new URLSearchParams(location.search);
 let TOKEN = params.get('token') || localStorage.getItem('tok') || '';
@@ -699,6 +706,7 @@ async function refresh(){
   const eq=await (await api('/api/equity')).json();
   const fills=await (await api('/api/fills')).json();
   const ft=await (await api('/api/forward-test')).json();
+  const shadows=await (await api('/api/shadows')).json();
   const p=s.performance||{}, base=p.starting_equity??s.equity, pnl=p.total_pnl??((s.equity||0)-(base||0)), pnlpct=base?pnl/base:0;
   const basket=s.basket||{};
   const aliveDot=`<span class=dot style="background:${s.alive?'#3fb950':'#f85149'}"></span>`;
@@ -721,6 +729,8 @@ async function refresh(){
     (s.positions||[]).map(p=>`<tr><td>${p.symbol}</td><td>${fmt(p.qty,4)}</td><td>${fmt(p.entry,4)}</td><td class="${cls(p.unrealized)}">$${fmt(p.unrealized)}</td></tr>`).join('');
   document.getElementById('fills').innerHTML='<tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Price</th><th>Fee</th><th>Slip</th></tr>'+
     fills.map(f=>`<tr><td>${(f.ts||'').slice(0,19).replace('T',' ')}</td><td>${f.symbol}</td><td class="${f.side=='BUY'?'pos':'neg'}">${f.side}</td><td>${fmt(f.qty,4)}</td><td>${fmt(f.price,4)}</td><td>$${fmt(f.commission,4)}</td><td class="${f.slippage>0?'neg':'pos'}">$${fmt(f.slippage,4)}</td></tr>`).join('');
+  document.getElementById('shadows').innerHTML='<tr><th>Model</th><th>Cycles</th><th>Return</th><th>Sharpe</th><th>Max DD</th></tr>'+
+    Object.entries(shadows.models||{}).map(([name,m])=>`<tr><td>${name}</td><td>${m.cycles}</td><td class="${cls(m.total_return)}">${fmt(m.total_return*100)}%</td><td>${fmt(m.sharpe)}</td><td class="${cls(m.maximum_drawdown)}">${fmt(m.maximum_drawdown*100)}%</td></tr>`).join('');
   const labels=eq.map(e=>e.ts.slice(5,16).replace('T',' ')), data=eq.map(e=>e.equity);
   if(!chart){chart=new Chart(document.getElementById('chart'),{type:'line',
     data:{labels,datasets:[{data,borderColor:'#3fb950',borderWidth:1.5,pointRadius:0,fill:false}]},

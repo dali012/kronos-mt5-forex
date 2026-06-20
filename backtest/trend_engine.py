@@ -217,6 +217,15 @@ def main() -> None:
     ap.add_argument("--corr-window", type=int, default=90)
     ap.add_argument("--corr-threshold", type=float, default=0.65)
     ap.add_argument("--corr-min-scalar", type=float, default=0.50)
+    ap.add_argument("--use-portfolio-allocator", action="store_true")
+    ap.add_argument("--portfolio-target-vol", type=float, default=0.10)
+    ap.add_argument("--portfolio-cov-window", type=int, default=90)
+    ap.add_argument("--portfolio-cov-shrinkage", type=float, default=0.25)
+    ap.add_argument("--portfolio-min-scale", type=float, default=0.25)
+    ap.add_argument("--portfolio-max-scale", type=float, default=1.25)
+    ap.add_argument("--portfolio-max-gross", type=float, default=1.50)
+    ap.add_argument("--portfolio-scale-up-alpha", type=float, default=0.20)
+    ap.add_argument("--portfolio-scale-deadband", type=float, default=0.05)
     ap.add_argument("--cost-aware-rebalance", action="store_true")
     ap.add_argument("--round-trip-cost-bps", type=float, default=8.0)
     ap.add_argument("--slippage-bps", type=float, default=2.0)
@@ -284,6 +293,15 @@ def main() -> None:
                 corr_window=args.corr_window,
                 corr_threshold=args.corr_threshold,
                 corr_min_scalar=args.corr_min_scalar,
+                use_portfolio_allocator=args.use_portfolio_allocator,
+                portfolio_target_vol=args.portfolio_target_vol,
+                portfolio_cov_window=args.portfolio_cov_window,
+                portfolio_cov_shrinkage=args.portfolio_cov_shrinkage,
+                portfolio_min_scale=args.portfolio_min_scale,
+                portfolio_max_scale=args.portfolio_max_scale,
+                portfolio_max_gross=args.portfolio_max_gross,
+                portfolio_scale_up_alpha=args.portfolio_scale_up_alpha,
+                portfolio_scale_deadband=args.portfolio_scale_deadband,
                 cost_aware_rebalance=args.cost_aware_rebalance,
                 round_trip_cost_bps=args.round_trip_cost_bps,
                 slippage_bps=args.slippage_bps,

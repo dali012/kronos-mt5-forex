@@ -74,7 +74,7 @@ def test_accounting_migrates_old_db(tmp_path):
     assert {"commission", "reference_price", "slippage", "trade_id", "reconciliation"} <= fill_cols
     assert {"realized", "commissions", "funding", "slippage", "total_pnl"} <= equity_cols
     assert "income" in tables
-    assert {"closed_positions", "basket_cycles", "incidents", "ops_events"} <= tables
+    assert {"closed_positions", "basket_cycles", "incidents", "ops_events", "shadow_targets"} <= tables
     assert {"basket_direction", "average_correlation", "effective_bets", "market_regime"} <= equity_cols
 
 
@@ -116,6 +116,39 @@ def test_performance_accounting_reconciles_components(db):
     # Baseline is immutable across restarts/snapshots.
     again = store.ensure_accounting_baseline(2000.0, 2000.0, 0.0, db)
     assert again == baseline
+
+
+def test_shadow_targets_are_idempotent_and_scored(db):
+    def row(model, cycle, ts, price, weight):
+        return {
+            "model": model,
+            "cycle_id": cycle,
+            "cycle_ts": ts,
+            "symbol": "BTCUSDT-PERP",
+            "price": price,
+            "signal": 1.0,
+            "raw_weight": 1.0,
+            "target_weight": weight,
+            "portfolio_weight": weight,
+            "portfolio_scale": weight,
+            "funding_rate": 0.0001,
+            "funding_scalar": 1.0,
+            "cost_bps": 10.0,
+        }
+
+    rows = [
+        row("live", "d1", "2026-01-01T00:00:00+00:00", 100.0, 1.0),
+        row("live", "d2", "2026-01-02T00:00:00+00:00", 110.0, 1.0),
+        row("challenger", "d1", "2026-01-01T00:00:00+00:00", 100.0, 0.5),
+        row("challenger", "d2", "2026-01-02T00:00:00+00:00", 110.0, 0.5),
+    ]
+    assert store.record_shadow_targets(rows, db) == 4
+    assert store.record_shadow_targets(rows, db) == 0
+    report = store.shadow_report(db)
+    assert report["models"]["live"]["cycles"] == 2
+    assert report["models"]["live"]["total_return"] > 0.09
+    assert 0.04 < report["models"]["challenger"]["total_return"] < 0.06
+    assert "not simulated" in report["funding_note"]
 
 
 def test_forward_test_counts_eight_correlated_legs_as_one_basket(db):
@@ -331,6 +364,7 @@ def test_api_endpoints_and_kill(tmp_path, monkeypatch):
         assert st["equity"] == 10500.0 and st["alive"] is True and st["halted"] is False
         assert len(client.get("/api/equity").json()) == 1
         assert client.get("/api/forward-test").json()["minimum_target"] == 30
+        assert client.get("/api/shadows").json()["models"] == {}
 
         assert client.post("/kill").json()["mode"] == "kill"
         assert store.is_halted(p) is True

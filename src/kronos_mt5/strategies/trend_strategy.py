@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import contextlib
 from collections import deque
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import numpy as np
@@ -66,8 +66,21 @@ class TrendStrategyConfig(StrategyConfig, frozen=True):
     corr_window: int = 90
     corr_threshold: float = 0.65
     corr_min_scalar: float = 0.50
+    use_portfolio_allocator: bool = False
+    portfolio_target_vol: float = 0.10
+    portfolio_cov_window: int = 90
+    portfolio_cov_shrinkage: float = 0.25
+    portfolio_min_scale: float = 0.25
+    portfolio_max_scale: float = 1.25
+    portfolio_max_gross: float = 1.50
+    portfolio_min_observations: int = 30
+    portfolio_scale_up_alpha: float = 0.20
+    portfolio_scale_deadband: float = 0.05
     funding_filter_enabled: bool = False
     funding_rate_limit: float = 0.0010
+    funding_continuous_sizing: bool = False
+    funding_rate_soft_limit: float = 0.0001
+    funding_min_scalar: float = 0.0
     cost_aware_rebalance: bool = False
     round_trip_cost_bps: float = 8.0
     slippage_bps: float = 2.0
@@ -77,6 +90,8 @@ class TrendStrategyConfig(StrategyConfig, frozen=True):
     patient_limit_offset_bps: float = 2.0
     patient_limit_timeout_secs: int = 300
     patient_limit_market_fallback: bool = True
+    shadow_enabled: bool = False
+    shadow_lookbacks: tuple[int, ...] = (7, 21, 63, 126)
 
 
 class TrendStrategy(Strategy):
@@ -140,7 +155,11 @@ class TrendStrategy(Strategy):
     def _on_init_timer(self, event) -> None:  # noqa: ANN001
         self.clock.cancel_timer("init_rebalance")
         self.log.info(f"initial rebalance ({len(self._closes)} bars buffered) {self.instrument_id}")
-        self._rebalance()
+        run_id = getattr(self.risk_state, "run_id", "standalone")
+        self._rebalance(
+            cycle_id=f"{run_id}:startup",
+            cycle_ts=self.clock.utc_now().isoformat(),
+        )
 
     def on_historical_data(self, data) -> None:
         bars = data if isinstance(data, (list, tuple)) else [data]
@@ -151,7 +170,8 @@ class TrendStrategy(Strategy):
 
     def on_bar(self, bar: Bar) -> None:
         self._closes.append(bar.close.as_double())
-        self._rebalance()
+        cycle_ts = datetime.fromtimestamp(bar.ts_event / 1e9, tz=timezone.utc).isoformat()
+        self._rebalance(cycle_id=str(bar.ts_event), cycle_ts=cycle_ts)
 
     def _flatten_self(self) -> None:
         """Flatten this strategy's own position (correctly strategy-scoped)."""
@@ -191,7 +211,11 @@ class TrendStrategy(Strategy):
     def _on_control_timer(self, event) -> None:  # noqa: ANN001 (live: act on control within ~1 min)
         self._apply_control()
 
-    def _rebalance(self) -> None:
+    def _rebalance(
+        self,
+        cycle_id: str | int | None = None,
+        cycle_ts: str | None = None,
+    ) -> None:
         if len(self._closes) <= max(self.cfg().lookbacks):
             return
         if self._apply_control():
@@ -212,15 +236,37 @@ class TrendStrategy(Strategy):
         if equity <= 0:
             return
         budget = equity / self.cfg().n_instruments
-        w = float(
+        raw_weight = float(
             np.clip(
                 sig * (self.cfg().target_vol / inst_vol),
                 -self.cfg().max_leverage,
                 self.cfg().max_leverage,
             )
         )
-        w *= self._correlation_scalar()
-        w = self._funding_adjusted_weight(w)
+        cycle_id = cycle_id or f"{getattr(self.risk_state, 'run_id', 'standalone')}:adhoc"
+        cycle_ts = cycle_ts or datetime.now(timezone.utc).isoformat()
+        if self.cfg().use_portfolio_allocator:
+            funded_weight = self._funding_adjusted_weight(raw_weight)
+            portfolio_scale = self._portfolio_scale(
+                "live_allocator", funded_weight, rets, cycle_id
+            )
+            w = funded_weight * portfolio_scale
+        else:
+            portfolio_scale = 1.0
+            w = raw_weight * self._correlation_scalar()
+            w = self._funding_adjusted_weight(w)
+        self._queue_shadow_targets(
+            closes=closes,
+            returns=rets,
+            cycle_id=cycle_id,
+            cycle_ts=cycle_ts,
+            price=price,
+            inst_vol=inst_vol,
+            signal=sig,
+            raw_weight=raw_weight,
+            live_weight=w,
+            live_portfolio_scale=portfolio_scale,
+        )
         target_units = (budget * w) / price
         current_units = float(self.portfolio.net_position(self.instrument_id))
         delta = target_units - current_units
@@ -333,11 +379,51 @@ class TrendStrategy(Strategy):
         return float(np.clip(value, lower, upper))
 
     def _update_portfolio_returns(self, returns: np.ndarray) -> None:
-        if not (self.cfg().use_correlation_scaling and self.risk_state is not None):
+        enabled = (
+            self.cfg().use_correlation_scaling
+            or self.cfg().use_portfolio_allocator
+            or self.cfg().shadow_enabled
+        )
+        if not (enabled and self.risk_state is not None):
             return
-        window = min(len(returns), self.cfg().corr_window)
+        window = min(
+            len(returns),
+            max(self.cfg().corr_window, self.cfg().portfolio_cov_window),
+        )
         if window > 1 and hasattr(self.risk_state, "update_returns"):
             self.risk_state.update_returns(self.instrument_id.symbol.value, returns[-window:])
+
+    def _portfolio_scale(
+        self,
+        model: str,
+        weight: float,
+        returns: np.ndarray,
+        cycle_id: str | int,
+    ) -> float:
+        rs = self.risk_state
+        if rs is None or not hasattr(rs, "publish_portfolio_target"):
+            return 1.0
+        expected = tuple(iid.symbol.value for iid in self._portfolio_iids)
+        return float(
+            rs.publish_portfolio_target(
+                model,
+                self.instrument_id.symbol.value,
+                weight,
+                returns,
+                cycle_id,
+                expected,
+                window=self.cfg().portfolio_cov_window,
+                target_vol=self.cfg().portfolio_target_vol,
+                ppy=self.cfg().ppy,
+                shrinkage=self.cfg().portfolio_cov_shrinkage,
+                min_scale=self.cfg().portfolio_min_scale,
+                max_scale=self.cfg().portfolio_max_scale,
+                max_gross=self.cfg().portfolio_max_gross,
+                min_observations=self.cfg().portfolio_min_observations,
+                scale_up_alpha=self.cfg().portfolio_scale_up_alpha,
+                scale_deadband=self.cfg().portfolio_scale_deadband,
+            )
+        )
 
     def _correlation_scalar(self) -> float:
         if not (self.cfg().use_correlation_scaling and self.risk_state is not None):
@@ -352,21 +438,163 @@ class TrendStrategy(Strategy):
             )
         )
 
-    def _funding_adjusted_weight(self, weight: float) -> float:
-        if not self.cfg().funding_filter_enabled or weight == 0 or self.funding_rates is None:
+    def _funding_adjusted_weight(
+        self,
+        weight: float,
+        *,
+        continuous: bool | None = None,
+        log_adjustment: bool = True,
+    ) -> float:
+        enabled = self.cfg().funding_filter_enabled or continuous is True
+        if not enabled or weight == 0 or self.funding_rates is None:
             return weight
         rate = self.funding_rates.get(self.instrument_id.symbol.value)
         if rate is None:
             return weight
-        adverse_long = weight > 0 and rate > self.cfg().funding_rate_limit
-        adverse_short = weight < 0 and rate < -self.cfg().funding_rate_limit
-        if adverse_long or adverse_short:
+        use_continuous = (
+            self.cfg().funding_continuous_sizing if continuous is None else continuous
+        )
+        scalar = self._funding_scalar(weight, rate, continuous=use_continuous)
+        if scalar < 1.0 and log_adjustment:
+            action = "scaled" if use_continuous and scalar > 0 else "veto"
             self.log.info(
-                f"{self.instrument_id.symbol} funding veto: target_w={weight:+.2f} "
-                f"rate={rate:+.4%} limit={self.cfg().funding_rate_limit:.4%}"
+                f"{self.instrument_id.symbol} funding {action}: target_w={weight:+.2f} "
+                f"rate={rate:+.4%} scalar={scalar:.2f}"
             )
-            return 0.0
-        return weight
+        return weight * scalar
+
+    def _funding_scalar(self, weight: float, rate: float, *, continuous: bool) -> float:
+        if weight == 0:
+            return 1.0
+        adverse_rate = float(rate) if weight > 0 else -float(rate)
+        if adverse_rate <= 0:
+            return 1.0  # favorable funding never increases risk
+        hard = max(0.0, float(self.cfg().funding_rate_limit))
+        if not continuous:
+            return 0.0 if adverse_rate > hard else 1.0
+        soft = float(np.clip(self.cfg().funding_rate_soft_limit, 0.0, hard))
+        floor = float(np.clip(self.cfg().funding_min_scalar, 0.0, 1.0))
+        if adverse_rate <= soft:
+            return 1.0
+        if hard <= soft or adverse_rate >= hard:
+            return floor
+        pressure = (adverse_rate - soft) / (hard - soft)
+        return float(1.0 - pressure * (1.0 - floor))
+
+    def _queue_shadow_targets(
+        self,
+        *,
+        closes: np.ndarray,
+        returns: np.ndarray,
+        cycle_id: str | int,
+        cycle_ts: str,
+        price: float,
+        inst_vol: float,
+        signal: float,
+        raw_weight: float,
+        live_weight: float,
+        live_portfolio_scale: float,
+    ) -> None:
+        rs = self.risk_state
+        if not self.cfg().shadow_enabled or rs is None or not hasattr(rs, "queue_shadow_target"):
+            return
+        rate = self.funding_rates.get(self.instrument_id.symbol.value) if self.funding_rates else None
+        self._queue_shadow_row(
+            "live",
+            cycle_id,
+            cycle_ts,
+            price,
+            signal,
+            raw_weight,
+            live_weight,
+            live_portfolio_scale,
+            rate,
+        )
+
+        smooth_weight = self._funding_adjusted_weight(
+            raw_weight, continuous=True, log_adjustment=False
+        )
+        smooth_scale = self._portfolio_scale(
+            "shadow_allocator_continuous", smooth_weight, returns, cycle_id
+        )
+        self._queue_shadow_row(
+            "allocator_continuous",
+            cycle_id,
+            cycle_ts,
+            price,
+            signal,
+            raw_weight,
+            smooth_weight * smooth_scale,
+            smooth_scale,
+            rate,
+        )
+
+        lookbacks = tuple(self.cfg().shadow_lookbacks)
+        if lookbacks and len(closes) > max(lookbacks):
+            fast_signal = float(
+                np.mean([np.sign(price / closes[-1 - lb] - 1.0) for lb in lookbacks])
+            )
+            fast_raw = float(
+                np.clip(
+                    fast_signal * (self.cfg().target_vol / inst_vol),
+                    -self.cfg().max_leverage,
+                    self.cfg().max_leverage,
+                )
+            )
+            fast_funded = self._funding_adjusted_weight(
+                fast_raw, continuous=True, log_adjustment=False
+            )
+            fast_scale = self._portfolio_scale(
+                "shadow_fast_allocator_continuous", fast_funded, returns, cycle_id
+            )
+            self._queue_shadow_row(
+                "fast_allocator_continuous",
+                cycle_id,
+                cycle_ts,
+                price,
+                fast_signal,
+                fast_raw,
+                fast_funded * fast_scale,
+                fast_scale,
+                rate,
+            )
+
+    def _queue_shadow_row(
+        self,
+        model: str,
+        cycle_id: str | int,
+        cycle_ts: str,
+        price: float,
+        signal: float,
+        raw_weight: float,
+        target_weight: float,
+        portfolio_scale: float,
+        funding_rate: float | None,
+    ) -> None:
+        continuous = model != "live" or self.cfg().funding_continuous_sizing
+        funding_enabled = self.cfg().funding_filter_enabled or model != "live"
+        funding_scalar = (
+            self._funding_scalar(raw_weight, funding_rate, continuous=continuous)
+            if funding_enabled and funding_rate is not None
+            else 1.0
+        )
+        self.risk_state.queue_shadow_target(
+            {
+                "model": model,
+                "cycle_id": str(cycle_id),
+                "cycle_ts": cycle_ts,
+                "symbol": self.instrument_id.symbol.value,
+                "price": float(price),
+                "signal": float(signal),
+                "raw_weight": float(raw_weight),
+                "target_weight": float(target_weight),
+                "portfolio_weight": float(target_weight) / max(1, self.cfg().n_instruments),
+                "portfolio_scale": float(portfolio_scale),
+                "funding_rate": float(funding_rate) if funding_rate is not None else None,
+                "funding_scalar": float(funding_scalar),
+                "cost_bps": float(self.cfg().round_trip_cost_bps + self.cfg().slippage_bps),
+            }
+        )
 
     def _rebalance_notional_threshold(self, budget: float, price: float, inst_vol: float) -> float:
         threshold = self.cfg().rebalance_threshold * budget

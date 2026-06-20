@@ -66,6 +66,8 @@ def test_trend_config_patient_limit_and_safe_defaults():
     d = TrendStrategyConfig(instrument_id="X.Y", bar_type="X.Y-1-DAY-LAST-EXTERNAL")
     assert not d.use_patient_limit and not d.use_vol_stop and not d.use_correlation_scaling
     assert not d.funding_filter_enabled and not d.cost_aware_rebalance
+    assert not d.use_portfolio_allocator and not d.funding_continuous_sizing
+    assert not d.shadow_enabled and d.portfolio_target_vol == 0.10
     assert not d.use_trailing_stop and d.trailing_activation_r == 1.0
     assert d.flatten_on_stop is False
 
@@ -132,6 +134,112 @@ def test_correlation_metrics_count_effective_bets_not_symbols():
     assert metrics["effective_bets"] == pytest.approx(1.0)
     assert metrics["risk_scalar"] == pytest.approx(0.50)
     assert metrics["volatility_regime"] == "LOW_VOL"
+
+
+def test_portfolio_allocator_activates_one_common_scale_next_cycle():
+    risk = RiskState()
+    returns = np.linspace(-0.02, 0.02, 90)
+    kwargs = dict(
+        expected_symbols=("BTC", "ETH"),
+        window=90,
+        target_vol=0.10,
+        ppy=365,
+        shrinkage=0.0,
+        min_scale=0.10,
+        max_scale=1.25,
+        max_gross=2.0,
+        min_observations=30,
+        scale_up_alpha=1.0,
+        scale_deadband=0.0,
+    )
+    first_btc = risk.publish_portfolio_target(
+        "live", "BTC", 1.0, returns, "day-1", **kwargs
+    )
+    first_eth = risk.publish_portfolio_target(
+        "live", "ETH", 1.0, returns, "day-1", **kwargs
+    )
+    computed = risk.allocation_scales["live"]
+    assert first_btc == first_eth == 1.0
+    assert 0.10 <= computed < 1.0
+    assert risk.allocation_metrics["live"]["ready"] is True
+
+    # Both sibling strategies capture the same lagged scale before day-2 is finalized.
+    second_btc = risk.publish_portfolio_target(
+        "live", "BTC", 1.0, returns, "day-2", **kwargs
+    )
+    second_eth = risk.publish_portfolio_target(
+        "live", "ETH", 1.0, returns, "day-2", **kwargs
+    )
+    assert second_btc == pytest.approx(computed)
+    assert second_eth == pytest.approx(computed)
+
+
+def test_portfolio_allocator_gross_cap_overrides_minimum_scale():
+    risk = RiskState()
+    returns = np.linspace(-0.01, 0.01, 60)
+    for symbol in ("BTC", "ETH"):
+        risk.publish_portfolio_target(
+            "gross",
+            symbol,
+            4.0,
+            returns,
+            "day-1",
+            ("BTC", "ETH"),
+            window=60,
+            target_vol=1.0,
+            ppy=365,
+            shrinkage=0.25,
+            min_scale=0.50,
+            max_scale=1.25,
+            max_gross=1.0,
+            min_observations=30,
+            scale_up_alpha=1.0,
+            scale_deadband=0.0,
+        )
+    metrics = risk.allocation_metrics["gross"]
+    assert metrics["gross_before"] == pytest.approx(4.0)
+    assert metrics["scale"] == pytest.approx(0.25)
+    assert metrics["gross_after"] == pytest.approx(1.0)
+
+
+def test_portfolio_allocator_smooths_small_scale_increases():
+    risk = RiskState()
+    quiet = np.linspace(-0.001, 0.001, 60)
+    risk.publish_portfolio_target(
+        "smooth",
+        "BTC",
+        0.1,
+        quiet,
+        "day-1",
+        ("BTC",),
+        window=60,
+        target_vol=0.50,
+        ppy=365,
+        shrinkage=0.25,
+        min_scale=0.25,
+        max_scale=1.25,
+        max_gross=2.0,
+        min_observations=30,
+        scale_up_alpha=0.20,
+        scale_deadband=0.10,
+    )
+    metrics = risk.allocation_metrics["smooth"]
+    assert metrics["candidate_scale"] == pytest.approx(1.25)
+    assert metrics["scale"] == pytest.approx(1.0)  # 5% increase is inside 10% deadband
+
+
+def test_continuous_funding_sizing_is_smooth_and_never_boosts():
+    strategy = TrendStrategy.__new__(TrendStrategy)
+    strategy.cfg = lambda: SimpleNamespace(
+        funding_rate_limit=0.0010,
+        funding_rate_soft_limit=0.0001,
+        funding_min_scalar=0.0,
+    )
+    assert strategy._funding_scalar(1.0, 0.0001, continuous=True) == 1.0
+    assert strategy._funding_scalar(1.0, 0.00055, continuous=True) == pytest.approx(0.5)
+    assert strategy._funding_scalar(1.0, 0.0010, continuous=True) == 0.0
+    assert strategy._funding_scalar(-1.0, -0.00055, continuous=True) == pytest.approx(0.5)
+    assert strategy._funding_scalar(1.0, -0.0010, continuous=True) == 1.0
 
 
 # --- protection idempotency (the live duplicate-stop bug) --------------------

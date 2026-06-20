@@ -78,6 +78,10 @@ def trend_returns(
     cost_bps: float,
     funding: pd.Series | None = None,
     ppy: int = PPY,
+    funding_continuous_sizing: bool = False,
+    funding_soft_limit: float = 0.0003,
+    funding_hard_limit: float = 0.0030,
+    funding_min_scalar: float = 0.0,
 ) -> pd.DataFrame:
     """Per-instrument vol-targeted trend-following net returns (no look-ahead).
 
@@ -96,16 +100,30 @@ def trend_returns(
     # vol-targeted weight, capped
     w = (sig * (target_vol / ann_vol)).clip(-max_leverage, max_leverage).where(valid, 0.0)
 
-    w_lag = w.shift(1).fillna(0.0)  # trade next bar -> no look-ahead
-    gross = w_lag * r
-    turnover = (w - w.shift(1)).abs().fillna(0.0)
-    cost = turnover * (cost_bps / 1e4)
-    funding_cost = 0.0
+    daily_funding = None
     if funding is not None:
         funding_by_day = funding.copy()
         funding_by_day.index = pd.to_datetime(funding_by_day.index, utc=True).normalize()
         close_days = pd.Series(pd.to_datetime(close.index, utc=True).normalize(), index=close.index)
         daily_funding = close_days.map(funding_by_day).fillna(0.0)
+        if funding_continuous_sizing:
+            hard = max(0.0, float(funding_hard_limit))
+            soft = float(np.clip(funding_soft_limit, 0.0, hard))
+            floor = float(np.clip(funding_min_scalar, 0.0, 1.0))
+            adverse = (np.sign(w) * daily_funding).clip(lower=0.0)
+            if hard <= soft:
+                scalar = pd.Series(np.where(adverse > soft, floor, 1.0), index=w.index)
+            else:
+                pressure = ((adverse - soft) / (hard - soft)).clip(0.0, 1.0)
+                scalar = 1.0 - pressure * (1.0 - floor)
+            w = w * scalar
+
+    w_lag = w.shift(1).fillna(0.0)  # trade next bar -> no look-ahead
+    gross = w_lag * r
+    turnover = (w - w.shift(1)).abs().fillna(0.0)
+    cost = turnover * (cost_bps / 1e4)
+    funding_cost = 0.0
+    if daily_funding is not None:
         funding_cost = w_lag * daily_funding
     net = (gross - cost - funding_cost).where(valid)  # NaN before live
 
@@ -192,6 +210,10 @@ def main() -> None:
     ap.add_argument(
         "--funding-dir", type=Path, default=None, help="directory of SYMBOL_funding.csv files"
     )
+    ap.add_argument("--funding-continuous-sizing", action="store_true")
+    ap.add_argument("--funding-soft-limit", type=float, default=0.0003)
+    ap.add_argument("--funding-hard-limit", type=float, default=0.0030)
+    ap.add_argument("--funding-min-scalar", type=float, default=0.0)
     ap.add_argument("--use-correlation-scaling", action="store_true")
     ap.add_argument("--corr-window", type=int, default=90)
     ap.add_argument("--corr-threshold", type=float, default=0.65)
@@ -220,6 +242,10 @@ def main() -> None:
             DEFAULT_COST_BPS.get(sym, args.crypto_cost_bps),
             funding=funding,
             ppy=ppy,
+            funding_continuous_sizing=args.funding_continuous_sizing,
+            funding_soft_limit=args.funding_soft_limit,
+            funding_hard_limit=args.funding_hard_limit,
+            funding_min_scalar=args.funding_min_scalar,
         )
         net_cols[sym] = res["net"]
         turnovers[sym] = res["turnover"].mean() * ppy

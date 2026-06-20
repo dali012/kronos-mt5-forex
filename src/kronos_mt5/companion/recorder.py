@@ -112,6 +112,33 @@ class Companion(Strategy):
             direction = self._basket_direction(positions)
             correlation = self._correlation_metrics()
             basket = self._basket_metrics(positions, orders, direction, correlation)
+            allocation_metrics = (
+                dict(getattr(self.risk_state, "allocation_metrics", {}))
+                if self.risk_state is not None
+                else {}
+            )
+            allocation_scales = (
+                dict(getattr(self.risk_state, "allocation_scales", {}))
+                if self.risk_state is not None
+                else {}
+            )
+            if "live_allocator" in allocation_scales:
+                store.set_kv(
+                    "portfolio_allocator_scale",
+                    f"{float(allocation_scales['live_allocator']):.12g}",
+                    self.config.db_path,
+                )
+            basket["portfolio_allocators"] = allocation_metrics
+            shadow_rows = (
+                self.risk_state.pending_shadow_targets()
+                if self.risk_state is not None
+                and hasattr(self.risk_state, "pending_shadow_targets")
+                else []
+            )
+            if shadow_rows:
+                store.record_shadow_targets(shadow_rows, self.config.db_path)
+                self.risk_state.acknowledge_shadow_targets(shadow_rows)
+            shadows = store.shadow_report(self.config.db_path)
             store.update_basket_cycle(
                 direction,
                 [p["symbol"] for p in positions],
@@ -148,6 +175,7 @@ class Companion(Strategy):
                         self.risk_state.mark_age_secs if self.risk_state else {}
                     ),
                     "basket": basket,
+                    "shadows": shadows,
                     "positions": positions, "orders": orders,
                 },
                 self.config.db_path,

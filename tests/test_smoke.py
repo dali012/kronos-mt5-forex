@@ -81,6 +81,28 @@ def test_trend_returns_apply_positive_funding_cost_to_longs():
     assert with_funding.sum() < no_funding.sum()
 
 
+def test_continuous_funding_sizing_reduces_adversely_funded_weight_without_lookahead():
+    idx = pd.date_range("2024-01-01", periods=20, freq="D", tz="UTC")
+    close = pd.Series(range(100, 120), index=idx, dtype=float)
+    funding = pd.Series(0.003, index=idx)
+    baseline = trend_returns(close, [1], 3, 0.10, 1.0, 0.0, funding=funding, ppy=365)
+    sized = trend_returns(
+        close,
+        [1],
+        3,
+        0.10,
+        1.0,
+        0.0,
+        funding=funding,
+        ppy=365,
+        funding_continuous_sizing=True,
+        funding_soft_limit=0.0003,
+        funding_hard_limit=0.0030,
+    )
+    valid = baseline["weight"] > 0
+    assert (sized.loc[valid, "weight"] == 0.0).all()
+
+
 def test_correlation_scalars_reduce_clustered_portfolio():
     idx = pd.date_range("2024-01-01", periods=20, freq="D")
     net = pd.DataFrame(

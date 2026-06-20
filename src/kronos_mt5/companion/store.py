@@ -12,7 +12,9 @@ Control model (single source of truth = the DB, so it survives bot restarts):
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
+from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -79,11 +81,20 @@ def init_db(db_path: str = DEFAULT_DB) -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,
                 kind TEXT NOT NULL, details TEXT
             );
+            CREATE TABLE IF NOT EXISTS shadow_targets (
+                model TEXT NOT NULL, cycle_id TEXT NOT NULL, cycle_ts TEXT NOT NULL,
+                recorded_ts TEXT NOT NULL, symbol TEXT NOT NULL, price REAL NOT NULL,
+                signal REAL NOT NULL, raw_weight REAL NOT NULL, target_weight REAL NOT NULL,
+                portfolio_weight REAL NOT NULL, portfolio_scale REAL NOT NULL,
+                funding_rate REAL, funding_scalar REAL NOT NULL, cost_bps REAL NOT NULL,
+                PRIMARY KEY (model, cycle_id, symbol)
+            );
             CREATE TABLE IF NOT EXISTS kv (name TEXT PRIMARY KEY, value TEXT, ts TEXT);
             CREATE INDEX IF NOT EXISTS idx_income_ts_type ON income(ts, income_type);
             CREATE INDEX IF NOT EXISTS idx_fills_ts ON fills(ts);
             CREATE INDEX IF NOT EXISTS idx_basket_status ON basket_cycles(status);
             CREATE INDEX IF NOT EXISTS idx_incidents_kind ON incidents(kind, started_ts);
+            CREATE INDEX IF NOT EXISTS idx_shadow_model_ts ON shadow_targets(model, cycle_ts);
             """
         )
         # Additive migrations preserve VPS databases created by earlier versions.
@@ -210,6 +221,42 @@ def record_income(
             ),
         )
         return cur.rowcount > 0
+
+
+def record_shadow_targets(rows: list[dict], db_path: str = DEFAULT_DB) -> int:
+    """Persist shadow decisions idempotently; these rows never place orders."""
+    if not rows:
+        return 0
+    recorded_ts = _now()
+    values = [
+        (
+            str(row["model"]),
+            str(row["cycle_id"]),
+            str(row["cycle_ts"]),
+            recorded_ts,
+            str(row["symbol"]),
+            float(row["price"]),
+            float(row["signal"]),
+            float(row["raw_weight"]),
+            float(row["target_weight"]),
+            float(row["portfolio_weight"]),
+            float(row["portfolio_scale"]),
+            float(row["funding_rate"]) if row.get("funding_rate") is not None else None,
+            float(row["funding_scalar"]),
+            float(row["cost_bps"]),
+        )
+        for row in rows
+    ]
+    with _conn(db_path) as con:
+        before = con.total_changes
+        con.executemany(
+            "INSERT OR IGNORE INTO shadow_targets "
+            "(model, cycle_id, cycle_ts, recorded_ts, symbol, price, signal, raw_weight, "
+            "target_weight, portfolio_weight, portfolio_scale, funding_rate, funding_scalar, "
+            "cost_bps) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            values,
+        )
+        return con.total_changes - before
 
 
 def record_closed_position(
@@ -541,6 +588,121 @@ def read_income(limit: int = 500, db_path: str = DEFAULT_DB) -> list[dict]:
             (limit,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def read_shadow_targets(limit: int = 5000, db_path: str = DEFAULT_DB) -> list[dict]:
+    with _conn(db_path) as con:
+        rows = con.execute(
+            "SELECT model, cycle_id, cycle_ts, recorded_ts, symbol, price, signal, "
+            "raw_weight, target_weight, portfolio_weight, portfolio_scale, funding_rate, "
+            "funding_scalar, cost_bps FROM shadow_targets "
+            "ORDER BY cycle_ts DESC, model, symbol LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def shadow_report(db_path: str = DEFAULT_DB) -> dict:
+    """Score shadow targets using next-cycle price returns and modeled turnover costs.
+
+    Funding is deliberately not estimated from a point-in-time rate. The income
+    ledger remains the source of truth for live funding, while shadow reports
+    disclose this limitation instead of manufacturing precision.
+    """
+    rows = read_shadow_targets(limit=100000, db_path=db_path)
+    grouped: dict[str, dict[str, list[dict]]] = defaultdict(lambda: defaultdict(list))
+    for row in rows:
+        grouped[str(row["model"])][str(row["cycle_id"])].append(row)
+
+    models = {}
+    for model, cycles_by_id in grouped.items():
+        cycles = sorted(
+            cycles_by_id.values(),
+            key=lambda cycle: datetime.fromisoformat(str(cycle[0]["cycle_ts"])),
+        )
+        if not cycles:
+            continue
+        virtual_equity = 1.0
+        peak = 1.0
+        max_drawdown = 0.0
+        period_returns: list[float] = []
+        previous: dict[str, dict] | None = None
+        first_ts = datetime.fromisoformat(str(cycles[0][0]["cycle_ts"]))
+        last_ts = first_ts
+        for cycle in cycles:
+            current = {str(row["symbol"]): row for row in cycle}
+            current_ts = datetime.fromisoformat(str(cycle[0]["cycle_ts"]))
+            last_ts = max(last_ts, current_ts)
+            if previous is None:
+                entry_turnover = sum(abs(float(row["portfolio_weight"])) for row in current.values())
+                cost_bps = max((float(row["cost_bps"]) for row in current.values()), default=0.0)
+                virtual_equity *= 1.0 - entry_turnover * cost_bps / 1e4
+            else:
+                price_return = 0.0
+                for symbol, prior in previous.items():
+                    now = current.get(symbol)
+                    if now is None or float(prior["price"]) <= 0:
+                        continue
+                    asset_return = float(now["price"]) / float(prior["price"]) - 1.0
+                    price_return += float(prior["portfolio_weight"]) * asset_return
+                symbols = set(previous) | set(current)
+                turnover = sum(
+                    abs(
+                        float(current.get(symbol, {}).get("portfolio_weight", 0.0))
+                        - float(previous.get(symbol, {}).get("portfolio_weight", 0.0))
+                    )
+                    for symbol in symbols
+                )
+                cost_bps = max((float(row["cost_bps"]) for row in current.values()), default=0.0)
+                net_return = price_return - turnover * cost_bps / 1e4
+                period_returns.append(net_return)
+                virtual_equity *= max(0.0, 1.0 + net_return)
+            peak = max(peak, virtual_equity)
+            if peak > 0:
+                max_drawdown = min(max_drawdown, virtual_equity / peak - 1.0)
+            previous = current
+
+        elapsed_days = max(0.0, (last_ts - first_ts).total_seconds() / 86400.0)
+        annualized_return = (
+            virtual_equity ** (365.0 / elapsed_days) - 1.0
+            if elapsed_days > 0 and virtual_equity > 0
+            else None
+        )
+        sharpe = None
+        if len(period_returns) > 1 and elapsed_days > 0:
+            mean_return = sum(period_returns) / len(period_returns)
+            variance = sum((value - mean_return) ** 2 for value in period_returns) / (
+                len(period_returns) - 1
+            )
+            periods_per_year = 365.0 / max(elapsed_days / len(period_returns), 1e-9)
+            if variance > 0:
+                sharpe = mean_return / math.sqrt(variance) * math.sqrt(periods_per_year)
+        latest = {
+            row["symbol"]: {
+                "signal": row["signal"],
+                "target_weight": row["target_weight"],
+                "portfolio_weight": row["portfolio_weight"],
+                "portfolio_scale": row["portfolio_scale"],
+                "funding_rate": row["funding_rate"],
+                "funding_scalar": row["funding_scalar"],
+            }
+            for row in cycles[-1]
+        }
+        models[model] = {
+            "cycles": len(cycles),
+            "scored_periods": len(period_returns),
+            "total_return": virtual_equity - 1.0,
+            "annualized_return": annualized_return,
+            "sharpe": sharpe,
+            "maximum_drawdown": max_drawdown,
+            "latest_cycle_ts": cycles[-1][0]["cycle_ts"],
+            "latest_targets": latest,
+        }
+    return {
+        "models": models,
+        "method": "next-cycle price return minus configured turnover cost",
+        "funding_note": "Shadow funding PnL is not simulated from point-in-time rates.",
+    }
 
 
 def read_closed_positions(limit: int = 500, db_path: str = DEFAULT_DB) -> list[dict]:

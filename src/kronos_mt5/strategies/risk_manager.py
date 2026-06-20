@@ -10,6 +10,7 @@ as exchange-native reduce-only orders.
 from __future__ import annotations
 
 from datetime import timedelta
+from uuid import uuid4
 
 import numpy as np
 
@@ -30,6 +31,15 @@ class RiskState:
         self.flatten_seq = 0  # bumped for one-shot flatten requests
         self.flatten_target = "all"  # 'all' or a symbol like 'BTCUSDT-PERP'
         self.returns_by_symbol: dict[str, np.ndarray] = {}
+        self.run_id = uuid4().hex
+        # Portfolio allocators publish one common scale for the *next* cycle.
+        # That one-cycle lag keeps all strategies on the same scale even though
+        # Nautilus dispatches their same-timestamp bars sequentially.
+        self.allocation_scales: dict[str, float] = {}
+        self.allocation_metrics: dict[str, dict] = {}
+        self._allocation_pending: dict[str, dict[str, dict[str, float]]] = {}
+        self._allocation_completed: dict[str, set[str]] = {}
+        self._shadow_target_queue: dict[tuple[str, str, str], dict] = {}
         # Live-only mark stream health. Backtests leave the watchdog disabled.
         self.mark_watchdog_enabled = False
         self.market_data_stale = False
@@ -76,6 +86,160 @@ class RiskState:
 
     def update_returns(self, symbol: str, returns: np.ndarray) -> None:
         self.returns_by_symbol[symbol] = np.asarray(returns, dtype=float)
+
+    def publish_portfolio_target(
+        self,
+        model: str,
+        symbol: str,
+        raw_weight: float,
+        returns: np.ndarray,
+        cycle_id: str | int,
+        expected_symbols: tuple[str, ...],
+        *,
+        window: int,
+        target_vol: float,
+        ppy: int,
+        shrinkage: float,
+        min_scale: float,
+        max_scale: float,
+        max_gross: float,
+        min_observations: int,
+        scale_up_alpha: float,
+        scale_deadband: float,
+    ) -> float:
+        """Publish one target and return the stable scale for this cycle.
+
+        Once every expected symbol has published for ``cycle_id``, a shrunk
+        covariance estimate produces the scale activated on the next cycle.
+        This avoids order-dependent sizing across sibling strategies.
+        """
+        current_scale = float(self.allocation_scales.get(model, 1.0))
+        self.update_returns(symbol, returns)
+        cycle = str(cycle_id)
+        completed = self._allocation_completed.setdefault(model, set())
+        if cycle in completed:
+            return current_scale
+
+        cycles = self._allocation_pending.setdefault(model, {})
+        weights = cycles.setdefault(cycle, {})
+        weights[symbol] = float(raw_weight)
+        expected = tuple(dict.fromkeys(expected_symbols))
+        if expected and set(expected).issubset(weights):
+            metrics = self._portfolio_allocation_metrics(
+                {name: weights[name] for name in expected},
+                window=window,
+                target_vol=target_vol,
+                ppy=ppy,
+                shrinkage=shrinkage,
+                min_scale=min_scale,
+                max_scale=max_scale,
+                max_gross=max_gross,
+                min_observations=min_observations,
+            )
+            candidate_scale = float(metrics["scale"])
+            previous_scale = float(self.allocation_scales.get(model, 1.0))
+            if candidate_scale < previous_scale:
+                activated_scale = candidate_scale  # de-risk immediately
+            else:
+                alpha = float(np.clip(scale_up_alpha, 0.0, 1.0))
+                activated_scale = previous_scale + alpha * (candidate_scale - previous_scale)
+                relative_change = abs(activated_scale - previous_scale) / max(
+                    abs(previous_scale), 1e-9
+                )
+                if relative_change < max(0.0, float(scale_deadband)):
+                    activated_scale = previous_scale
+            # Gross is a hard limit even while scale increases are smoothed.
+            gross_before = float(metrics["gross_before"])
+            if max_gross > 0 and gross_before > 0:
+                activated_scale = min(activated_scale, float(max_gross) / gross_before)
+            metrics["candidate_scale"] = candidate_scale
+            metrics["scale"] = max(0.0, activated_scale)
+            metrics["gross_after"] = gross_before * metrics["scale"]
+            forecast = metrics["forecast_vol_before"]
+            metrics["forecast_vol_after"] = (
+                forecast * metrics["scale"] if forecast is not None else None
+            )
+            metrics.update({"model": model, "source_cycle": cycle})
+            self.allocation_scales[model] = float(metrics["scale"])
+            self.allocation_metrics[model] = metrics
+            completed.add(cycle)
+            cycles.pop(cycle, None)
+            # Bound state during long-running processes and backtests.
+            while len(completed) > 16:
+                completed.pop()
+            while len(cycles) > 4:
+                cycles.pop(next(iter(cycles)))
+        return current_scale
+
+    def _portfolio_allocation_metrics(
+        self,
+        raw_weights: dict[str, float],
+        *,
+        window: int,
+        target_vol: float,
+        ppy: int,
+        shrinkage: float,
+        min_scale: float,
+        max_scale: float,
+        max_gross: float,
+        min_observations: int,
+    ) -> dict:
+        symbols = tuple(raw_weights)
+        n_assets = len(symbols)
+        portfolio_weights = np.asarray(
+            [raw_weights[symbol] / max(1, n_assets) for symbol in symbols], dtype=float
+        )
+        gross_before = float(np.abs(portfolio_weights).sum())
+        available = [self.returns_by_symbol.get(symbol) for symbol in symbols]
+        ready = bool(
+            available
+            and all(series is not None and len(series) >= min_observations for series in available)
+        )
+        forecast_vol = None
+        vol_scale = 1.0
+        if ready:
+            length = min(window, *(len(series) for series in available if series is not None))
+            matrix = np.vstack([series[-length:] for series in available if series is not None])
+            covariance = np.atleast_2d(np.cov(matrix, ddof=1)) * float(ppy)
+            shrink = float(np.clip(shrinkage, 0.0, 1.0))
+            covariance = (1.0 - shrink) * covariance + shrink * np.diag(
+                np.diag(covariance)
+            )
+            variance = float(portfolio_weights @ covariance @ portfolio_weights)
+            forecast_vol = float(np.sqrt(max(0.0, variance)))
+            if forecast_vol > 1e-12:
+                vol_scale = max(0.0, float(target_vol)) / forecast_vol
+
+        lower = max(0.0, float(min_scale))
+        upper = max(lower, float(max_scale))
+        scale = float(np.clip(vol_scale, lower, upper)) if ready else min(1.0, upper)
+        if max_gross > 0 and gross_before > 0:
+            scale = min(scale, float(max_gross) / gross_before)
+        scale = max(0.0, scale)
+        return {
+            "ready": ready,
+            "scale": scale,
+            "forecast_vol_before": forecast_vol,
+            "forecast_vol_after": forecast_vol * scale if forecast_vol is not None else None,
+            "target_vol": float(target_vol),
+            "gross_before": gross_before,
+            "gross_after": gross_before * scale,
+            "asset_count": n_assets,
+            "window": int(window),
+            "shrinkage": float(np.clip(shrinkage, 0.0, 1.0)),
+        }
+
+    def queue_shadow_target(self, row: dict) -> None:
+        key = (str(row["model"]), str(row["cycle_id"]), str(row["symbol"]))
+        self._shadow_target_queue[key] = dict(row)
+
+    def pending_shadow_targets(self) -> list[dict]:
+        return list(self._shadow_target_queue.values())
+
+    def acknowledge_shadow_targets(self, rows: list[dict]) -> None:
+        for row in rows:
+            key = (str(row["model"]), str(row["cycle_id"]), str(row["symbol"]))
+            self._shadow_target_queue.pop(key, None)
 
     def correlation_scalar(
         self,
