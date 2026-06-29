@@ -445,3 +445,20 @@ def test_funding_rate_state_normalizes_nautilus_perpetual_symbols():
     assert state.get("BTCUSDT") == 0.0001
     assert state.get("BTCUSDT-PERP") == 0.0001
     assert state.get("BTCUSDT-PERP.BINANCE") == 0.0001
+
+
+def test_restore_control_state_does_not_replay_flatten(tmp_path):
+    from kronos_mt5.companion import store
+    from kronos_mt5.live.run_trend_binance import _restore_control_state
+
+    db = str(tmp_path / "control.db")
+    store.init_db(db)
+    store.set_mode("run", db)
+    assert store.request_flatten("all", db) == 1
+    risk = RiskState()
+
+    _restore_control_state(risk, db)
+
+    assert risk.mode == "run"
+    assert risk.flatten_seq == 1
+    assert risk.flatten_target == "all"

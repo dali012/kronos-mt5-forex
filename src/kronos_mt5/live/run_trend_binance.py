@@ -181,6 +181,13 @@ def _instrument_ids(symbols: list[str]) -> list[str]:
     return [f"{s}-PERP.{VENUE}" for s in symbols]
 
 
+def _restore_control_state(risk: RiskState, db_path: str) -> None:
+    """Restore persisted control state without replaying one-shot commands."""
+    store.init_db(db_path)
+    risk.mode = store.get_mode(db_path)
+    risk.flatten_seq, risk.flatten_target = store.get_flatten(db_path)
+
+
 def build_node() -> TradingNode:
     settings.assert_binance_testnet()  # refuse non-testnet / missing keys
     symbols = [s.strip() for s in settings.binance_symbols.split(",") if s.strip()]
@@ -228,6 +235,10 @@ def build_node() -> TradingNode:
 
     n = len(symbols)
     risk = RiskState()  # shared halt flag (drawdown kill-switch -> blocks entries)
+    try:
+        _restore_control_state(risk, settings.companion_db)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Control state restore skipped: {exc!r}")
     if settings.binance_use_portfolio_allocator:
         try:
             store.init_db(settings.companion_db)
