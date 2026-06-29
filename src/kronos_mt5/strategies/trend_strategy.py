@@ -820,7 +820,7 @@ class TrendStrategy(Strategy):
             # place. Nautilus represents this as basis points and divides by
             # 100, so round to 10-bps increments before submission.
             callback_rate_pct = round(self._dynamic_trailing_pct * 100, 1)
-            trail_offset_bps = Decimal(str(callback_rate_pct * 100))
+            trail_offset_bps = Decimal(f"{callback_rate_pct:.1f}") * Decimal("100")
 
         signature = (
             close_side.value,

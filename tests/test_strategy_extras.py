@@ -424,12 +424,12 @@ def test_trailing_distance_uses_daily_vol_and_binance_bounds(monkeypatch):
 
 def test_trailing_callback_rate_uses_binance_precision(monkeypatch):
     s = _protection_strat(monkeypatch, use_trail=True)
-    s._dynamic_trailing_pct = 0.080742457784
+    s._dynamic_trailing_pct = 0.092911670832
 
     s._set_protection(2.0, 100.0)
 
     trail = s.submitted[1]
-    assert float(trail.kwargs["trailing_offset"]) == 810.0  # 8.1%, in basis points
+    assert str(trail.kwargs["trailing_offset"]) == "930.0"  # 9.3%, exact basis points
 
 
 def test_funding_rate_updater_constructs():
