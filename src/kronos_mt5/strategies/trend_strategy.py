@@ -816,7 +816,11 @@ class TrendStrategy(Strategy):
             )
             if already_activated:
                 trail_activation = None
-            trail_offset_bps = Decimal(str(round(self._dynamic_trailing_pct * 10_000, 8)))
+            # Binance Futures accepts callbackRate in percent with one decimal
+            # place. Nautilus represents this as basis points and divides by
+            # 100, so round to 10-bps increments before submission.
+            callback_rate_pct = round(self._dynamic_trailing_pct * 100, 1)
+            trail_offset_bps = Decimal(str(callback_rate_pct * 100))
 
         signature = (
             close_side.value,
