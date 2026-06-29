@@ -16,3 +16,4 @@ reports/
 kaggle/_staging/
 kaggle/kernel/kernel-metadata.json
 logs/
+artifacts/

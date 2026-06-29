@@ -207,7 +207,17 @@ def build_node() -> TradingNode:
         # MarkPriceUpdate events now drive Portfolio.unrealized_pnl/net exposure.
         # Without this, the daily bars leave live PnL and drawdown stale all day.
         portfolio=PortfolioConfig(use_mark_prices=True),
-        data_clients={VENUE: BinanceDataClientConfig(**common)},
+        data_clients={
+            VENUE: BinanceDataClientConfig(
+                **common,
+                # The fixed testnet universe is loaded at startup. Nautilus
+                # 1.228.0's hourly full-catalog refresh can fail when an
+                # unrelated Binance symbol reports the newer TRADING_HALT
+                # status, so avoid that nonessential refresh until upstream
+                # handles unknown instrument states defensively.
+                update_instruments_interval_mins=None,
+            )
+        },
         exec_clients={VENUE: BinanceExecClientConfig(**common)},
     )
 

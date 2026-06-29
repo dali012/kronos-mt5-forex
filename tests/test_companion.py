@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import io
 import json
 import sqlite3
 import urllib.parse
+from urllib.error import HTTPError
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -257,6 +259,29 @@ def test_binance_income_client_signs_request():
     assert params["startTime"] == ["100"] and captured["timeout"] == 10.0
 
 
+def test_binance_income_client_includes_http_error_body():
+    from kronos_mt5.companion.accounting import BinanceIncomeClient
+
+    def opener(request, timeout):
+        raise HTTPError(
+            request.full_url,
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(b'{"code":-1021,"msg":"Timestamp outside recvWindow"}'),
+        )
+
+    client = BinanceIncomeClient(
+        "api-key",
+        "secret",
+        "https://demo-fapi.binance.com",
+        opener=opener,
+        clock_ms=lambda: 999,
+    )
+    with pytest.raises(RuntimeError, match=r"HTTP 400.*-1021.*recvWindow"):
+        client.fetch_income(100)
+
+
 def test_fill_reference_price_prefers_decision_tag():
     from kronos_mt5.companion.recorder import Companion
 
@@ -430,6 +455,37 @@ def test_mark_stale_alert_and_api_halt(tmp_path, monkeypatch):
     store.write_snapshot(snap, p)
     api._check_mark_data()
     assert len(sent) == 2 and "RECOVERED" in sent[-1]
+
+
+def test_mark_stale_alert_escalates_once(tmp_path, monkeypatch):
+    from kronos_mt5.companion import api
+
+    p = str(tmp_path / "marks-escalation.db")
+    store.init_db(p)
+    monkeypatch.setattr(api, "DB", p)
+    monkeypatch.setattr(api.settings, "api_mark_stale_escalate_secs", 60)
+    sent = []
+    monkeypatch.setattr(api.tg, "send", sent.append)
+    store.write_snapshot(
+        {
+            "mark_data_stale": True,
+            "stale_mark_symbols": ["BTCUSDT-PERP"],
+        },
+        p,
+    )
+
+    api._check_mark_data()
+    store.set_kv(
+        "alert_mark_stale_started_ts",
+        "2000-01-01T00:00:00+00:00",
+        p,
+    )
+    api._check_mark_data()
+    api._check_mark_data()
+
+    assert len(sent) == 2
+    assert "STILL STALE" in sent[-1]
+    assert store.get_kv("alert_mark_stale_escalated", "0", p) == "1"
 
 
 def test_telegram_commands(tmp_path, monkeypatch):

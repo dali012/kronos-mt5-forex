@@ -8,6 +8,7 @@ RiskState the strategies read. Only local SQLite writes — never blocks trading
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import traceback
 
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.currencies import USDT
@@ -202,7 +203,9 @@ class Companion(Strategy):
             )
             store.heartbeat(self.config.db_path)
         except Exception as exc:  # noqa: BLE001
-            self.log.warning(f"companion snapshot failed: {exc!r}")
+            self.log.warning(
+                f"companion snapshot failed: {exc!r}\n{traceback.format_exc()}"
+            )
 
     def on_stop(self) -> None:
         try:

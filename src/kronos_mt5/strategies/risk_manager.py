@@ -393,8 +393,10 @@ class MarkPriceMonitor(Strategy):
             self.log.warning("MARK WATCHDOG: all mark streams fresh; entry gate released")
 
     def on_stop(self) -> None:
-        for iid in self._iids:
-            self.unsubscribe_mark_prices(iid)
+        # Binance's Nautilus adapter does not implement mark-price unsubscribe
+        # in 1.228.0. The client disconnect performed by node disposal releases
+        # these subscriptions, so avoid noisy NotImplementedError shutdown logs.
+        pass
 
 
 class RiskManager(Strategy):

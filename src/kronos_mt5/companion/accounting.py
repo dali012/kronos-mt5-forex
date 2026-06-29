@@ -8,6 +8,7 @@ import json
 import time
 import urllib.parse
 import urllib.request
+from urllib.error import HTTPError
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 
@@ -56,8 +57,14 @@ class BinanceIncomeClient:
             f"{self._base_url}/fapi/v1/income?{query}&signature={signature}",
             headers={"X-MBX-APIKEY": self._api_key},
         )
-        with self._opener(request, timeout=self._timeout_secs) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+        try:
+            with self._opener(request, timeout=self._timeout_secs) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")[:1000]
+            raise RuntimeError(
+                f"Binance income HTTP {exc.code} {exc.reason}: {body}"
+            ) from exc
         if not isinstance(payload, list):
             raise RuntimeError(f"Binance income request failed: {payload!r}")
         return payload

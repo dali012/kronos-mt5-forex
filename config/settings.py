@@ -114,6 +114,7 @@ class Settings(BaseSettings):
     api_poll_secs: int = 30  # alerter loop interval
     api_dd_warn_pct: float = 0.10  # Telegram warn when drawdown crosses this
     api_bot_down_secs: int = 600  # alert if no bot heartbeat for this long
+    api_mark_stale_escalate_secs: int = 60  # second alert if mark outage persists
     api_daily_summary_hour: int = 0  # UTC hour for the daily Telegram digest (<0 = off)
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
