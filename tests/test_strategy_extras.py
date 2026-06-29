@@ -462,3 +462,13 @@ def test_restore_control_state_does_not_replay_flatten(tmp_path):
     assert risk.mode == "run"
     assert risk.flatten_seq == 1
     assert risk.flatten_target == "all"
+
+
+def test_strategy_start_syncs_persisted_flatten_cursor():
+    strategy = TrendStrategy.__new__(TrendStrategy)
+    strategy.risk_state = SimpleNamespace(flatten_seq=7)
+    strategy._last_flatten_seq = 0
+
+    strategy._sync_flatten_cursor()
+
+    assert strategy._last_flatten_seq == 7

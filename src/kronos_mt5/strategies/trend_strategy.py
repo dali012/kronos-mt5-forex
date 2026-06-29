@@ -126,11 +126,22 @@ class TrendStrategy(Strategy):
         return self.config
 
     def on_start(self) -> None:
+        self._sync_flatten_cursor()
         self.instrument = self.cache.instrument(self.instrument_id)
         if self.instrument is None:
             self.log.error(f"No instrument {self.instrument_id}; stopping.")
             self.stop()
             return
+        self._start_after_instrument_load()
+
+    def _sync_flatten_cursor(self) -> None:
+        # One-shot flatten commands already persisted before this process
+        # started have been consumed. Start at the shared cursor so a restart
+        # does not replay an old command and skip protection reconciliation.
+        if self.risk_state is not None:
+            self._last_flatten_seq = self.risk_state.flatten_seq
+
+    def _start_after_instrument_load(self) -> None:
         if self.cfg().warmup_request:
             import pandas as pd
 
