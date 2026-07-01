@@ -213,6 +213,11 @@ def main() -> None:
     ap.add_argument("--stop-vol-mult", type=float, default=4.0)
     ap.add_argument("--min-stop-pct", type=float, default=0.08)
     ap.add_argument("--max-stop-pct", type=float, default=0.30)
+    ap.add_argument("--use-trailing-stop", action="store_true", help="native trailing stop (arms ~+1R)")
+    ap.add_argument("--trailing-activation-r", type=float, default=1.0)
+    ap.add_argument("--trailing-vol-mult", type=float, default=3.0)
+    ap.add_argument("--min-trailing-pct", type=float, default=0.005)
+    ap.add_argument("--max-trailing-pct", type=float, default=0.10)
     ap.add_argument("--use-correlation-scaling", action="store_true")
     ap.add_argument("--corr-window", type=int, default=90)
     ap.add_argument("--corr-threshold", type=float, default=0.65)
@@ -289,6 +294,11 @@ def main() -> None:
                 max_stop_pct=args.max_stop_pct,
                 use_take_profit=args.tp_pct > 0,
                 tp_pct=args.tp_pct or 0.50,
+                use_trailing_stop=args.use_trailing_stop,
+                trailing_activation_r=args.trailing_activation_r,
+                trailing_vol_mult=args.trailing_vol_mult,
+                min_trailing_pct=args.min_trailing_pct,
+                max_trailing_pct=args.max_trailing_pct,
                 use_correlation_scaling=args.use_correlation_scaling,
                 corr_window=args.corr_window,
                 corr_threshold=args.corr_threshold,
