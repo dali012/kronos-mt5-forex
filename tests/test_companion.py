@@ -442,6 +442,8 @@ def test_mark_stale_alert_and_api_halt(tmp_path, monkeypatch):
         },
         p,
     )
+    # The trend bot's watchdog is the sole incident writer; the companion alerts off it.
+    store.start_incident("MARK_STALE", "ETHUSDT-PERP", p)
 
     api._check_mark_data()
     api._check_mark_data()  # alert is edge-triggered, not repeated every poll
@@ -453,6 +455,7 @@ def test_mark_stale_alert_and_api_halt(tmp_path, monkeypatch):
     snap["mark_data_stale"] = False
     snap["stale_mark_symbols"] = []
     store.write_snapshot(snap, p)
+    store.resolve_incident("MARK_STALE", p)
     api._check_mark_data()
     assert len(sent) == 2 and "RECOVERED" in sent[-1]
 
@@ -473,6 +476,7 @@ def test_mark_stale_alert_escalates_once(tmp_path, monkeypatch):
         },
         p,
     )
+    store.start_incident("MARK_STALE", "BTCUSDT-PERP", p)
 
     api._check_mark_data()
     store.set_kv(

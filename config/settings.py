@@ -57,6 +57,7 @@ class Settings(BaseSettings):
     binance_heartbeat_secs: int = 3600  # periodic equity/PnL log between daily rebalances
     binance_mark_check_secs: int = 5  # watchdog cadence for the 1s Binance mark stream
     binance_mark_stale_secs: int = 15  # fail closed when any configured mark is older
+    binance_mark_incident_min_secs: int = 10  # debounce: only log an incident if staleness persists
     # --- risk controls ---
     binance_stop_pct: float = 0.20  # per-position stop-loss (exchange-native, reduce-only)
     binance_use_vol_stop: bool = False

@@ -413,6 +413,16 @@ def resolve_incident(kind: str, db_path: str = DEFAULT_DB) -> None:
         )
 
 
+def has_open_incident(kind: str, db_path: str = DEFAULT_DB) -> bool:
+    """True while an unresolved incident of ``kind`` exists (single source of truth)."""
+    with _conn(db_path) as con:
+        row = con.execute(
+            "SELECT 1 FROM incidents WHERE kind=? AND ended_ts IS NULL LIMIT 1",
+            (kind,),
+        ).fetchone()
+    return row is not None
+
+
 def ensure_accounting_baseline(
     equity: float,
     cash: float,

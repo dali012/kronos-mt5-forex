@@ -125,13 +125,16 @@ def _check_bot_down() -> None:
 
 def _check_mark_data() -> None:
     snap = store.read_snapshot(DB) or {}
-    stale = bool(snap.get("mark_data_stale"))
+    # The trend bot's MarkPriceMonitor is the sole MARK_STALE incident writer and
+    # debounces transient feed flaps. Alert off that confirmed incident rather than
+    # the raw snapshot flag so Telegram stays in lockstep with the incident log and
+    # startup mark warmup is never announced.
+    stale = store.has_open_incident("MARK_STALE", DB)
     alerted = store.get_kv("alert_mark_stale", "0", DB) == "1"
     escalated = store.get_kv("alert_mark_stale_escalated", "0", DB) == "1"
     if stale and not alerted:
         symbols = ", ".join(snap.get("stale_mark_symbols", [])) or "unknown"
         tg.send(f"🟠 MARK DATA STALE — entries halted ({symbols}); positions/stops kept")
-        store.start_incident("MARK_STALE", symbols, DB)
         store.set_kv("alert_mark_stale", "1", DB)
         store.set_kv(
             "alert_mark_stale_started_ts", datetime.now(timezone.utc).isoformat(), DB
@@ -149,7 +152,6 @@ def _check_mark_data() -> None:
                 )
                 store.set_kv("alert_mark_stale_escalated", "1", DB)
     elif not stale and alerted:
-        store.resolve_incident("MARK_STALE", DB)
         tg.send("🟢 MARK DATA RECOVERED — entry gate released")
         store.set_kv("alert_mark_stale", "0", DB)
         store.set_kv("alert_mark_stale_started_ts", "", DB)

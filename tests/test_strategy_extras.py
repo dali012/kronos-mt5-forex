@@ -482,3 +482,78 @@ def test_strategy_start_syncs_persisted_flatten_cursor():
     strategy._sync_flatten_cursor()
 
     assert strategy._last_flatten_seq == 7
+
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self.ns = 0
+
+    def timestamp_ns(self) -> int:
+        return self.ns
+
+
+def _watchdog_stub(db_path: str, iids):
+    """A MarkPriceMonitor-shaped object that exercises _evaluate_freshness without
+    standing up the full Nautilus Strategy machinery."""
+    return SimpleNamespace(
+        risk_state=RiskState(),
+        clock=_FakeClock(),
+        log=SimpleNamespace(error=lambda *a, **k: None, warning=lambda *a, **k: None),
+        config=SimpleNamespace(stale_after_secs=15, incident_min_secs=10, db_path=db_path),
+        _iids=iids,
+        _stale_since_ns=None,
+        _incident_open=False,
+        _warmed_up=False,
+    )
+
+
+def test_mark_watchdog_debounces_transient_flaps(tmp_path):
+    """Entry gate reacts instantly; incidents only log when staleness persists."""
+    from kronos_mt5.companion import store
+    from kronos_mt5.strategies.risk_manager import MarkPriceMonitor
+
+    db = str(tmp_path / "watchdog.db")
+    store.init_db(db)
+    btc = InstrumentId.from_str("BTCUSDT-PERP.BINANCE")
+    eth = InstrumentId.from_str("ETHUSDT-PERP.BINANCE")
+    iids = (btc, eth)
+    ev = MarkPriceMonitor._evaluate_freshness
+
+    m = _watchdog_stub(db, iids)
+    m.risk_state.enable_mark_watchdog(iids)
+    sec = 1_000_000_000
+
+    # Startup warmup: stale until marks arrive, but this is never an incident.
+    m.clock.ns = 100 * sec
+    ev(m)
+    assert not store.has_open_incident("MARK_STALE", db)
+    m.risk_state.update_mark(_mark(btc, "63000"), received_ns=m.clock.ns)
+    m.risk_state.update_mark(_mark(eth, "1700"), received_ns=m.clock.ns)
+    ev(m)  # first fresh read -> warmed up
+    assert m._warmed_up and not store.has_open_incident("MARK_STALE", db)
+
+    # Transient flap: goes stale then recovers before incident_min_secs -> no incident.
+    m.clock.ns = 120 * sec  # marks now 20s old (> 15s stale threshold)
+    ev(m)
+    assert m.risk_state.market_data_stale  # entry gate closed immediately (fail-safe)
+    assert not store.has_open_incident("MARK_STALE", db)  # but not yet logged
+    m.risk_state.update_mark(_mark(btc, "63010"), received_ns=125 * sec)
+    m.risk_state.update_mark(_mark(eth, "1701"), received_ns=125 * sec)
+    m.clock.ns = 125 * sec
+    ev(m)
+    assert not store.has_open_incident("MARK_STALE", db)
+
+    # Persistent outage: stale beyond incident_min_secs -> exactly one incident.
+    m.clock.ns = 145 * sec  # marks 20s old again
+    ev(m)
+    assert not store.has_open_incident("MARK_STALE", db)  # debounce not elapsed
+    m.clock.ns = 156 * sec  # 11s of continuous staleness
+    ev(m)
+    assert store.has_open_incident("MARK_STALE", db)
+
+    # Recovery resolves the single incident.
+    m.risk_state.update_mark(_mark(btc, "63020"), received_ns=156 * sec)
+    m.risk_state.update_mark(_mark(eth, "1702"), received_ns=156 * sec)
+    ev(m)
+    assert not store.has_open_incident("MARK_STALE", db)
+    assert len([r for r in store.read_incidents(db_path=db) if r["kind"] == "MARK_STALE"]) == 1

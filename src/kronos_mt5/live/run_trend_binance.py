@@ -276,6 +276,7 @@ def build_node() -> TradingNode:
             instrument_ids=tuple(iids),
             check_secs=settings.binance_mark_check_secs,
             stale_after_secs=settings.binance_mark_stale_secs,
+            incident_min_secs=settings.binance_mark_incident_min_secs,
             db_path=settings.companion_db,
         )
     )

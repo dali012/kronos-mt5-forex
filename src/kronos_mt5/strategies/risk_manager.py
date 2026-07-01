@@ -325,6 +325,10 @@ class MarkPriceMonitorConfig(StrategyConfig, frozen=True):
     instrument_ids: tuple[str, ...]
     check_secs: int = 5
     stale_after_secs: int = 15
+    # Only record a MARK_STALE incident once staleness has persisted this long, so
+    # transient exchange feed flaps (common on testnet) don't spam the incident log.
+    # The entry gate itself still fails closed instantly on the first stale mark.
+    incident_min_secs: int = 10
     db_path: str = store.DEFAULT_DB
 
 
@@ -340,6 +344,11 @@ class MarkPriceMonitor(Strategy):
         super().__init__(config)
         self._iids = tuple(InstrumentId.from_str(i) for i in config.instrument_ids)
         self.risk_state: RiskState | None = None
+        # Debounce state: the entry gate reacts instantly, but incident/alert
+        # logging waits until staleness is confirmed to persist.
+        self._stale_since_ns: int | None = None
+        self._incident_open = False
+        self._warmed_up = False
 
     def on_start(self) -> None:
         if self.risk_state is None:
@@ -370,27 +379,45 @@ class MarkPriceMonitor(Strategy):
     def _evaluate_freshness(self) -> None:
         if self.risk_state is None:
             return
-        was_stale = self.risk_state.market_data_stale
+        now_ns = self.clock.timestamp_ns()
+        # evaluate_mark_freshness sets risk_state.market_data_stale immediately, so
+        # the entry gate fails closed on the very first stale mark (fail-safe). The
+        # logging/incident side below is debounced to filter transient feed flaps.
         stale = self.risk_state.evaluate_mark_freshness(
             self._iids,
-            self.clock.timestamp_ns(),
+            now_ns,
             self.config.stale_after_secs,
         )
-        if stale and not was_stale:
-            try:
-                store.start_incident("MARK_STALE", ",".join(stale), self.config.db_path)
-            except Exception as exc:  # noqa: BLE001
-                self.log.warning(f"record stale-mark incident failed: {exc!r}")
-            self.log.error(
-                "MARK WATCHDOG: stale streams "
-                f"({', '.join(stale)}); new entries halted, positions/stops kept"
-            )
-        elif not stale and was_stale:
-            try:
-                store.resolve_incident("MARK_STALE", self.config.db_path)
-            except Exception as exc:  # noqa: BLE001
-                self.log.warning(f"resolve stale-mark incident failed: {exc!r}")
-            self.log.warning("MARK WATCHDOG: all mark streams fresh; entry gate released")
+        if stale:
+            if self._stale_since_ns is None:
+                self._stale_since_ns = now_ns
+            persisted = (now_ns - self._stale_since_ns) / 1e9
+            if (
+                self._warmed_up
+                and not self._incident_open
+                and persisted >= self.config.incident_min_secs
+            ):
+                try:
+                    store.start_incident("MARK_STALE", ",".join(stale), self.config.db_path)
+                except Exception as exc:  # noqa: BLE001
+                    self.log.warning(f"record stale-mark incident failed: {exc!r}")
+                self._incident_open = True
+                self.log.error(
+                    "MARK WATCHDOG: stale streams "
+                    f"({', '.join(stale)}); new entries halted, positions/stops kept"
+                )
+        else:
+            if not self._warmed_up:
+                self._warmed_up = True
+                self.log.warning("MARK WATCHDOG: all mark streams fresh; entry gate released")
+            elif self._incident_open:
+                try:
+                    store.resolve_incident("MARK_STALE", self.config.db_path)
+                except Exception as exc:  # noqa: BLE001
+                    self.log.warning(f"resolve stale-mark incident failed: {exc!r}")
+                self._incident_open = False
+                self.log.warning("MARK WATCHDOG: all mark streams fresh; entry gate released")
+            self._stale_since_ns = None
 
     def on_stop(self) -> None:
         # Binance's Nautilus adapter does not implement mark-price unsubscribe
