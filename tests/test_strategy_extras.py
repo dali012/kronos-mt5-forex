@@ -362,6 +362,9 @@ def test_entry_fill_reconciles_protection_after_position_resize(monkeypatch):
     s = _protection_strat(monkeypatch)
     s._patient = None  # a plain market entry has no patient state
     s._patient_order = None
+    s._retiring = {}
+    s._tombstones = {}
+    s._orders_by_coid = {}
     refreshed = []
     s._refresh_protection = lambda: refreshed.append(True)
     event = SimpleNamespace(

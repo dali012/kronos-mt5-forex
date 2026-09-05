@@ -9,7 +9,7 @@ properties with plain properties on the Python subclass.
 from __future__ import annotations
 
 import sqlite3
-from collections import deque
+from collections import OrderedDict, deque
 from types import SimpleNamespace
 
 import pytest
@@ -21,9 +21,12 @@ from kronos_mt5.execution import (
     ROLE_PATIENT_LIMIT,
     SKIP_ADVERSE_DRIFT,
     SKIP_ALREADY_RESOLVED,
+    SKIP_BELOW_THRESHOLD,
     SKIP_NO_FRESH_PRICE,
     SKIP_TARGET_REACHED,
+    SKIP_UNOWNED_RESTING_ORDER,
     STATE_CANCEL_PENDING,
+    STATE_CANCEL_RETRY,
     STATE_WORKING,
     PatientOrder,
     adverse_drift_bps,
@@ -32,6 +35,7 @@ from kronos_mt5.execution import (
     implementation_shortfall_bps,
     implementation_shortfall_quote,
     liquidity_label,
+    tag_float,
 )
 from kronos_mt5.strategies.trend_strategy import TrendStrategy
 
@@ -80,10 +84,15 @@ class _FakeOrder:
         self.kwargs = kwargs
         self.client_order_id = coid
         self.is_closed = False
+        self.is_reduce_only = bool(kwargs.get("reduce_only", False))
         self.side = kwargs.get("order_side")
         self.quantity = kwargs.get("quantity")
         self.tags = kwargs.get("tags")
         self.price = kwargs.get("price")
+        self.order_type = SimpleNamespace(
+            name={"limit": "LIMIT", "market": "MARKET"}.get(kind, "OTHER")
+        )
+        self.strategy_id = "TrendStrategy-TEST"
 
 
 class _FakeFactory:
@@ -112,15 +121,31 @@ class _FakeClock:
     def __init__(self, now_ns: int = 1_000_000_000_000) -> None:
         self.now_ns = now_ns
         self.timers: dict[str, object] = {}
+        self.fired: list[str] = []
 
     def timestamp_ns(self) -> int:
         return self.now_ns
 
     def set_timer(self, name, interval, callback):
-        self.timers[name] = callback
+        self.timers[name] = (callback, interval)
 
     def cancel_timer(self, name):
         self.timers.pop(name, None)
+
+    def fire(self, prefix: str) -> bool:
+        """Fire the single timer whose name starts with `prefix` (like the engine
+        would when the interval elapses). Returns False when none is armed."""
+        for name in list(self.timers):
+            if name.startswith(prefix):
+                callback, interval = self.timers.pop(name)
+                self.now_ns += int(interval.total_seconds() * 1e9)
+                self.fired.append(name)
+                callback(None)
+                return True
+        return False
+
+    def armed(self, prefix: str) -> bool:
+        return any(name.startswith(prefix) for name in self.timers)
 
 
 class _FakeLog:
@@ -203,6 +228,11 @@ def _patient_strat(
     )
     s._patient = None
     s._patient_order = None
+    s._retiring = {}
+    s._tombstones = OrderedDict()
+    s._orders_by_coid = {}
+    s._deferred = None
+    s._owned_coids = set()
     s._closes = deque([100.0], maxlen=8)
     s._protective_orders = []
     s._protection_signature = None
@@ -211,8 +241,15 @@ def _patient_strat(
     s._last_flatten_seq = 0
     s.submitted: list[_FakeOrder] = []
     s.canceled: list[_FakeOrder] = []
+    s.cancel_raises = False
     s.submit_order = s.submitted.append
-    s.cancel_order = s.canceled.append
+
+    def _cancel(order):
+        if s.cancel_raises:
+            raise RuntimeError("venue rejected the cancel request")
+        s.canceled.append(order)
+
+    s.cancel_order = _cancel
     s._refresh_protection = lambda *a, **k: None
     return s
 
@@ -242,7 +279,37 @@ def _fill(order, qty, *, closed: bool, iid=None):
 
 
 # --------------------------------------------------------------------------
-# 1-4: lifecycle ordering
+# helpers for the cancel-confirmed / settling lifecycle
+# --------------------------------------------------------------------------
+
+
+def _settle(s: TrendStrategy) -> bool:
+    """Fire the settling timer, as the engine would when the window elapses."""
+    return s._fake_clock.fire("patient_settle_")
+
+
+def _confirm_cancel(s: TrendStrategy, order) -> None:
+    order.is_closed = True
+    s.on_order_canceled(SimpleNamespace(client_order_id=order.client_order_id))
+
+
+def _timeout_then_cancel(s: TrendStrategy, order) -> None:
+    """Full happy path: timeout -> cancel requested -> confirmed -> settled."""
+    s._on_patient_timeout()
+    _confirm_cancel(s, order)
+    _settle(s)
+
+
+def _external_limit(coid: str = "manual-1") -> _FakeOrder:
+    """A resting entry limit this strategy cannot prove it owns."""
+    order = _FakeOrder("limit", {}, coid)
+    order.tags = None
+    order.strategy_id = "SomeoneElse-001"
+    return order
+
+
+# --------------------------------------------------------------------------
+# 1-4: cancellation is terminal before anything is submitted
 # --------------------------------------------------------------------------
 
 
@@ -255,8 +322,25 @@ def test_timeout_requests_cancel_without_submitting_a_market_order(monkeypatch):
 
     assert s.canceled == [order]
     assert _markets(s) == []  # nothing taken before the venue confirms
-    assert s._patient.state == STATE_CANCEL_PENDING
-    assert s._patient.fallback_pending is True
+    assert s._patient is None  # no longer the active order...
+    (retiring,) = s._retiring.values()  # ...but still tracked by client order id
+    assert retiring.state == STATE_CANCEL_PENDING
+    assert retiring.fallback_pending is True
+
+
+def test_no_fallback_until_the_settling_window_has_elapsed(monkeypatch):
+    """The cancel callback alone is not enough: resolution waits for settling."""
+    s = _patient_strat(monkeypatch)
+    order = _submit_patient(s, units=10.0)
+    s._on_patient_timeout()
+
+    _confirm_cancel(s, order)
+    assert _markets(s) == []  # still nothing — a late fill could still arrive
+    assert s._retiring  # ownership retained across the settling window
+
+    assert _settle(s) is True
+    assert len(_markets(s)) == 1
+    assert not s._retiring
 
 
 def test_partial_fill_falls_back_only_for_the_remaining_delta(monkeypatch):
@@ -269,9 +353,7 @@ def test_partial_fill_falls_back_only_for_the_remaining_delta(monkeypatch):
     assert s._patient is not None  # a partial must NOT clear the state
     assert s._patient.state == STATE_WORKING
 
-    s._on_patient_timeout()
-    order.is_closed = True
-    s.on_order_canceled(SimpleNamespace(client_order_id=order.client_order_id))
+    _timeout_then_cancel(s, order)
 
     (fallback,) = _markets(s)
     assert float(fallback.kwargs["quantity"]) == pytest.approx(6.0)
@@ -288,6 +370,7 @@ def test_full_fill_while_cancel_pending_submits_no_fallback(monkeypatch):
 
     s._net_position = 10.0
     s.on_order_filled(_fill(order, 10.0, closed=True))
+    _settle(s)
 
     assert _markets(s) == []
     assert s._patient is None
@@ -295,7 +378,7 @@ def test_full_fill_while_cancel_pending_submits_no_fallback(monkeypatch):
 
 
 def test_duplicate_terminal_callbacks_create_exactly_one_fallback(monkeypatch):
-    """4. Repeated cancel/fill callbacks must be idempotent."""
+    """4. Repeated and conflicting terminal callbacks are idempotent."""
     s = _patient_strat(monkeypatch)
     order = _submit_patient(s, units=10.0)
     s._on_patient_timeout()
@@ -305,7 +388,9 @@ def test_duplicate_terminal_callbacks_create_exactly_one_fallback(monkeypatch):
     s.on_order_canceled(event)
     s.on_order_canceled(event)  # duplicate from the venue
     s.on_order_expired(event)  # and a conflicting terminal
-    s.on_order_filled(_fill(order, 10.0, closed=True))  # and a late fill
+    _settle(s)
+    s.on_order_canceled(event)  # and one more, after resolution
+    _settle(s)
 
     assert len(_markets(s)) == 1
     assert s._patient is None
@@ -324,14 +409,434 @@ def test_repeated_timeouts_do_not_re_request_cancellation(monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# 5-7: adverse-drift cap
+# late fills arriving after the cancellation notification
 # --------------------------------------------------------------------------
 
 
-def _timeout_then_cancel(s, order):
+def test_late_full_fill_after_cancel_notification_causes_no_fallback(monkeypatch):
+    """11. The order was reported canceled, then a full fill landed. Resolution
+    happens after settling, so the fallback quantity must be zero."""
+    s = _patient_strat(monkeypatch)
+    order = _submit_patient(s, units=10.0)
     s._on_patient_timeout()
-    order.is_closed = True
-    s.on_order_canceled(SimpleNamespace(client_order_id=order.client_order_id))
+    _confirm_cancel(s, order)
+
+    # ... the fill arrives AFTER the cancel notification but BEFORE settling
+    s._net_position = 10.0
+    s.on_order_filled(_fill(order, 10.0, closed=True))
+    _settle(s)
+
+    assert _markets(s) == []
+    assert f"reason={SKIP_TARGET_REACHED}" in s._fake_log.text()
+
+
+def test_late_partial_fill_after_cancel_notification_reduces_the_fallback(monkeypatch):
+    """12. A late partial must shrink the fallback, not leave it at full size."""
+    s = _patient_strat(monkeypatch)
+    order = _submit_patient(s, units=10.0)
+    s._on_patient_timeout()
+    _confirm_cancel(s, order)
+
+    s._net_position = 7.5  # late partial lands during the settling window
+    s.on_order_filled(_fill(order, 7.5, closed=True))
+    _settle(s)
+
+    (fallback,) = _markets(s)
+    assert float(fallback.kwargs["quantity"]) == pytest.approx(2.5)
+
+
+def test_fill_after_settlement_is_recorded_and_left_to_the_next_cycle(monkeypatch):
+    """A bounded tombstone keeps a very late fill attributable without re-acting."""
+    s = _patient_strat(monkeypatch)
+    order = _submit_patient(s, units=10.0)
+    _timeout_then_cancel(s, order)
+    assert len(_markets(s)) == 1
+
+    s.on_order_filled(_fill(order, 1.0, closed=True))
+
+    assert len(_markets(s)) == 1  # no second reaction
+    assert order.client_order_id in s._tombstones
+    assert "late fill on retired patient order" in s._fake_log.text()
+
+
+# --------------------------------------------------------------------------
+# supersede: never replace before the predecessor is terminal
+# --------------------------------------------------------------------------
+
+
+def test_supersede_requests_cancel_and_submits_no_replacement(monkeypatch):
+    """1. A newer target must not put a second entry order on the book."""
+    s = _patient_strat(monkeypatch)
+    first = _submit_patient(s, units=10.0)
+
+    second = _submit_patient(s, units=12.0)
+
+    assert second is None  # nothing new was placed; the field is not clear
+    assert s.canceled == [first]
+    assert len(s.submitted) == 1  # still only the original limit
+    assert s._patient is None
+    assert s._deferred is not None and s._deferred.target_units == 12.0
+    (retiring,) = s._retiring.values()
+    assert retiring.state == STATE_CANCEL_PENDING
+
+
+def test_replacement_is_submitted_only_after_the_predecessor_settles(monkeypatch):
+    """2. Cancel confirmation alone is not enough; settling must complete too."""
+    s = _patient_strat(monkeypatch)
+    first = _submit_patient(s, units=10.0)
+    _submit_patient(s, units=12.0)
+
+    _confirm_cancel(s, first)
+    assert len(s.submitted) == 1  # still nothing new during settling
+
+    _settle(s)
+
+    assert len(s.submitted) == 2
+    replacement = s.submitted[1]
+    assert replacement.kind == "limit"
+    assert float(replacement.kwargs["quantity"]) == pytest.approx(12.0)
+    assert s._patient.target_units == 12.0
+    assert s._deferred is None
+
+
+def test_partial_predecessor_fill_reduces_the_replacement_quantity(monkeypatch):
+    """3. Replacement is sized from target - current, not from the old order."""
+    s = _patient_strat(monkeypatch)
+    first = _submit_patient(s, units=10.0)
+    _submit_patient(s, units=12.0)
+
+    s._net_position = 4.0
+    s.on_order_filled(_fill(first, 4.0, closed=True))
+    _settle(s)
+
+    replacement = s.submitted[1]
+    assert float(replacement.kwargs["quantity"]) == pytest.approx(8.0)  # 12 - 4
+
+
+def test_full_predecessor_fill_eliminates_the_replacement(monkeypatch):
+    """4. If the retiring order already reached the new target, submit nothing."""
+    s = _patient_strat(monkeypatch)
+    first = _submit_patient(s, units=10.0)
+    _submit_patient(s, units=10.0)
+
+    s._net_position = 10.0
+    s.on_order_filled(_fill(first, 10.0, closed=True))
+    _settle(s)
+
+    assert len(s.submitted) == 1
+    assert f"reason={SKIP_TARGET_REACHED}" in s._fake_log.text()
+    assert s._deferred is None
+
+
+def test_multiple_supersedes_coalesce_onto_the_newest_target(monkeypatch):
+    """5. A burst of rebalances must never queue a burst of orders."""
+    s = _patient_strat(monkeypatch)
+    first = _submit_patient(s, units=10.0)
+    _submit_patient(s, units=12.0)
+    _submit_patient(s, units=14.0)
+    _submit_patient(s, units=9.0)
+
+    assert s._deferred.target_units == 9.0
+    assert s._deferred.requests == 3
+    assert s.canceled == [first]  # cancelled once, not once per request
+
+    _confirm_cancel(s, first)
+    _settle(s)
+
+    assert len(s.submitted) == 2
+    assert float(s.submitted[1].kwargs["quantity"]) == pytest.approx(9.0)
+
+
+def test_replacement_below_the_rebalance_threshold_is_not_submitted(monkeypatch):
+    """A delta that no longer clears the threshold must trade nothing."""
+    s = _patient_strat(monkeypatch)
+    first = _submit_patient(s, units=10.0)
+    s._submit_entry_order(
+        _side("BUY"),
+        s.instrument.make_qty(10.05),
+        100.0,
+        target_units=10.05,
+        threshold_notional=500.0,
+    )
+
+    s._net_position = 10.0
+    s.on_order_filled(_fill(first, 10.0, closed=True))
+    _settle(s)
+
+    assert len(s.submitted) == 1
+    assert f"reason={SKIP_BELOW_THRESHOLD}" in s._fake_log.text()
+
+
+# --------------------------------------------------------------------------
+# restart orphan recovery + ownership
+# --------------------------------------------------------------------------
+
+
+def test_owned_restart_orphan_blocks_the_new_entry_until_terminal(monkeypatch):
+    """6. An owned limit left by a previous run is retired, not raced."""
+    s = _patient_strat(monkeypatch)
+    orphan = _FakeOrder("limit", {"quantity": 3.0}, "orphan-from-previous-run")
+    orphan.tags = [f"EXEC_ROLE={ROLE_PATIENT_LIMIT}"]  # our own tag vocabulary
+    s._fake_cache.orders_open = lambda instrument_id=None: [orphan]
+
+    _submit_patient(s, units=10.0)
+
+    assert s.canceled == [orphan]
+    assert s.submitted == []  # blocked: nothing new while the orphan is unresolved
+    assert s._deferred is not None and s._deferred.target_units == 10.0
+    assert orphan.client_order_id in s._retiring
+
+    s._fake_cache.orders_open = lambda instrument_id=None: []
+    _confirm_cancel(s, orphan)
+    _settle(s)
+
+    assert len(s.submitted) == 1  # only now
+    assert float(s.submitted[0].kwargs["quantity"]) == pytest.approx(10.0)
+
+
+def test_orphan_late_fill_reduces_the_deferred_entry(monkeypatch):
+    s = _patient_strat(monkeypatch)
+    orphan = _FakeOrder("limit", {"quantity": 3.0}, "orphan-1")
+    orphan.tags = [f"EXEC_ROLE={ROLE_PATIENT_LIMIT}"]
+    s._fake_cache.orders_open = lambda instrument_id=None: [orphan]
+    _submit_patient(s, units=10.0)
+
+    s._fake_cache.orders_open = lambda instrument_id=None: []
+    s._net_position = 3.0
+    s.on_order_filled(_fill(orphan, 3.0, closed=True))
+    _settle(s)
+
+    assert float(s.submitted[0].kwargs["quantity"]) == pytest.approx(7.0)
+
+
+def test_unknown_external_limit_is_never_cancelled(monkeypatch):
+    """7. Manual / other-strategy / unknown reconciled orders are not ours."""
+    s = _patient_strat(monkeypatch)
+    foreign = _external_limit()
+    s._fake_cache.orders_open = lambda instrument_id=None: [foreign]
+
+    _submit_patient(s, units=10.0)
+
+    assert s.canceled == []  # we do not touch what we cannot prove we own
+
+
+def test_unknown_external_limit_blocks_the_new_entry(monkeypatch):
+    """8. Blocked rather than racing an order of unknown provenance."""
+    s = _patient_strat(monkeypatch)
+    foreign = _external_limit()
+    s._fake_cache.orders_open = lambda instrument_id=None: [foreign]
+
+    _submit_patient(s, units=10.0)
+
+    assert s.submitted == []
+    assert f"reason={SKIP_UNOWNED_RESTING_ORDER}" in s._fake_log.text()
+
+    # once it disappears, entries resume on the next attempt — no sticky block
+    s._fake_cache.orders_open = lambda instrument_id=None: []
+    _submit_patient(s, units=10.0)
+    assert len(s.submitted) == 1
+
+
+def test_ownership_is_proven_by_client_order_id_and_strategy_id(monkeypatch):
+    s = _patient_strat(monkeypatch)
+    ours_by_coid = _FakeOrder("limit", {}, "c-1")
+    ours_by_coid.tags = None
+    ours_by_coid.strategy_id = "SomeoneElse-001"
+    s._owned_coids.add("c-1")
+    assert s._owns_order(ours_by_coid) is True
+
+    ours_by_tag = _FakeOrder("limit", {}, "c-2")
+    ours_by_tag.tags = [f"EXEC_ROLE={ROLE_PATIENT_LIMIT}"]
+    ours_by_tag.strategy_id = "SomeoneElse-001"
+    assert s._owns_order(ours_by_tag) is True
+
+    assert s._owns_order(_external_limit("c-3")) is False
+
+
+# --------------------------------------------------------------------------
+# control modes
+# --------------------------------------------------------------------------
+
+
+def test_halt_cancels_the_resting_entry_and_keeps_tracking_it(monkeypatch):
+    """9. 'Keep positions, no new entries' — a resting entry IS a new entry."""
+    s = _patient_strat(monkeypatch)
+    order = _submit_patient(s, units=10.0)
+    s.risk_state.mode = "halt"
+
+    assert s._apply_control() is True
+
+    assert s.canceled == [order]
+    assert s._patient is None
+    (retiring,) = s._retiring.values()  # tracking retained, not dropped
+    assert retiring.state == STATE_CANCEL_PENDING
+    assert retiring.fallback_forbidden is True
+    assert not s._fake_clock.armed("patient_timeout_")
+
+    # no fill fallback and no replacement may follow
+    _confirm_cancel(s, order)
+    _settle(s)
+    assert _markets(s) == []
+    assert len(s.submitted) == 1
+
+
+@pytest.mark.parametrize(
+    ("control", "reason"),
+    [
+        ({"mode": "halt"}, "control_halt"),
+        ({"mode": "kill"}, "control_kill"),
+        ({"flatten_seq": 7}, "control_flatten"),
+        ({"market_data_stale": True}, "market_data_stale"),
+    ],
+)
+def test_control_paths_retain_retirement_tracking_until_terminal(monkeypatch, control, reason):
+    """10. Kill/flatten may also close positions, but the entry-order cancellation
+    stays tracked until the venue confirms it."""
+    s = _patient_strat(monkeypatch)
+    s._flatten_self = lambda: None
+    order = _submit_patient(s, units=10.0)
+    for key, value in control.items():
+        setattr(s.risk_state, key, value)
+
+    assert s._apply_control() is True
+
+    assert s.canceled == [order]
+    (retiring,) = s._retiring.values()
+    assert retiring.is_retiring and retiring.fallback_forbidden is True
+
+    _confirm_cancel(s, order)
+    _settle(s)
+    assert _markets(s) == []
+    assert not s._retiring
+    assert order.client_order_id in s._tombstones
+
+
+def test_control_blocks_the_fallback_of_an_already_timed_out_order(monkeypatch):
+    s = _patient_strat(monkeypatch)
+    order = _submit_patient(s, units=10.0)
+    s._on_patient_timeout()
+    s.risk_state.mode = "halt"
+
+    _confirm_cancel(s, order)
+    _settle(s)
+
+    assert _markets(s) == []
+    assert "reason=control_halt" in s._fake_log.text()
+
+
+def test_control_drops_a_parked_replacement(monkeypatch):
+    s = _patient_strat(monkeypatch)
+    first = _submit_patient(s, units=10.0)
+    _submit_patient(s, units=12.0)
+    assert s._deferred is not None
+
+    s.risk_state.mode = "halt"
+    s._apply_control()
+    _confirm_cancel(s, first)
+    _settle(s)
+
+    assert s._deferred is None
+    assert len(s.submitted) == 1
+
+
+def test_strategy_stop_retires_the_entry_and_clears_timers(monkeypatch):
+    s = _patient_strat(monkeypatch)
+    s.cfg().flatten_on_stop = False
+    order = _submit_patient(s)
+
+    s.on_stop()
+
+    assert s.canceled == [order]
+    assert s._patient is None
+    assert s._retiring  # in-flight callbacks during shutdown stay attributable
+    assert s._fake_clock.timers == {}
+
+
+# --------------------------------------------------------------------------
+# cancellation failures
+# --------------------------------------------------------------------------
+
+
+def test_synchronous_cancel_exception_is_logged_retried_and_blocks_fallback(monkeypatch):
+    """14. A raising cancel_order() must never be swallowed or fall back."""
+    s = _patient_strat(monkeypatch)
+    order = _submit_patient(s, units=10.0)
+    s.cancel_raises = True
+
+    s._on_patient_timeout()
+
+    assert _markets(s) == []
+    (retiring,) = s._retiring.values()
+    assert retiring.state == STATE_CANCEL_RETRY
+    assert retiring.fallback_forbidden is True
+    log = s._fake_log.text()
+    assert "patient cancel FAILED" in log
+    assert order.client_order_id in log
+    assert retiring.symbol in log
+    assert s._fake_clock.armed("patient_cancel_retry_")  # never stuck without a timer
+
+    # the retry eventually succeeds, and still no fallback is taken
+    s.cancel_raises = False
+    assert s._fake_clock.fire("patient_cancel_retry_") is True
+    assert s.canceled == [order]
+    _confirm_cancel(s, order)
+    _settle(s)
+    assert _markets(s) == []
+
+
+def test_cancel_retry_backoff_is_bounded_and_always_rearmed(monkeypatch):
+    s = _patient_strat(monkeypatch)
+    _submit_patient(s, units=10.0)
+    s.cancel_raises = True
+    s._on_patient_timeout()
+
+    for _ in range(8):
+        assert s._fake_clock.armed("patient_cancel_retry_")
+        s._fake_clock.fire("patient_cancel_retry_")
+
+    (retiring,) = s._retiring.values()
+    assert retiring.state == STATE_CANCEL_RETRY
+    assert s._fake_clock.armed("patient_cancel_retry_")  # still timed, never stuck
+    assert _markets(s) == []
+
+
+def test_cancel_rejection_keeps_fallback_and_replacement_blocked(monkeypatch):
+    """15. A refused cancel means the limit may still fill — take nothing."""
+    s = _patient_strat(monkeypatch)
+    order = _submit_patient(s, units=10.0)
+    s._on_patient_timeout()
+
+    s.on_order_cancel_rejected(
+        SimpleNamespace(client_order_id=order.client_order_id, reason="UNKNOWN_ORDER")
+    )
+
+    (retiring,) = s._retiring.values()
+    assert retiring.state == STATE_CANCEL_RETRY
+    assert retiring.fallback_forbidden is True
+    assert _markets(s) == []
+    assert s._fake_clock.armed("patient_cancel_retry_")
+
+    s._fake_clock.fire("patient_cancel_retry_")
+    _confirm_cancel(s, order)
+    _settle(s)
+    assert _markets(s) == []  # still never falls back
+
+
+def test_cancel_failure_blocks_a_deferred_replacement_too(monkeypatch):
+    s = _patient_strat(monkeypatch)
+    _submit_patient(s, units=10.0)
+    s.cancel_raises = True
+    _submit_patient(s, units=12.0)  # supersede while cancel fails
+
+    assert len(s.submitted) == 1
+    assert s._deferred is not None
+    _settle(s)
+    assert len(s.submitted) == 1  # replacement stays blocked
+
+
+# --------------------------------------------------------------------------
+# 5-7: adverse-drift cap
+# --------------------------------------------------------------------------
 
 
 def test_adverse_buy_drift_above_cap_blocks_the_fallback(monkeypatch):
@@ -378,7 +883,7 @@ def test_zero_cap_disables_the_adverse_check(monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# 8-9: fresh price and control gates
+# 8: fresh price
 # --------------------------------------------------------------------------
 
 
@@ -443,74 +948,6 @@ def test_live_never_falls_back_to_the_bar_close(monkeypatch):
     assert _markets(s) == []
 
 
-def test_untracked_resting_entry_limit_is_cancelled_before_a_new_entry(monkeypatch):
-    """A limit left working by a previous process must not fill on top of us."""
-    s = _patient_strat(monkeypatch)
-    orphan = _FakeOrder("limit", {"order_side": None}, "orphan-from-previous-run")
-    orphan.order_type = SimpleNamespace(name="LIMIT")
-    orphan.is_reduce_only = False
-    protective = _FakeOrder("stop", {}, "protective")
-    protective.order_type = SimpleNamespace(name="STOP_MARKET")
-    protective.is_reduce_only = True
-    s._fake_cache.orders_open = lambda instrument_id=None: [orphan, protective]
-
-    _submit_patient(s, units=10.0)
-
-    assert s.canceled == [orphan]  # the reduce-only stop is left alone
-
-
-@pytest.mark.parametrize(
-    ("control", "expected"),
-    [
-        ({"mode": "halt"}, "control_halt"),
-        ({"mode": "kill"}, "control_kill"),
-        ({"flatten_seq": 7}, "control_flatten"),
-        ({"market_data_stale": True}, "market_data_stale"),
-    ],
-)
-def test_control_modes_block_the_fallback(monkeypatch, control, expected):
-    """9. Halt, kill, flatten and stale market data all veto new exposure."""
-    s = _patient_strat(monkeypatch)
-    order = _submit_patient(s, units=10.0, price=100.0)
-    s._on_patient_timeout()
-    for key, value in control.items():
-        setattr(s.risk_state, key, value)
-
-    order.is_closed = True
-    s.on_order_canceled(SimpleNamespace(client_order_id=order.client_order_id))
-
-    assert _markets(s) == []
-    assert f"reason={expected}" in s._fake_log.text()
-    assert s._patient is None
-
-
-def test_control_takeover_cancels_a_resting_patient_limit(monkeypatch):
-    s = _patient_strat(monkeypatch)
-    order = _submit_patient(s)
-    s.risk_state.market_data_stale = True
-    s._flatten_self = lambda: None
-
-    assert s._apply_control() is True
-    assert s.canceled == [order]
-    assert s._patient is None
-
-    # a terminal callback arriving afterwards is a harmless no-op
-    s.on_order_canceled(SimpleNamespace(client_order_id=order.client_order_id))
-    assert _markets(s) == []
-
-
-def test_strategy_stop_clears_patient_state(monkeypatch):
-    s = _patient_strat(monkeypatch)
-    s.cfg().flatten_on_stop = False
-    order = _submit_patient(s)
-
-    s.on_stop()
-
-    assert s.canceled == [order]
-    assert s._patient is None
-    assert s._fake_clock.timers == {}
-
-
 # --------------------------------------------------------------------------
 # 10-11: post-only
 # --------------------------------------------------------------------------
@@ -533,53 +970,51 @@ def test_post_only_defaults_to_false_for_backward_compatibility(monkeypatch):
     assert order.kwargs["post_only"] is False
 
 
-def test_post_only_rejection_clears_state_without_resubmitting(monkeypatch):
+def test_post_only_rejection_settles_without_resubmitting(monkeypatch):
     """11. A rejected post-only limit must not loop: no cancel, no new order."""
     s = _patient_strat(monkeypatch, post_only=True)
     order = _submit_patient(s, units=10.0)
+    order.is_closed = True
 
     s.on_order_rejected(
         SimpleNamespace(client_order_id=order.client_order_id, reason="POST_ONLY_REJECT")
     )
+    _settle(s)
 
     assert s._patient is None
-    assert s._patient_order is None
+    assert not s._retiring
     assert _markets(s) == []
     assert s.canceled == []
     assert len(s.submitted) == 1  # only the original limit
-    assert s._fake_clock.timers == {}
+    assert not s._fake_clock.armed("patient_timeout_")
 
 
-def test_cancel_rejection_disables_fallback_and_keeps_retrying_cancel(monkeypatch):
-    """A refused cancel means the limit may still fill — never take on top of it."""
-    s = _patient_strat(monkeypatch)
-    order = _submit_patient(s)
-    s._on_patient_timeout()
-
-    s.on_order_cancel_rejected(
-        SimpleNamespace(client_order_id=order.client_order_id, reason="UNKNOWN_ORDER")
-    )
-
-    assert s._patient.state == STATE_WORKING
-    assert s._patient.fallback_forbidden is True
-    assert _markets(s) == []
-
-    s._on_patient_timeout()  # retry the cancel...
-    assert s.canceled == [order, order]
-    order.is_closed = True
-    s.on_order_canceled(SimpleNamespace(client_order_id=order.client_order_id))
-    assert _markets(s) == []  # ...but still never fall back
-    assert s._patient is None
+# --------------------------------------------------------------------------
+# 16: fallback telemetry
+# --------------------------------------------------------------------------
 
 
-def test_new_entry_supersedes_and_cancels_a_stale_patient_limit(monkeypatch):
-    s = _patient_strat(monkeypatch)
-    first = _submit_patient(s, units=10.0)
-    second = _submit_patient(s, units=12.0)
+def test_fallback_tags_retain_the_original_limit_price_and_decision(monkeypatch):
+    """16. A PATIENT_FALLBACK fill must carry the whole decision story."""
+    s = _patient_strat(monkeypatch, mark=100.05)
+    order = _submit_patient(s, side="BUY", units=10.0, price=100.0)
+    decision_ts = s._patient.decision_ts_ns
+    limit_price = s._patient.limit_price
 
-    assert s.canceled == [first]
-    assert s._patient_order is second
-    assert s._patient.target_units == 12.0
+    _timeout_then_cancel(s, order)
+
+    (fallback,) = _markets(s)
+    tags = fallback.kwargs["tags"]
+    assert f"REF_PX={100.0:.12g}" in tags  # original decision price
+    assert f"LIMIT_PX={limit_price:.12g}" in tags  # original limit price
+    assert f"DEC_TS={decision_ts}" in tags  # original decision timestamp
+    assert "FB_REASON=timeout" in tags
+    drift = next(t for t in tags if t.startswith("FB_DRIFT_BPS="))
+    assert float(drift.removeprefix("FB_DRIFT_BPS=")) == pytest.approx(5.0, rel=1e-3)
+
+    role = classify_exec_role("MARKET", tags=tags)
+    assert role == ROLE_PATIENT_FALLBACK
+    assert tag_float(tags, "LIMIT_PX=") == pytest.approx(limit_price)
 
 
 # --------------------------------------------------------------------------

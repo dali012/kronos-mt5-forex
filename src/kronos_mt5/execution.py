@@ -51,16 +51,33 @@ ROLE_TRAILING_STOP = "TRAILING_STOP"
 ROLE_OTHER = "OTHER"
 
 # --- patient-order lifecycle states -----------------------------------------
+#
+#   WORKING ──timeout/supersede/control──▶ CANCEL_PENDING ──venue terminal──▶ SETTLING
+#      │                                        │                                │
+#      └── fully filled ──▶ SETTLING            └── cancel raised/rejected ──▶ CANCEL_RETRY
+#                                                        (bounded backoff, always timed)
+#   SETTLING ──settle delay elapsed──▶ TERMINAL ──▶ tombstone (bounded, absorbs late fills)
+#
+# Nothing is submitted while any owned order sits in a non-TERMINAL state. SETTLING
+# exists so a late fill or reconciliation that lands *after* the cancel notification
+# is folded into the position before any remaining delta is recomputed — callback
+# ordering is never assumed.
 STATE_WORKING = "WORKING"  # limit resting, timeout not reached
 STATE_CANCEL_PENDING = "CANCEL_PENDING"  # cancel requested, awaiting a terminal event
-STATE_TERMINAL = "TERMINAL"  # order closed; state is about to be cleared
+STATE_CANCEL_RETRY = "CANCEL_RETRY"  # cancel failed/was rejected; retrying on a timer
+STATE_SETTLING = "SETTLING"  # venue says closed; waiting for late fills to land
+STATE_TERMINAL = "TERMINAL"  # settled; safe to size a replacement against the position
 
 # --- fallback decisions ------------------------------------------------------
 ACTION_SUBMIT = "SUBMIT"
 ACTION_SKIP = "SKIP"
 
 REASON_TIMEOUT = "timeout"
+REASON_SUPERSEDED = "superseded"
 SKIP_ALREADY_RESOLVED = "already_resolved"
+SKIP_NOT_SETTLED = "not_settled"
+SKIP_BELOW_THRESHOLD = "below_rebalance_threshold"
+SKIP_UNOWNED_RESTING_ORDER = "unowned_resting_entry_order"
 SKIP_FALLBACK_DISABLED = "fallback_disabled"
 SKIP_CONTROL = "control_active"
 SKIP_NO_FRESH_PRICE = "no_fresh_price"
@@ -197,11 +214,24 @@ class PatientOrder:
     fallback_forbidden: bool = False  # a control event / failed cancel banned the fallback
     filled_units: float = 0.0
     cancel_attempts: int = 0
+    retire_reason: str | None = None  # why it stopped being the active order
+    retired_ts_ns: int = 0
+    settled_ts_ns: int = 0
     events: list[str] = field(default_factory=list)
 
     @property
     def is_terminal(self) -> bool:
         return self.state == STATE_TERMINAL
+
+    @property
+    def is_settled(self) -> bool:
+        """Terminal AND past the settling window — safe to size against."""
+        return self.state == STATE_TERMINAL
+
+    @property
+    def is_retiring(self) -> bool:
+        """Tracked but not yet safe to replace: cancel pending, retrying or settling."""
+        return self.state in (STATE_CANCEL_PENDING, STATE_CANCEL_RETRY, STATE_SETTLING)
 
     def note(self, event: str) -> None:
         """Small bounded audit trail, useful in logs and tests."""
@@ -211,23 +241,72 @@ class PatientOrder:
     def register_fill(self, units: float) -> None:
         self.filled_units += abs(float(units))
 
-    def begin_cancel(self, *, fallback_enabled: bool) -> bool:
-        """Move WORKING -> CANCEL_PENDING. Returns False if already past that."""
-        if self.state != STATE_WORKING:
+    def begin_cancel(self, *, fallback_enabled: bool, reason: str, now_ns: int = 0) -> bool:
+        """Move WORKING/CANCEL_RETRY -> CANCEL_PENDING. False if already past that."""
+        if self.state not in (STATE_WORKING, STATE_CANCEL_RETRY):
             return False
         self.state = STATE_CANCEL_PENDING
         self.fallback_pending = bool(fallback_enabled) and not self.fallback_forbidden
         self.cancel_attempts += 1
-        self.note("cancel_requested")
+        if not self.retire_reason:
+            self.retire_reason = reason
+            self.retired_ts_ns = now_ns
+        self.note(f"cancel_requested:{reason}#{self.cancel_attempts}")
         return True
 
-    def mark_terminal(self, reason: str) -> bool:
-        """Move to TERMINAL exactly once. Returns False for duplicate callbacks."""
+    def mark_cancel_failed(self, detail: str) -> None:
+        """A cancel raised or was rejected: retry on a timer, never fall back."""
+        self.state = STATE_CANCEL_RETRY
+        self.fallback_pending = False
+        self.fallback_forbidden = True
+        self.note(f"cancel_failed:{detail}")
+
+    def begin_settling(self, reason: str) -> bool:
+        """Venue reported the order closed. Returns False for duplicate callbacks.
+
+        Deliberately NOT terminal yet: a fill or reconciliation event can still
+        arrive after the cancel notification, and it must be folded into the
+        position before any remaining delta is computed.
+        """
+        if self.state in (STATE_SETTLING, STATE_TERMINAL):
+            return False
+        self.state = STATE_SETTLING
+        self.note(f"settling:{reason}")
+        return True
+
+    def mark_terminal(self, reason: str, *, now_ns: int = 0) -> bool:
+        """Settling window elapsed. Returns False for duplicate callbacks."""
         if self.state == STATE_TERMINAL:
             return False
         self.state = STATE_TERMINAL
+        self.settled_ts_ns = now_ns
         self.note(f"terminal:{reason}")
         return True
+
+
+@dataclass
+class DeferredEntry:
+    """The newest desired entry, parked until every owned predecessor is settled.
+
+    Only the newest target is kept: repeated supersedes coalesce onto this one
+    record, so a burst of rebalances can never queue a burst of orders.
+    """
+
+    target_units: float
+    decision_price: float
+    decision_ts_ns: int
+    threshold_notional: float = 0.0
+    requests: int = 1
+    reason: str = REASON_SUPERSEDED
+
+    def coalesce(self, other: DeferredEntry) -> None:
+        """Replace the parked target with a newer one, keeping the request count."""
+        self.target_units = other.target_units
+        self.decision_price = other.decision_price
+        self.decision_ts_ns = other.decision_ts_ns
+        self.threshold_notional = other.threshold_notional
+        self.reason = other.reason
+        self.requests += 1
 
 
 @dataclass(frozen=True)
@@ -259,6 +338,7 @@ def evaluate_fallback(
     control_reason: str | None = None,
     max_adverse_bps: float = 0.0,
     min_units: float = 0.0,
+    threshold_notional: float = 0.0,
 ) -> FallbackDecision:
     """Decide whether a market fallback may be submitted, and for how much.
 
@@ -279,6 +359,16 @@ def evaluate_fallback(
     if fresh_price is None or fresh_price <= 0:
         # Never reuse the stale decision price as if it were executable.
         return FallbackDecision(ACTION_SKIP, SKIP_NO_FRESH_PRICE, remaining_units=remaining)
+
+    if threshold_notional > 0 and abs(remaining) * fresh_price < threshold_notional:
+        # The delta no longer clears the rebalance/minimum-notional bar: trading it
+        # would cost more than the drift it corrects.
+        return FallbackDecision(
+            ACTION_SKIP,
+            SKIP_BELOW_THRESHOLD,
+            fresh_price=fresh_price,
+            remaining_units=remaining,
+        )
 
     side = SIDE_BUY if remaining > 0 else SIDE_SELL
     drift = adverse_drift_bps(side, patient.decision_price, fresh_price)
