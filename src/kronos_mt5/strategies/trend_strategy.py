@@ -31,6 +31,30 @@ from nautilus_trader.model.enums import OrderSide, TrailingOffsetType, TriggerTy
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.trading.strategy import Strategy, StrategyConfig
 
+from kronos_mt5.execution import (
+    ROLE_HARD_STOP,
+    ROLE_PATIENT_FALLBACK,
+    ROLE_PATIENT_LIMIT,
+    ROLE_TAKE_PROFIT,
+    ROLE_TRAILING_STOP,
+    ROLE_TREND_MARKET,
+    STATE_WORKING,
+    TAG_DECISION_TS,
+    TAG_EXEC_ROLE,
+    TAG_FALLBACK_DRIFT,
+    TAG_FALLBACK_REASON,
+    TAG_LIMIT_PX,
+    TAG_REF_PX,
+    TAG_RISK_PCT,
+    PatientOrder,
+    evaluate_fallback,
+)
+
+# A fallback must price off something current. Marks arrive ~1/s live, so a
+# reference older than this is treated as missing rather than executable — the
+# bar close that produced the decision is never reused as a fill price.
+FRESH_PRICE_MAX_AGE_SECS = 60.0
+
 
 class TrendStrategyConfig(StrategyConfig, frozen=True):
     instrument_id: str
@@ -90,6 +114,13 @@ class TrendStrategyConfig(StrategyConfig, frozen=True):
     patient_limit_offset_bps: float = 2.0
     patient_limit_timeout_secs: int = 300
     patient_limit_market_fallback: bool = True
+    # Post-only rejects a patient limit that would cross and take liquidity.
+    # Default False keeps existing deployments byte-identical; `true` is the
+    # recommended rollout value once maker fills are confirmed.
+    patient_limit_post_only: bool = False
+    # Skip the market fallback when the market has already run this far against
+    # the decision price (bps). <= 0 disables the cap.
+    patient_limit_max_adverse_bps: float = 15.0
     shadow_enabled: bool = False
     shadow_lookbacks: tuple[int, ...] = (7, 21, 63, 126)
 
@@ -113,7 +144,10 @@ class TrendStrategy(Strategy):
         self._dynamic_trailing_pct = self._bounded_trailing_pct(
             config.trailing_vol_mult * initial_daily_vol
         )
-        self._pending_entry_order = None
+        # Explicit patient-limit lifecycle: `_patient` is the state, `_patient_order`
+        # the engine object we may still need to cancel. Both are cleared together.
+        self._patient: PatientOrder | None = None
+        self._patient_order = None
         self._protective_orders = []  # SL/TP/trailing orders we've submitted (may be in-flight)
         self._protection_signature = None  # desired protection currently working/in-flight
         self._protection_position_key = None  # freezes +1R/trail width for this position
@@ -201,23 +235,38 @@ class TrendStrategy(Strategy):
             target_me = rs.flatten_target in ("all", self.instrument_id.symbol.value)
             self._last_flatten_seq = rs.flatten_seq
             if target_me:
+                self._abort_patient("control_flatten")
                 self._flatten_self()
                 return True
         if rs.mode == "kill":
+            self._abort_patient("control_kill")
             self._flatten_self()  # flatten + stay out
             return True
         if rs.market_data_stale:
             # A patient limit submitted before the stream failed must not fill (or
             # fall back to market) while the watchdog is blocking new exposure.
-            order = self._pending_entry_order
-            if order is not None and not getattr(order, "is_closed", False):
-                with contextlib.suppress(Exception):
-                    self.cancel_order(order)
-            self._pending_entry_order = None
+            self._abort_patient("market_data_stale")
             return True
         if rs.mode == "halt":
-            return True  # freeze: keep positions, no new orders
+            # Freeze: keep positions and any resting limit, but never fall back to
+            # market — `_control_block_reason` blocks that at resolution time.
+            return True
         return False
+
+    def _control_block_reason(self) -> str | None:
+        """Side-effect-free view of the control gate, for the fallback decision."""
+        rs = self.risk_state
+        if rs is None:
+            return None
+        if getattr(rs, "flatten_seq", 0) > self._last_flatten_seq:
+            return "control_flatten"
+        if rs.mode == "kill":
+            return "control_kill"
+        if rs.mode == "halt":
+            return "control_halt"
+        if getattr(rs, "market_data_stale", False):
+            return "market_data_stale"
+        return None
 
     def _on_control_timer(self, event) -> None:  # noqa: ANN001 (live: act on control within ~1 min)
         self._apply_control()
@@ -288,7 +337,7 @@ class TrendStrategy(Strategy):
             qty = self.instrument.make_qty(abs(delta))
             if qty > self.instrument.make_qty(0) and self._order_passes_filters(qty, price):
                 side = OrderSide.BUY if delta > 0 else OrderSide.SELL
-                self._submit_entry_order(side, qty, price)
+                self._submit_entry_order(side, qty, price, target_units=target_units)
                 self.log.info(
                     f"{self.instrument_id.symbol} sig={sig:+.2f} vol={inst_vol:.2f} w={w:+.2f} "
                     f"tgt={target_units:+.4f} cur={current_units:+.4f} {side.name} {qty}"
@@ -305,11 +354,24 @@ class TrendStrategy(Strategy):
     # --- protective orders -------------------------------------------------
     def on_order_filled(self, event) -> None:  # noqa: ANN001
         if getattr(event, "instrument_id", None) == self.instrument_id:
-            pending = self._pending_entry_order
-            if pending is not None and (
-                getattr(event, "client_order_id", None) == pending.client_order_id
+            patient = self._patient
+            if patient is not None and (
+                getattr(event, "client_order_id", None) == patient.client_order_id
             ):
-                self._pending_entry_order = None
+                patient.register_fill(self._as_float(getattr(event, "last_qty", 0.0)))
+                order = self._patient_order
+                closed = True if order is None else bool(getattr(order, "is_closed", False))
+                if closed:
+                    # Terminal by fill. If a cancel was pending, the fallback is
+                    # re-evaluated against the *new* position, so a completed fill
+                    # simply leaves nothing to do.
+                    self._patient_terminal("filled")
+                else:
+                    self.log.info(
+                        f"patient partial fill {patient.symbol} "
+                        f"coid={patient.client_order_id} filled={patient.filled_units:.8f}/"
+                        f"{patient.submitted_units:.8f} state={patient.state}"
+                    )
             # Portfolio state is updated before strategy fill dispatch. Reconcile
             # again here because Binance netting may emit no PositionChanged event
             # for a restart-reconciled position. _set_protection is idempotent and
@@ -318,14 +380,49 @@ class TrendStrategy(Strategy):
             self._refresh_protection()
 
     def on_order_canceled(self, event) -> None:  # noqa: ANN001
-        if (
-            self._pending_entry_order is not None
-            and getattr(event, "client_order_id", None) == self._pending_entry_order.client_order_id
-        ):
-            self._pending_entry_order = None
+        self._patient_terminal("canceled", client_order_id=getattr(event, "client_order_id", None))
+
+    def on_order_expired(self, event) -> None:
+        self._patient_terminal("expired", client_order_id=getattr(event, "client_order_id", None))
+
+    def on_order_denied(self, event) -> None:
+        self._patient_terminal("denied", client_order_id=getattr(event, "client_order_id", None))
+
+    def on_order_cancel_rejected(self, event) -> None:
+        """The venue refused the cancel — the limit may still fill, so never
+        market-fallback for it. Retry the cancel on the next timeout instead."""
+        patient = self._patient
+        client_order_id = getattr(event, "client_order_id", None)
+        if patient is None or client_order_id != patient.client_order_id:
+            return
+        order = self._patient_order
+        if order is None or getattr(order, "is_closed", False):
+            self._patient_terminal("cancel_rejected_closed")
+            return
+        patient.fallback_forbidden = True
+        patient.fallback_pending = False
+        patient.state = STATE_WORKING
+        patient.note("cancel_rejected")
+        self.log.error(
+            f"patient cancel rejected {patient.symbol} coid={patient.client_order_id} "
+            f"attempts={patient.cancel_attempts} reason="
+            f"{getattr(event, 'reason', 'unknown reason')} — fallback disabled, retrying cancel"
+        )
+        self._set_patient_timer()
 
     def on_order_rejected(self, event) -> None:  # noqa: ANN001
         client_order_id = getattr(event, "client_order_id", None)
+        patient = self._patient
+        if patient is not None and client_order_id == patient.client_order_id:
+            # Includes a post-only limit rejected for crossing the book. Clear the
+            # state and let the next rebalance cycle decide — never resubmit here.
+            self.log.warning(
+                f"patient limit rejected {patient.symbol} coid={patient.client_order_id} "
+                f"post_only={patient.post_only} "
+                f"reason={getattr(event, 'reason', 'unknown reason')}"
+            )
+            self._patient_terminal("rejected")
+            return
         if any(o.client_order_id == client_order_id for o in self._protective_orders):
             # Keep any accepted hard stop working, but force the next reconciliation
             # to replace an incomplete protection set rather than treating it as valid.
@@ -624,56 +721,288 @@ class TrendStrategy(Strategy):
             threshold = max(threshold, budget * (inst_vol / np.sqrt(self.cfg().ppy)) * 0.25)
         return threshold
 
-    def _submit_entry_order(self, side: OrderSide, qty, price: float) -> None:  # noqa: ANN001
+    def _submit_entry_order(
+        self,
+        side: OrderSide,
+        qty,
+        price: float,
+        target_units: float,
+    ) -> None:
+        decision_ts_ns = self._now_ns()
         reference_tags = [
-            f"REF_PX={price:.12g}",
-            f"RISK_PCT={self._dynamic_stop_pct:.12g}",
+            f"{TAG_REF_PX}{price:.12g}",
+            f"{TAG_RISK_PCT}{self._dynamic_stop_pct:.12g}",
+            f"{TAG_DECISION_TS}{decision_ts_ns}",
         ]
         if self.cfg().use_patient_limit:
+            # Only ever one patient order per instrument; cancel any predecessor so
+            # a stale resting limit cannot fill on top of the new one.
+            # Sweep first (so the order we still track is excluded), then cancel it.
+            self._cancel_orphan_entry_limits()
+            self._abort_patient("superseded")
             offset = self.cfg().patient_limit_offset_bps / 1e4
-            limit_price = price * (1 - offset) if side == OrderSide.BUY else price * (1 + offset)
+            raw_limit = price * (1 - offset) if side == OrderSide.BUY else price * (1 + offset)
+            limit_price = self.instrument.make_price(raw_limit)
+            post_only = bool(self.cfg().patient_limit_post_only)
             order = self.order_factory.limit(
                 instrument_id=self.instrument_id,
                 order_side=side,
                 quantity=qty,
-                price=self.instrument.make_price(limit_price),
-                tags=reference_tags,
+                price=limit_price,
+                post_only=post_only,
+                tags=[
+                    *reference_tags,
+                    f"{TAG_EXEC_ROLE}{ROLE_PATIENT_LIMIT}",
+                    f"{TAG_LIMIT_PX}{float(limit_price):.12g}",
+                ],
             )
-            self._pending_entry_order = order
+            self._patient = PatientOrder(
+                client_order_id=order.client_order_id,
+                symbol=self.instrument_id.symbol.value,
+                side=side.name,
+                target_units=float(target_units),
+                decision_price=float(price),
+                decision_ts_ns=decision_ts_ns,
+                limit_price=float(limit_price),
+                submitted_units=self._as_float(qty),
+                post_only=post_only,
+            )
+            self._patient_order = order
             self.submit_order(order)
-            if self.cfg().patient_limit_timeout_secs > 0:
-                self.clock.set_timer(
-                    name=f"patient_timeout_{self.instrument_id.symbol.value}",
-                    interval=timedelta(seconds=self.cfg().patient_limit_timeout_secs),
-                    callback=self._on_patient_timeout,
-                )
+            self.log.info(
+                f"patient limit submitted {self._patient.symbol} "
+                f"coid={order.client_order_id} {side.name} {qty} @ {limit_price} "
+                f"post_only={post_only} ref={price:.12g} "
+                f"target={target_units:+.8f} timeout={self.cfg().patient_limit_timeout_secs}s"
+            )
+            self._set_patient_timer()
             return
         self.submit_order(
             self.order_factory.market(
                 instrument_id=self.instrument_id,
                 order_side=side,
                 quantity=qty,
-                tags=reference_tags,
+                tags=[*reference_tags, f"{TAG_EXEC_ROLE}{ROLE_TREND_MARKET}"],
             )
         )
 
-    def _on_patient_timeout(self, event) -> None:  # noqa: ANN001
+    # --- patient-limit lifecycle -------------------------------------------
+    def _now_ns(self) -> int:
         with contextlib.suppress(Exception):
-            self.clock.cancel_timer(f"patient_timeout_{self.instrument_id.symbol.value}")
-        order = self._pending_entry_order
-        self._pending_entry_order = None
-        if order is None or order not in self.cache.orders_open():
+            return int(self.clock.timestamp_ns())
+        return 0
+
+    def _patient_timer_name(self) -> str:
+        return f"patient_timeout_{self.instrument_id.symbol.value}"
+
+    def _set_patient_timer(self) -> None:
+        if self.cfg().patient_limit_timeout_secs <= 0:
             return
-        self.cancel_order(order)
-        if self.cfg().patient_limit_market_fallback and not self._apply_control():
-            self.submit_order(
-                self.order_factory.market(
-                    instrument_id=self.instrument_id,
-                    order_side=order.side,
-                    quantity=order.quantity,
-                    tags=order.tags,
-                )
+        self._cancel_patient_timer()
+        with contextlib.suppress(Exception):
+            self.clock.set_timer(
+                name=self._patient_timer_name(),
+                interval=timedelta(seconds=self.cfg().patient_limit_timeout_secs),
+                callback=self._on_patient_timeout,
             )
+
+    def _cancel_patient_timer(self) -> None:
+        with contextlib.suppress(Exception):
+            self.clock.cancel_timer(self._patient_timer_name())
+
+    def _on_patient_timeout(self, event=None) -> None:
+        """Timeout only *requests* cancellation. The fallback is decided later,
+        once the venue has confirmed the limit is really closed."""
+        self._cancel_patient_timer()
+        patient = self._patient
+        if patient is None:
+            return
+        order = self._patient_order
+        if order is None or getattr(order, "is_closed", False):
+            self._clear_patient("timeout_after_close")
+            return
+        if not patient.begin_cancel(
+            fallback_enabled=bool(self.cfg().patient_limit_market_fallback)
+        ):
+            return  # already cancelling — a repeated timer is a no-op
+        self.log.info(
+            f"patient timeout {patient.symbol} coid={patient.client_order_id} "
+            f"target={patient.target_units:+.8f} filled={patient.filled_units:.8f} "
+            f"attempt={patient.cancel_attempts} -> cancel requested "
+            f"(fallback_pending={patient.fallback_pending})"
+        )
+        with contextlib.suppress(Exception):
+            self.cancel_order(order)
+
+    def _patient_terminal(self, reason: str, *, client_order_id=None) -> None:
+        """Authoritative end of the patient order. Idempotent: duplicate cancel/
+        fill callbacks after the first are no-ops."""
+        patient = self._patient
+        if patient is None:
+            return
+        if client_order_id is not None and client_order_id != patient.client_order_id:
+            return
+        if not patient.mark_terminal(reason):
+            return
+        self._cancel_patient_timer()
+        if patient.fallback_pending and not patient.fallback_resolved:
+            self._resolve_fallback(patient, reason)
+        self._clear_patient(reason)
+
+    def _resolve_fallback(self, patient: PatientOrder, reason: str) -> None:
+        """Recompute the remaining delta against the REAL position and, if every
+        guard passes, take the remainder with a market order."""
+        if patient.fallback_resolved:
+            return
+        current_units = float(self.portfolio.net_position(self.instrument_id))
+        fresh_price = self._fresh_price()
+        decision = evaluate_fallback(
+            patient,
+            current_units=current_units,
+            fresh_price=fresh_price,
+            fallback_enabled=bool(self.cfg().patient_limit_market_fallback),
+            control_reason=self._control_block_reason(),
+            max_adverse_bps=float(self.cfg().patient_limit_max_adverse_bps),
+            min_units=self._min_units(),
+        )
+        patient.fallback_resolved = True
+        patient.fallback_pending = False
+        drift = "n/a" if decision.drift_bps is None else f"{decision.drift_bps:+.2f}bps"
+        context = (
+            f"{patient.symbol} coid={patient.client_order_id} after={reason} "
+            f"target={patient.target_units:+.8f} current={current_units:+.8f} "
+            f"remaining={decision.remaining_units:+.8f} ref={patient.decision_price:.12g} "
+            f"fresh={'n/a' if fresh_price is None else format(fresh_price, '.12g')} drift={drift}"
+        )
+        if not decision.submit:
+            self.log.info(f"patient fallback skipped: reason={decision.reason} {context}")
+            return
+
+        qty = self.instrument.make_qty(decision.units)
+        if self._as_float(qty) <= 0 or not self._order_passes_filters(qty, decision.fresh_price):
+            self.log.info(f"patient fallback skipped: reason=instrument_filters {context}")
+            return
+        side = OrderSide.BUY if decision.side == "BUY" else OrderSide.SELL
+        order = self.order_factory.market(
+            instrument_id=self.instrument_id,
+            order_side=side,
+            quantity=qty,
+            tags=[
+                f"{TAG_REF_PX}{patient.decision_price:.12g}",
+                f"{TAG_RISK_PCT}{self._dynamic_stop_pct:.12g}",
+                f"{TAG_DECISION_TS}{patient.decision_ts_ns}",
+                f"{TAG_EXEC_ROLE}{ROLE_PATIENT_FALLBACK}",
+                f"{TAG_FALLBACK_REASON}{decision.reason}",
+                f"{TAG_FALLBACK_DRIFT}{decision.drift_bps:.4f}",
+            ],
+        )
+        self.submit_order(order)
+        self.log.info(
+            f"patient fallback submitted coid={order.client_order_id} {side.name} {qty} {context}"
+        )
+
+    def _cancel_orphan_entry_limits(self) -> None:
+        """Cancel resting non-reduce-only limits this process no longer tracks.
+
+        In-memory patient state does not survive a restart, so a limit left by a
+        previous run would otherwise still be working at the venue and could fill
+        on top of a freshly sized entry.
+        """
+        tracked = None
+        if self._patient_order is not None:
+            tracked = self._patient_order.client_order_id
+        try:
+            resting = list(self.cache.orders_open(instrument_id=self.instrument_id))
+        except Exception:  # noqa: BLE001
+            return
+        for order in resting:
+            if getattr(order, "is_reduce_only", False):
+                continue
+            if getattr(order.order_type, "name", None) != "LIMIT":
+                continue
+            if tracked is not None and order.client_order_id == tracked:
+                continue
+            self.log.warning(
+                f"cancelling untracked resting entry limit {order.client_order_id} "
+                f"on {self.instrument_id} (likely left by a previous run)"
+            )
+            with contextlib.suppress(Exception):
+                self.cancel_order(order)
+
+    def _abort_patient(self, reason: str) -> None:
+        """Control/stop path: cancel the resting limit and never fall back."""
+        patient = self._patient
+        if patient is None:
+            return
+        patient.fallback_forbidden = True
+        patient.fallback_pending = False
+        order = self._patient_order
+        if order is not None and not getattr(order, "is_closed", False):
+            with contextlib.suppress(Exception):
+                self.cancel_order(order)
+        self._clear_patient(reason)
+
+    def _clear_patient(self, reason: str) -> None:
+        patient = self._patient
+        self._patient = None
+        self._patient_order = None
+        self._cancel_patient_timer()
+        if patient is not None:
+            self.log.info(
+                f"patient state cleared {patient.symbol} coid={patient.client_order_id} "
+                f"reason={reason} filled={patient.filled_units:.8f}/"
+                f"{patient.submitted_units:.8f}"
+            )
+
+    def _min_units(self) -> float:
+        return self._as_float(getattr(self.instrument, "min_quantity", None))
+
+    def _fresh_price(self) -> float | None:
+        """Freshest executable reference available, or None.
+
+        Never falls back to the bar close that produced the decision: reusing a
+        stale daily close as an executable price is exactly what produced the
+        ~412 bps fallback observed on testnet.
+        """
+        rs = self.risk_state
+        key = str(self.instrument_id)
+        if rs is not None:
+            mark = getattr(rs, "mark_prices", {}).get(key)
+            received_ns = getattr(rs, "mark_received_ns", {}).get(key)
+            if mark and received_ns:
+                age = max(0.0, (self._now_ns() - int(received_ns)) / 1e9)
+                if age <= FRESH_PRICE_MAX_AGE_SECS:
+                    return float(mark)
+        tick_price = self._cached_tick_price()
+        if tick_price is not None:
+            return tick_price
+        if rs is None or not getattr(rs, "mark_watchdog_enabled", False):
+            # Backtest / no live mark stream: the latest bar close IS the freshest
+            # price that exists, and fills are priced off bars anyway. Live runs
+            # always have the watchdog on, so this branch cannot reuse the stale
+            # daily close that produced the ~412 bps fallback on testnet.
+            return float(self._closes[-1]) if self._closes else None
+        return None
+
+    def _cached_tick_price(self) -> float | None:
+        cache = self.cache
+        if cache is None:
+            return None
+        max_age_ns = FRESH_PRICE_MAX_AGE_SECS * 1e9
+        now_ns = self._now_ns()
+        with contextlib.suppress(Exception):
+            quote = cache.quote_tick(self.instrument_id)
+            if quote is not None and (now_ns - int(quote.ts_event)) <= max_age_ns:
+                mid = (quote.bid_price.as_double() + quote.ask_price.as_double()) / 2.0
+                if mid > 0:
+                    return mid
+        with contextlib.suppress(Exception):
+            trade = cache.trade_tick(self.instrument_id)
+            if trade is not None and (now_ns - int(trade.ts_event)) <= max_age_ns:
+                price = float(trade.price)
+                if price > 0:
+                    return price
+        return None
 
     def _order_passes_filters(self, qty, price: float) -> bool:  # noqa: ANN001
         qty_value = float(qty)
@@ -846,6 +1175,7 @@ class TrendStrategy(Strategy):
                     quantity=qty,
                     trigger_price=sl_price,
                     reduce_only=True,
+                    tags=[f"{TAG_EXEC_ROLE}{ROLE_HARD_STOP}"],
                 )
                 self._protective_orders.append(order)
                 self.submit_order(order)
@@ -856,6 +1186,7 @@ class TrendStrategy(Strategy):
                     quantity=qty,
                     price=tp_price,
                     reduce_only=True,
+                    tags=[f"{TAG_EXEC_ROLE}{ROLE_TAKE_PROFIT}"],
                 )
                 self._protective_orders.append(order)
                 self.submit_order(order)
@@ -869,7 +1200,7 @@ class TrendStrategy(Strategy):
                     activation_price=trail_activation,
                     trigger_type=TriggerType.MARK_PRICE,
                     reduce_only=True,
-                    tags=["VOL_TRAIL"],
+                    tags=["VOL_TRAIL", f"{TAG_EXEC_ROLE}{ROLE_TRAILING_STOP}"],
                 )
                 self._protective_orders.append(order)
                 self.submit_order(order)
@@ -894,6 +1225,7 @@ class TrendStrategy(Strategy):
         return equity
 
     def on_stop(self) -> None:
+        self._abort_patient("strategy_stop")
         if self.cfg().flatten_on_stop:
             self.cancel_all_orders(self.instrument_id)
             self.close_all_positions(self.instrument_id)

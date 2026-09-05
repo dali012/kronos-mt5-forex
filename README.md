@@ -108,6 +108,19 @@ vectorized test did not improve Sharpe, so the bot does not enable it by default
   An optional native volatility trail arms around +1R while retaining the hard stop.
   Live PnL and drawdown use Binance's 1-second futures mark stream; a fail-closed
   freshness watchdog blocks new entries if any mark goes stale.
+- **Patient-limit execution** — entries can rest as a maker limit `offset_bps`
+  inside the touch (optionally **post-only**, `BINANCE_PATIENT_LIMIT_POST_ONLY`).
+  On timeout the bot *requests* a cancel and waits for the venue to confirm it;
+  only then does it recompute `target_units - current_units` and take the
+  **remaining** delta with a market order priced off a **fresh mark**. The
+  fallback is skipped — and the next cycle reconciles instead — when the market
+  has already moved more than `BINANCE_PATIENT_LIMIT_MAX_ADVERSE_BPS` against the
+  decision price, when no fresh price is available, or when a halt/kill/flatten
+  or stale-mark control is active. Every fill records its liquidity side,
+  execution role, decision-to-fill latency and implementation shortfall.
+  **Shortfall sign convention: positive bps = worse than the decision price,
+  negative = price improvement.** Shortfall is a measurement of the price paid —
+  it is already inside the execution price and is never booked as a separate cost.
 - **Companion** — decoupled via SQLite so neither process can crash the other:
   dashboard, attributed performance ledger (starting equity, realized/unrealized
   PnL, commissions, funding, slippage, reconciliation residual), equity curve,

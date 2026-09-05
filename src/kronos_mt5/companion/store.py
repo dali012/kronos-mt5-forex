@@ -53,7 +53,10 @@ def init_db(db_path: str = DEFAULT_DB) -> None:
             CREATE TABLE IF NOT EXISTS fills (
                 fill_id TEXT PRIMARY KEY, ts TEXT, symbol TEXT, side TEXT,
                 qty REAL, price REAL, kind TEXT, trade_id TEXT, commission REAL,
-                reference_price REAL, slippage REAL, reconciliation INTEGER
+                reference_price REAL, slippage REAL, reconciliation INTEGER,
+                order_type TEXT, liquidity TEXT, exec_role TEXT, decision_price REAL,
+                limit_price REAL, decision_to_fill_ms REAL, fallback_reason TEXT,
+                adverse_drift_bps REAL, impl_shortfall_quote REAL, impl_shortfall_bps REAL
             );
             CREATE TABLE IF NOT EXISTS income (
                 income_id TEXT PRIMARY KEY, ts TEXT, time_ms INTEGER, income_type TEXT,
@@ -106,6 +109,17 @@ def init_db(db_path: str = DEFAULT_DB) -> None:
             "reference_price": "REAL",
             "slippage": "REAL",
             "reconciliation": "INTEGER",
+            # --- execution telemetry (added later; NULL on pre-existing rows) ---
+            "order_type": "TEXT",
+            "liquidity": "TEXT",
+            "exec_role": "TEXT",
+            "decision_price": "REAL",
+            "limit_price": "REAL",
+            "decision_to_fill_ms": "REAL",
+            "fallback_reason": "TEXT",
+            "adverse_drift_bps": "REAL",
+            "impl_shortfall_quote": "REAL",
+            "impl_shortfall_bps": "REAL",
         }.items():
             if name not in fill_cols:
                 con.execute(f"ALTER TABLE fills ADD COLUMN {name} {sql_type}")
@@ -179,18 +193,41 @@ def record_fill(
     reference_price: float | None = None,
     slippage: float | None = None,
     reconciliation: bool = False,
+    order_type: str | None = None,
+    liquidity: str | None = None,
+    exec_role: str | None = None,
+    decision_price: float | None = None,
+    limit_price: float | None = None,
+    decision_to_fill_ms: float | None = None,
+    fallback_reason: str | None = None,
+    adverse_drift_bps: float | None = None,
+    impl_shortfall_quote: float | None = None,
+    impl_shortfall_bps: float | None = None,
 ) -> bool:
     """Insert a fill (idempotent on fill_id). kind='STOP' for stop-loss fills.
-    Returns True if newly inserted."""
+    Returns True if newly inserted.
+
+    Every telemetry argument is optional: older callers and venue-reconciled
+    fills that carry no decision metadata simply store NULL.
+
+    `slippage` is kept for backward compatibility and is the same quantity as
+    `impl_shortfall_quote` — POSITIVE means the fill was worse than the decision
+    price. It is a measurement of the price paid, never a separate cash expense.
+    """
     with _conn(db_path) as con:
         cur = con.execute(
             "INSERT OR IGNORE INTO fills "
             "(fill_id, ts, symbol, side, qty, price, kind, trade_id, commission, "
-            "reference_price, slippage, reconciliation) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "reference_price, slippage, reconciliation, order_type, liquidity, "
+            "exec_role, decision_price, limit_price, decision_to_fill_ms, "
+            "fallback_reason, adverse_drift_bps, impl_shortfall_quote, impl_shortfall_bps) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 fill_id, ts or _now(), symbol, side, qty, price, kind, trade_id,
                 commission, reference_price, slippage, int(reconciliation),
+                order_type, liquidity, exec_role, decision_price, limit_price,
+                decision_to_fill_ms, fallback_reason, adverse_drift_bps,
+                impl_shortfall_quote, impl_shortfall_bps,
             ),
         )
         return cur.rowcount > 0
@@ -510,7 +547,125 @@ def performance_summary(
         "reconciliation_residual": total_pnl - explained,
         "income_last_update": get_kv("accounting_income_last_success_ts", None, db_path),
         "income_error": get_kv("accounting_income_error", "", db_path) or None,
+        # Execution quality. Additive: consumers that don't know this key ignore it,
+        # and a pre-migration database reports zero counts rather than failing.
+        "execution": execution_summary(db_path, since_ts=start_ts),
     }
+
+
+def _percentile(values: list[float], pct: float) -> float | None:
+    """Nearest-rank percentile — no numpy dependency in the store layer."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    rank = max(1, math.ceil(pct / 100.0 * len(ordered)))
+    return ordered[min(rank, len(ordered)) - 1]
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def execution_summary(db_path: str = DEFAULT_DB, since_ts: str | None = None) -> dict:
+    """Maker/taker mix, fallback usage and implementation-shortfall distribution.
+
+    Only reads columns added by the telemetry migration, so a database whose
+    fills predate it simply reports zero counts and None statistics.
+
+    Shortfall sign convention (see `record_fill`): POSITIVE bps = execution was
+    worse than the decision price; NEGATIVE = price improvement.
+    """
+    empty = {
+        "fills_with_telemetry": 0,
+        "maker_fills": 0,
+        "taker_fills": 0,
+        "unknown_liquidity_fills": 0,
+        "maker_notional": 0.0,
+        "taker_notional": 0.0,
+        "patient_fallback_fills": 0,
+        "shortfall_bps_by_role": {},
+        "shortfall_bps_vw": None,
+        "shortfall_bps_median": None,
+        "shortfall_bps_p95": None,
+        "latency_ms_median": None,
+        "latency_ms_p95": None,
+    }
+    with _conn(db_path) as con:
+        columns = {r["name"] for r in con.execute("PRAGMA table_info(fills)")}
+        if not {"liquidity", "exec_role", "impl_shortfall_bps"} <= columns:
+            return empty  # pre-migration database
+        query = (
+            "SELECT qty, price, liquidity, exec_role, decision_to_fill_ms, impl_shortfall_bps "
+            "FROM fills"
+        )
+        params: tuple = ()
+        if since_ts:
+            query += " WHERE ts >= ?"
+            params = (since_ts,)
+        rows = con.execute(query, params).fetchall()
+
+    out = dict(empty)
+    shortfalls: list[float] = []
+    latencies: list[float] = []
+    by_role: dict[str, list[tuple[float, float]]] = defaultdict(list)
+    weighted_sum = 0.0
+    weight_total = 0.0
+    for row in rows:
+        qty = abs(float(row["qty"] or 0.0))
+        notional = qty * float(row["price"] or 0.0)
+        liquidity = row["liquidity"]
+        if liquidity == "MAKER":
+            out["maker_fills"] += 1
+            out["maker_notional"] += notional
+        elif liquidity == "TAKER":
+            out["taker_fills"] += 1
+            out["taker_notional"] += notional
+        elif liquidity is not None:
+            out["unknown_liquidity_fills"] += 1
+        role = row["exec_role"]
+        if role == "PATIENT_FALLBACK":
+            out["patient_fallback_fills"] += 1
+        if liquidity is not None or role is not None or row["impl_shortfall_bps"] is not None:
+            out["fills_with_telemetry"] += 1
+        latency = row["decision_to_fill_ms"]
+        if latency is not None:
+            latencies.append(float(latency))
+        shortfall = row["impl_shortfall_bps"]
+        if shortfall is None:
+            continue
+        shortfall = float(shortfall)
+        shortfalls.append(shortfall)
+        if notional > 0:
+            weighted_sum += shortfall * notional
+            weight_total += notional
+            by_role[role or "OTHER"].append((shortfall, notional))
+
+    out["shortfall_bps_vw"] = weighted_sum / weight_total if weight_total else None
+    out["shortfall_bps_median"] = _median(shortfalls)
+    out["shortfall_bps_p95"] = _percentile(shortfalls, 95)
+    out["latency_ms_median"] = _median(latencies)
+    out["latency_ms_p95"] = _percentile(latencies, 95)
+    out["shortfall_bps_by_role"] = {
+        role: {
+            "fills": len(pairs),
+            "notional": sum(n for _, n in pairs),
+            "shortfall_bps_vw": (
+                sum(v * n for v, n in pairs) / sum(n for _, n in pairs)
+                if sum(n for _, n in pairs)
+                else None
+            ),
+        }
+        for role, pairs in sorted(by_role.items())
+    }
+    return out
 
 
 def heartbeat(db_path: str = DEFAULT_DB) -> None:
@@ -583,7 +738,10 @@ def read_fills(limit: int = 200, after_rowid: int = 0, db_path: str = DEFAULT_DB
     with _conn(db_path) as con:
         rows = con.execute(
             "SELECT rowid, ts, symbol, side, qty, price, kind, trade_id, commission, "
-            "reference_price, slippage, reconciliation FROM fills "
+            "reference_price, slippage, reconciliation, order_type, liquidity, "
+            "exec_role, decision_price, limit_price, decision_to_fill_ms, "
+            "fallback_reason, adverse_drift_bps, impl_shortfall_quote, "
+            "impl_shortfall_bps FROM fills "
             "WHERE rowid > ? ORDER BY rowid DESC LIMIT ?",
             (after_rowid, limit),
         ).fetchall()

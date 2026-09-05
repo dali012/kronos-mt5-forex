@@ -360,15 +360,16 @@ def test_set_protection_flat_cancels_all(monkeypatch):
 
 def test_entry_fill_reconciles_protection_after_position_resize(monkeypatch):
     s = _protection_strat(monkeypatch)
-    pending = SimpleNamespace(client_order_id="entry-1")
-    s._pending_entry_order = pending
+    s._patient = None  # a plain market entry has no patient state
+    s._patient_order = None
     refreshed = []
     s._refresh_protection = lambda: refreshed.append(True)
-    event = SimpleNamespace(instrument_id=s.instrument_id, client_order_id="entry-1")
+    event = SimpleNamespace(
+        instrument_id=s.instrument_id, client_order_id="entry-1", last_qty=1.0
+    )
 
     s.on_order_filled(event)
 
-    assert s._pending_entry_order is None
     assert refreshed == [True]
 
 

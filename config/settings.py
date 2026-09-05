@@ -102,6 +102,12 @@ class Settings(BaseSettings):
     binance_patient_limit_offset_bps: float = 2.0
     binance_patient_limit_timeout_secs: int = 300
     binance_patient_limit_market_fallback: bool = True
+    # Post-only keeps patient limits maker-only. Default False so an existing
+    # deployment is unchanged until it opts in; `true` is the recommended value.
+    binance_patient_limit_post_only: bool = False
+    # Skip the market fallback once the market has run this far against the
+    # decision price (bps). <= 0 disables the cap.
+    binance_patient_limit_max_adverse_bps: float = 15.0
     binance_shadow_enabled: bool = False
     binance_shadow_lookbacks: str = "7,21,63,126"
 

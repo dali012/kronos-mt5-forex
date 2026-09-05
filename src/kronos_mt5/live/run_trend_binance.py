@@ -341,6 +341,8 @@ def build_node() -> TradingNode:
                 patient_limit_offset_bps=settings.binance_patient_limit_offset_bps,
                 patient_limit_timeout_secs=settings.binance_patient_limit_timeout_secs,
                 patient_limit_market_fallback=settings.binance_patient_limit_market_fallback,
+                patient_limit_post_only=settings.binance_patient_limit_post_only,
+                patient_limit_max_adverse_bps=settings.binance_patient_limit_max_adverse_bps,
                 shadow_enabled=settings.binance_shadow_enabled,
                 shadow_lookbacks=tuple(
                     int(value.strip())
