@@ -35,6 +35,7 @@ RESEARCH_ADAPTER_PATHS = (
 
 RELEVANT_SOURCE_DIRECTORIES = (
     Path("src/kronos_mt5/baseline"),
+    Path("src/kronos_mt5/experiments"),
     Path("src/kronos_mt5/marketdata"),
 )
 RELEVANT_SOURCE_FILES = (

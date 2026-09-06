@@ -107,6 +107,7 @@ def run(
     output: Path,
     *,
     include_holdout: bool = False,
+    overlay=None,
 ) -> dict:
     validation = validate_dataset(manifest_path)
     manifest = json.loads(manifest_path.read_text())
@@ -150,7 +151,7 @@ def run(
         btc = load_series(manifest_path, "BTCUSDT", "1d")
 
     def evaluate(start, end):
-        replay = run_engine(frames, funding, filters, config, start, end)
+        replay = run_engine(frames, funding, filters, config, start, end, overlay)
         metrics = summarize(replay)
         for symbol in config.symbols:
             metrics["per_symbol"].setdefault(
@@ -210,6 +211,7 @@ def run(
         if config.funding_mode == "historical"
         else "INCOMPLETE_FUNDING_OMITTED",
         "data_gaps": [],
+        "research_overlay": None if overlay is None else overlay.identity(),
         "development": development,
         "walk_forward": windows,
         "holdout": holdout_result,

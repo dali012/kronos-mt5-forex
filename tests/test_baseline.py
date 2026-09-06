@@ -487,8 +487,9 @@ def test_default_run_never_evaluates_holdout(tmp_path, monkeypatch):
     manifest = synthetic_manifest(tmp_path / "data", frames, funding)
     seen = []
 
-    def engine(frames, funding, filters, config, start, end):
+    def engine(frames, funding, filters, config, start, end, overlay=None):
         seen.append((start, end))
+        assert overlay is None, "the pinned baseline installs no research overlay"
         return {
             "observations": [
                 {

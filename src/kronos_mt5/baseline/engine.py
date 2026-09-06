@@ -10,7 +10,10 @@ distance, or protective-order construction. The research-only overrides are:
 * ``_order_passes_filters``: retain deployed filters and collect rejections;
 * ``on_quote_tick``: supply synthetic OHLC execution, risk checks and liquidation;
 * fill/rejection callbacks: retain pinned protection logic and collect reports;
-* ``snapshot``: collect research-only equity/exposure observations.
+* ``snapshot``: collect research-only equity/exposure observations;
+* ``current_regime``/``_experiment_adjust``: expose the pinned volatility regime and
+  let a Phase 4 research overlay veto or reduce a decision before submission.
+  The pinned baseline installs no overlay, so its behaviour is unchanged.
 
 Historical funding and conservative costs are simulation transport. Patient-limit
 queueing, live intraday marks, outages and exchange behavior remain approximations.
@@ -177,6 +180,7 @@ class ReplayStrategy(DeployedTrendStrategy):
         start_ns: int,
         end_ns: int,
         shared: dict,
+        overlay=None,
     ):
         super().__init__(config)
         self.replay = replay
@@ -184,6 +188,7 @@ class ReplayStrategy(DeployedTrendStrategy):
         self.start_ns = start_ns
         self.end_ns = end_ns
         self.shared = shared
+        self.overlay = overlay
         self.pending = None
         self.symbol = self.instrument_id.symbol.value
         self.decisions = []
@@ -265,12 +270,14 @@ class ReplayStrategy(DeployedTrendStrategy):
             price_obj = tick.ask_price if side == OrderSide.BUY else tick.bid_price
             # The pinned Quantity is snapped in Decimal and rebuilt exactly.
             qty_decimal = exact(pending["qty"])
+            current = float(self.portfolio.net_position(self.instrument_id))
+            side, qty_decimal, veto = self._experiment_adjust(side, qty_decimal, current)
             qty_obj = (
                 step_aligned_quantity(self.instrument, qty_decimal, self.filters["step_size"])
                 if qty_decimal > 0
                 else None
             )
-            reason = (
+            reason = veto or (
                 reject_reason(qty_obj, price_obj, self.filters)
                 if qty_obj is not None
                 else "nonpositive_or_nonfinite"
@@ -278,7 +285,6 @@ class ReplayStrategy(DeployedTrendStrategy):
             # Only after exact validation are these used for metrics/arithmetic.
             price = float(price_obj)
             qty = float(qty_obj) if qty_obj is not None else float(qty_decimal)
-            current = float(self.portfolio.net_position(self.instrument_id))
             delta = qty if side == OrderSide.BUY else -qty
             gross = sum(
                 abs(float(self.portfolio.net_position(iid))) * mid
@@ -373,6 +379,27 @@ class ReplayStrategy(DeployedTrendStrategy):
         self._record_engine_rejection(event)
         super().on_order_rejected(event)
 
+    def current_regime(self) -> str:
+        """Return the pinned volatility-regime classifier's observable state.
+
+        Overlays must consult this rather than defining their own classifier.
+        ``risk_state`` is only updated from closed bars, so reading it at an
+        executable open stays causal.
+        """
+
+        return self.risk_state.correlation_metrics(90, 0.65, 0.5)["volatility_regime"]
+
+    def _experiment_adjust(self, side, qty, current):
+        """Let a research overlay veto or reduce a decision before submission.
+
+        Returns ``(side, quantity, veto_reason)``. Without an overlay the pinned
+        deployed decision passes through untouched.
+        """
+
+        if self.overlay is None:
+            return side, qty, None
+        return self.overlay.adjust(self, side, qty, current)
+
     def snapshot(self, ts):
         if ts % DAY_NS == 0 and ts < self.end_ns:
             ts += 1  # preserve initial capital and attribute open fills to the new day
@@ -387,7 +414,7 @@ class ReplayStrategy(DeployedTrendStrategy):
             "equity": equity,
             "n_open": len(positions),
             "gross_exposure": gross / equity if equity > 0 else None,
-            "regime": self.risk_state.correlation_metrics(90, 0.65, 0.5)["volatility_regime"],
+            "regime": self.current_regime(),
         }
 
 
@@ -464,6 +491,7 @@ def run_engine(
     config: BaselineConfig,
     start_ns: int,
     end_ns: int,
+    overlay=None,
 ) -> dict:
     if start_ns >= end_ns or start_ns % DAY_NS or end_ns % DAY_NS:
         raise ValueError("window must be an ordered half-open UTC day range")
@@ -540,6 +568,7 @@ def run_engine(
                 start_ns,
                 end_ns,
                 shared,
+                overlay,
             )
             strategy.risk_state = risk
             strategy.funding_rates = SimpleNamespace(get=lambda s: rates.get(s))
