@@ -17,3 +17,12 @@ kaggle/_staging/
 kaggle/kernel/kernel-metadata.json
 logs/
 artifacts/
+
+# --- performance-audit inputs and outputs (never commit real trading data) ---
+kronos-performance-export-*.tar.gz
+kronos-performance-export-*.tar.gz.sha256
+companion_sanitized.db
+*.sqlite
+*.sqlite3
+kronos-performance-report/
+performance-report/

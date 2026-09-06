@@ -121,6 +121,14 @@ vectorized test did not improve Sharpe, so the bot does not enable it by default
   **Shortfall sign convention: positive bps = worse than the decision price,
   negative = price improvement.** Shortfall is a measurement of the price paid —
   it is already inside the execution price and is never booked as a separate cost.
+- **Performance audit** — an offline, read-only forensics CLI
+  (`python -m kronos_mt5.performance_audit --input EXPORT.tar.gz --output-dir DIR`)
+  that recomputes the equity curve, reconciles PnL against the income ledger,
+  attributes execution, and emits coded data-quality findings plus
+  `report.md` / `summary.json` / `daily_equity.csv` / `fill_attribution.csv`.
+  It never writes to its input. It deliberately refuses to score shadow models
+  without OHLCV (`NOT_EVALUABLE`) and states plainly that testnet results are not
+  evidence of live profitability. See [docs/performance_audit.md](docs/performance_audit.md).
 - **Companion** — decoupled via SQLite so neither process can crash the other:
   dashboard, attributed performance ledger (starting equity, realized/unrealized
   PnL, commissions, funding, slippage, reconciliation residual), equity curve,
