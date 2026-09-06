@@ -287,10 +287,33 @@ def render(report: dict) -> str:
             "net_pnl",
             "accounting_residual",
             "funding_mark_approximations",
+            "rejected_orders",
         ):
             lines.append(f"| {key} | {metrics.get(key)} |")
         for key, value in metrics["costs"].items():
             lines.append(f"| {key} cost (positive paid) | {value} |")
+        lines += [
+            "",
+            "#### Rejected orders",
+            "",
+        ]
+        if metrics.get("rejected_orders"):
+            lines += ["| Symbol | Reason | Count |", "|---|---|---:|"]
+            for key, count in metrics["rejections_by_symbol_reason"].items():
+                symbol, _, reason = key.partition("/")
+                lines.append(f"| {symbol} | {reason} | {count} |")
+            lines += [
+                "",
+                "By reason: "
+                + ", ".join(f"{k}={v}" for k, v in metrics["rejections_by_reason"].items())
+                + ".",
+                "",
+                "By symbol: "
+                + ", ".join(f"{k}={v}" for k, v in metrics["rejections_by_symbol"].items())
+                + ".",
+            ]
+        else:
+            lines.append("None.")
         lines += [
             "",
             f"Suppressed: {', '.join(metrics['suppressed_metrics']) or 'none'}.",
