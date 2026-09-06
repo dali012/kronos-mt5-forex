@@ -27,6 +27,7 @@ in the execution price and must never be booked as a separate cash expense.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 # --- order-tag vocabulary ----------------------------------------------------
@@ -36,6 +37,9 @@ from dataclasses import dataclass, field
 TAG_REF_PX = "REF_PX="  # decision / reference price (pre-existing)
 TAG_RISK_PCT = "RISK_PCT="  # stop distance at decision time (pre-existing)
 TAG_EXEC_ROLE = "EXEC_ROLE="  # why this order exists (see ROLE_* below)
+# WHO owns the order — a stable, deterministic strategy identity that survives a
+# restart. EXEC_ROLE describes purpose and must never be read as ownership.
+TAG_OWNER = "OWNER_STRATEGY="
 TAG_DECISION_TS = "DEC_TS="  # decision timestamp, UNIX epoch nanoseconds
 TAG_LIMIT_PX = "LIMIT_PX="  # submitted patient-limit price
 TAG_FALLBACK_REASON = "FB_REASON="  # why a fallback was submitted
@@ -180,14 +184,35 @@ def tag_float(tags: object, prefix: str) -> float | None:
         return None
 
 
+# A float has 53 bits of integer precision. Epoch nanoseconds (~1.8e18) are far
+# beyond that, so a float round-trip would silently corrupt a decision timestamp.
+_EXACT_FLOAT_INT_LIMIT = 2**53
+
+
 def tag_int(tags: object, prefix: str) -> int | None:
+    """Parse an integer tag exactly.
+
+    Parsed as an integer first so nanosecond timestamps keep every digit. The
+    float path exists only for legacy tags written in exponent form, and refuses
+    any value a float cannot represent exactly.
+    """
     raw = tag_value(tags, prefix)
     if raw is None:
         return None
+    text = raw.strip()
     try:
-        return int(float(raw))
+        return int(text)
+    except (TypeError, ValueError):
+        pass
+    try:
+        value = float(text)
     except (TypeError, ValueError):
         return None
+    if not math.isfinite(value) or value != int(value):
+        return None
+    if abs(value) >= _EXACT_FLOAT_INT_LIMIT:
+        return None  # a float cannot represent this integer exactly — refuse it
+    return int(value)
 
 
 @dataclass
@@ -217,6 +242,9 @@ class PatientOrder:
     retire_reason: str | None = None  # why it stopped being the active order
     retired_ts_ns: int = 0
     settled_ts_ns: int = 0
+    watchdog_armed: bool = False  # a future action is scheduled for this order
+    timer_failed: bool = False  # scheduling failed; recovery runs off the control timer
+    watchdog_expiries: int = 0
     events: list[str] = field(default_factory=list)
 
     @property

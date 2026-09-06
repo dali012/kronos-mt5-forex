@@ -41,7 +41,6 @@ from kronos_mt5.execution import (
     ROLE_TRAILING_STOP,
     ROLE_TREND_MARKET,
     SKIP_UNOWNED_RESTING_ORDER,
-    STATE_CANCEL_RETRY,
     STATE_SETTLING,
     STATE_TERMINAL,
     TAG_DECISION_TS,
@@ -49,6 +48,7 @@ from kronos_mt5.execution import (
     TAG_FALLBACK_DRIFT,
     TAG_FALLBACK_REASON,
     TAG_LIMIT_PX,
+    TAG_OWNER,
     TAG_REF_PX,
     TAG_RISK_PCT,
     DeferredEntry,
@@ -297,6 +297,8 @@ class TrendStrategy(Strategy):
 
     def _on_control_timer(self, event) -> None:  # noqa: ANN001 (live: act on control within ~1 min)
         self._apply_control()
+        # Safety net: re-arm anything whose timer failed to schedule or was lost.
+        self._recover_unmonitored()
 
     def _rebalance(
         self,
@@ -448,7 +450,7 @@ class TrendStrategy(Strategy):
             f"reason={getattr(event, 'reason', 'unknown reason')} — "
             f"fallback and replacement stay blocked, retrying cancel"
         )
-        self._schedule_cancel_retry()
+        self._arm_watchdog(patient, "cancel_rejected")
 
     def on_order_rejected(self, event) -> None:  # noqa: ANN001
         client_order_id = getattr(event, "client_order_id", None)
@@ -801,10 +803,11 @@ class TrendStrategy(Strategy):
         # An entry limit we cannot prove we own blocks us rather than being cancelled.
         blocker = self._unowned_resting_entry()
         if blocker is not None:
+            coid, why = blocker
             self.log.error(
                 f"patient entry blocked {self.instrument_id.symbol.value}: "
-                f"reason={SKIP_UNOWNED_RESTING_ORDER} order={blocker} — not provably "
-                f"owned by this strategy, refusing to cancel it or add exposure"
+                f"reason={SKIP_UNOWNED_RESTING_ORDER} order={coid} ({why}) — not "
+                f"provably owned by this strategy, refusing to cancel it or add exposure"
             )
             return
 
@@ -879,6 +882,8 @@ class TrendStrategy(Strategy):
             f"{TAG_REF_PX}{price:.12g}",
             f"{TAG_RISK_PCT}{self._dynamic_stop_pct:.12g}",
             f"{TAG_DECISION_TS}{decision_ts_ns}",
+            # bounded, non-secret provenance so a restart can re-adopt our own order
+            f"{TAG_OWNER}{self._strategy_identity()}",
         ]
 
     # --- patient-limit lifecycle -------------------------------------------
@@ -912,26 +917,71 @@ class TrendStrategy(Strategy):
         self._deferred = None
 
     # --- ownership ----------------------------------------------------------
-    def _owns_order(self, order) -> bool:
-        """Prove this strategy owns `order` before ever cancelling it.
+    def _strategy_identity(self) -> str:
+        """Stable owner identity, deterministic across restarts.
 
-        Three independent proofs, strongest first:
-          1. the engine's own `strategy_id` on the order equals ours (survives a
-             restart, because execution reconciliation restores it);
-          2. we submitted the client order id in this process;
-          3. the order carries an `EXEC_ROLE=` tag from our own tag vocabulary.
-        Anything else — a manual order, another strategy's order, an unknown
-        externally reconciled limit — is NOT ours and is never cancelled here.
+        Derived from the strategy class and its instrument — never from a
+        per-process random value, an engine-assigned counter or a run id — so an
+        order tagged by a previous process is still recognisable after a restart.
+        """
+        return f"{type(self).__name__}:{self.instrument_id}"
+
+    @staticmethod
+    def _order_strategy_id(order) -> str | None:
+        """The engine's strategy id for `order`, or None when it exposes none."""
+        with contextlib.suppress(Exception):
+            raw = getattr(order, "strategy_id", None)
+            if raw is None:
+                return None
+            text = str(raw)
+            return text or None
+        return None
+
+    def _ownership(self, order) -> tuple[bool, str]:
+        """Strict ownership proof. Returns (owned, why) — `why` is logged.
+
+        Rules, in order:
+          1. a client order id THIS process submitted proves ownership;
+          2. the engine's `strategy_id` is authoritative when present — matching
+             proves ownership, and an explicit MISMATCH proves the order is
+             foreign and can never be overridden by a tag;
+          3. with no engine strategy id, only an exact `OWNER_STRATEGY=` match
+             adopts the order (this is the restart-reconciliation path);
+          4. `EXEC_ROLE` describes an order's PURPOSE, never its owner, so it can
+             never prove ownership on its own.
+        Anything else is unknown: never cancelled, and it blocks new entries.
         """
         coid = getattr(order, "client_order_id", None)
         if coid is not None and coid in self._owned_coids:
-            return True
-        strategy_id = getattr(order, "strategy_id", None)
-        if strategy_id is not None:
+            return True, "client_order_id submitted by this process"
+
+        engine_id = self._order_strategy_id(order)
+        identity = self._strategy_identity()
+        owner_tag = tag_value(getattr(order, "tags", None), TAG_OWNER)
+        if engine_id is not None:
             with contextlib.suppress(Exception):
-                if str(strategy_id) == str(self.id):
-                    return True
-        return tag_value(getattr(order, "tags", None), TAG_EXEC_ROLE) is not None
+                if engine_id == str(self.id):
+                    return True, f"engine strategy_id={engine_id} matches"
+            # An explicit foreign strategy id is decisive: no tag may override it.
+            return False, f"engine strategy_id={engine_id} belongs to another strategy"
+
+        if owner_tag is not None:
+            if owner_tag == identity:
+                return True, f"{TAG_OWNER}{owner_tag} matches this strategy"
+            return False, f"{TAG_OWNER}{owner_tag} belongs to another strategy"
+
+        role = tag_value(getattr(order, "tags", None), TAG_EXEC_ROLE)
+        if role is not None:
+            # Purpose without provenance: a legacy order from before owner tagging,
+            # or someone else's order using the same vocabulary. Not ours to cancel.
+            return False, (
+                f"only {TAG_EXEC_ROLE}{role} present — purpose is not ownership, "
+                f"no {TAG_OWNER} tag and no engine strategy_id"
+            )
+        return False, "no engine strategy_id, no owner tag, unknown client order id"
+
+    def _owns_order(self, order) -> bool:
+        return self._ownership(order)[0]
 
     def _resting_entry_orders(self) -> list:
         """Open, non-reduce-only LIMIT orders on this instrument."""
@@ -949,10 +999,11 @@ class TrendStrategy(Strategy):
         return out
 
     def _unowned_resting_entry(self):
-        """First resting entry limit we cannot prove we own, if any."""
+        """First resting entry limit we cannot prove we own, as (coid, why)."""
         for order in self._resting_entry_orders():
-            if not self._owns_order(order):
-                return getattr(order, "client_order_id", "<unknown>")
+            owned, why = self._ownership(order)
+            if not owned:
+                return getattr(order, "client_order_id", "<unknown>"), why
         return None
 
     def _adopt_owned_orphans(self) -> None:
@@ -968,11 +1019,14 @@ class TrendStrategy(Strategy):
             tracked.add(self._patient.client_order_id)
         for order in self._resting_entry_orders():
             coid = getattr(order, "client_order_id", None)
-            if coid in tracked or not self._owns_order(order):
+            if coid in tracked:
                 continue
+            owned, why = self._ownership(order)
+            if not owned:
+                continue  # handled by `_unowned_resting_entry`: block, never cancel
             self.log.warning(
                 f"adopting untracked owned entry limit {coid} on {self.instrument_id} "
-                f"(left by a previous run) — retiring it before any new entry"
+                f"({why}) — retiring it before any new entry"
             )
             self._owned_coids.add(coid)
             orphan = PatientOrder(
@@ -997,18 +1051,32 @@ class TrendStrategy(Strategy):
     def _settle_timer_name(self) -> str:
         return f"patient_settle_{self.instrument_id.symbol.value}"
 
-    def _cancel_retry_timer_name(self) -> str:
-        return f"patient_cancel_retry_{self.instrument_id.symbol.value}"
+    def _watch_timer_name(self, client_order_id) -> str:
+        # One watchdog PER retiring order, so several retiring orders can never
+        # cancel one another's timer or leave one unmonitored.
+        return f"patient_watch_{self.instrument_id.symbol.value}_{client_order_id}"
 
-    def _set_timer(self, name: str, seconds: float, callback) -> None:
+    def _set_timer(self, name: str, seconds: float, callback) -> bool:
+        """Schedule a timer. Returns False (loudly) if scheduling failed.
+
+        A failure is never swallowed: the caller must keep new exposure blocked
+        and rely on the periodic control timer to recover.
+        """
         with contextlib.suppress(Exception):
             self.clock.cancel_timer(name)
-        with contextlib.suppress(Exception):
+        try:
             self.clock.set_timer(
                 name=name,
                 interval=timedelta(seconds=max(0.001, float(seconds))),
                 callback=callback,
             )
+        except Exception as exc:  # noqa: BLE001
+            self.log.error(
+                f"FAILED to schedule timer {name} ({seconds:.3f}s): {exc!r} — "
+                f"new exposure stays blocked; recovery falls back to the control timer"
+            )
+            return False
+        return True
 
     def _kill_timer(self, name: str) -> None:
         with contextlib.suppress(Exception):
@@ -1027,12 +1095,133 @@ class TrendStrategy(Strategy):
         self._kill_timer(self._patient_timer_name())
 
     def _clear_all_patient_timers(self) -> None:
-        for name in (
-            self._patient_timer_name(),
-            self._settle_timer_name(),
-            self._cancel_retry_timer_name(),
-        ):
+        for name in (self._patient_timer_name(), self._settle_timer_name()):
             self._kill_timer(name)
+        for coid in list(self._retiring):
+            self._kill_timer(self._watch_timer_name(coid))
+            self._retiring[coid].watchdog_armed = False
+
+    # --- watchdogs: every nonterminal state must have a future action -------
+    def _watch_delay(self, patient: PatientOrder) -> float:
+        """Bounded exponential backoff shared by cancel-confirmation and retry."""
+        return min(
+            PATIENT_CANCEL_RETRY_BASE_SECS * (2 ** max(0, patient.cancel_attempts - 1)),
+            PATIENT_CANCEL_RETRY_MAX_SECS,
+        )
+
+    def _arm_watchdog(self, patient: PatientOrder, why: str) -> None:
+        """Arm this order's own watchdog. Called after EVERY cancel request —
+        including locally successful ones, whose terminal callback may never
+        arrive — so a retirement can never sit unmonitored."""
+        coid = patient.client_order_id
+        delay = self._watch_delay(patient)
+        armed = self._set_timer(
+            self._watch_timer_name(coid),
+            delay,
+            lambda event=None, _coid=coid: self._on_cancel_watchdog(_coid),
+        )
+        patient.watchdog_armed = armed
+        patient.timer_failed = not armed
+        if not armed:
+            patient.fallback_pending = False
+            patient.fallback_forbidden = True
+            self.log.error(
+                f"patient watchdog NOT armed {patient.symbol} coid={coid} state="
+                f"{patient.state} why={why} — fallback and replacement stay blocked"
+            )
+
+    def _on_cancel_watchdog(self, client_order_id) -> None:
+        """The venue never confirmed our cancel. Re-read state and act."""
+        self._kill_timer(self._watch_timer_name(client_order_id))
+        patient = self._retiring.get(client_order_id)
+        if patient is None:
+            return
+        patient.watchdog_armed = False
+        patient.watchdog_expiries += 1
+        order = self._orders_by_coid.get(client_order_id)
+        closed = self._order_is_closed(order, client_order_id)
+        self.log.warning(
+            f"patient cancel watchdog expired {patient.symbol} coid={client_order_id} "
+            f"state={patient.state} attempt={patient.cancel_attempts} "
+            f"expiries={patient.watchdog_expiries} closed={closed}"
+        )
+        if closed is True:
+            # A terminal callback was missed; the order really is gone.
+            self._begin_settling(client_order_id, "watchdog_found_closed")
+            return
+        # Still open (or unprovable): retry the cancel, never add exposure.
+        if order is not None:
+            self._request_cancel(patient, order, reason="watchdog_retry")
+        else:
+            self.log.error(
+                f"patient cancel watchdog {patient.symbol} coid={client_order_id}: no "
+                f"order object to retry with — keeping watch, exposure stays blocked"
+            )
+            self._arm_watchdog(patient, "no_order_object")
+
+    def _order_is_closed(self, order, client_order_id):
+        """True / False / None when neither can be proven (keep watching)."""
+        if order is None:
+            with contextlib.suppress(Exception):
+                order = self.cache.order(client_order_id)
+        if order is not None:
+            return bool(getattr(order, "is_closed", False))
+        try:
+            open_ids = {
+                getattr(o, "client_order_id", None)
+                for o in self.cache.orders_open(instrument_id=self.instrument_id)
+            }
+        except Exception:  # noqa: BLE001
+            return None
+        return client_order_id not in open_ids
+
+    def _unmonitored_states(self) -> list[tuple[str, str]]:
+        """Every tracked order with no future action armed. Must stay empty."""
+        stale: list[tuple[str, str]] = []
+        patient = self._patient
+        if patient is not None and not self._timer_armed(self._patient_timer_name()):
+            stale.append((str(patient.client_order_id), patient.state))
+        settling_armed = self._timer_armed(self._settle_timer_name())
+        for coid, retiring in self._retiring.items():
+            if retiring.state == STATE_TERMINAL:
+                continue
+            armed = self._timer_armed(self._watch_timer_name(coid))
+            if retiring.state == STATE_SETTLING:
+                armed = armed or settling_armed
+            if not armed:
+                stale.append((str(coid), retiring.state))
+        return stale
+
+    def _timer_armed(self, name: str) -> bool:
+        with contextlib.suppress(Exception):
+            return name in set(self.clock.timer_names)
+        return False
+
+    def _recover_unmonitored(self) -> None:
+        """Safety net driven by the existing 60s control timer.
+
+        If a timer failed to schedule (or was lost), re-arm it; when re-arming
+        still fails, perform the watchdog check inline. Bounded by the control
+        timer's own cadence, so it can never become a tight retry loop.
+        """
+        for coid, state in self._unmonitored_states():
+            if self._patient is not None and str(self._patient.client_order_id) == coid:
+                self.log.warning(
+                    f"re-arming lost patient timeout {self._patient.symbol} coid={coid}"
+                )
+                self._set_patient_timer()
+                continue
+            patient = self._retiring.get(coid) or next(
+                (p for k, p in self._retiring.items() if str(k) == coid), None
+            )
+            if patient is None:
+                continue
+            self.log.warning(
+                f"re-arming lost patient watchdog {patient.symbol} coid={coid} state={state}"
+            )
+            self._arm_watchdog(patient, "recovery")
+            if not patient.watchdog_armed:
+                self._on_cancel_watchdog(patient.client_order_id)
 
     # --- cancellation -------------------------------------------------------
     def _request_cancel(self, patient: PatientOrder, order, *, reason: str) -> bool:
@@ -1052,41 +1241,22 @@ class TrendStrategy(Strategy):
                 f"reason={reason} attempt={patient.cancel_attempts}: {exc!r} — "
                 f"fallback forbidden, retrying on a timer"
             )
-            self._schedule_cancel_retry()
+            self._arm_watchdog(patient, "cancel_raised")
             return False
-        self.log.info(
+        level = (
+            self.log.info
+            if patient.cancel_attempts <= PATIENT_MAX_CANCEL_ATTEMPTS
+            else self.log.error
+        )
+        level(
             f"patient cancel requested {patient.symbol} coid={patient.client_order_id} "
             f"reason={reason} attempt={patient.cancel_attempts} "
             f"fallback_pending={patient.fallback_pending}"
         )
+        # A locally accepted cancel is NOT a confirmation: its terminal callback can
+        # be delayed or lost, so arm the confirmation watchdog either way.
+        self._arm_watchdog(patient, f"cancel_requested:{reason}")
         return True
-
-    def _schedule_cancel_retry(self) -> None:
-        """Bounded exponential backoff. The state always carries a live timer, so a
-        failed cancel can never leave the strategy stuck and untimed."""
-        attempts = max((p.cancel_attempts for p in self._retiring.values()), default=1)
-        delay = min(
-            PATIENT_CANCEL_RETRY_BASE_SECS * (2 ** max(0, attempts - 1)),
-            PATIENT_CANCEL_RETRY_MAX_SECS,
-        )
-        self._set_timer(self._cancel_retry_timer_name(), delay, self._on_cancel_retry)
-
-    def _on_cancel_retry(self, event=None) -> None:
-        self._kill_timer(self._cancel_retry_timer_name())
-        pending = [p for p in self._retiring.values() if p.state == STATE_CANCEL_RETRY]
-        if not pending:
-            return
-        for patient in pending:
-            order = self._orders_by_coid.get(patient.client_order_id)
-            if order is None or getattr(order, "is_closed", False):
-                self._begin_settling(patient.client_order_id, "closed_before_retry")
-                continue
-            level = self.log.warning if patient.cancel_attempts < PATIENT_MAX_CANCEL_ATTEMPTS else self.log.error
-            level(
-                f"patient cancel retry {patient.symbol} coid={patient.client_order_id} "
-                f"attempt={patient.cancel_attempts + 1}"
-            )
-            self._request_cancel(patient, order, reason="cancel_retry")
 
     def _retire_patient(self, reason: str, *, forbid_fallback: bool) -> None:
         """Move the active order into the retirement registry and ask to cancel it.
@@ -1134,15 +1304,26 @@ class TrendStrategy(Strategy):
             self._patient_order = None
             self._cancel_patient_timer()
             self._retiring[patient.client_order_id] = patient
-        if not patient.begin_settling(reason):
-            return  # duplicate / out-of-order terminal callback
-        self.log.info(
-            f"patient settling {patient.symbol} coid={patient.client_order_id} "
-            f"reason={reason} filled={patient.filled_units:.8f}/"
-            f"{patient.submitted_units:.8f} — deferring resolution {PATIENT_SETTLE_SECS}s "
-            f"for late fills"
-        )
-        self._set_timer(self._settle_timer_name(), PATIENT_SETTLE_SECS, self._on_settled)
+        if patient.state == STATE_TERMINAL:
+            return  # already resolved; a duplicate callback changes nothing
+        if patient.begin_settling(reason):
+            self.log.info(
+                f"patient settling {patient.symbol} coid={patient.client_order_id} "
+                f"reason={reason} filled={patient.filled_units:.8f}/"
+                f"{patient.submitted_units:.8f} — deferring resolution "
+                f"{PATIENT_SETTLE_SECS}s for late fills"
+            )
+        # Re-arm unconditionally while SETTLING: a repeat confirmation (e.g. the
+        # watchdog re-checking after `_on_settled` found the order still open)
+        # must not leave the order stranded with a consumed settle timer.
+        self._kill_timer(self._watch_timer_name(patient.client_order_id))
+        patient.watchdog_armed = False
+        if not self._set_timer(self._settle_timer_name(), PATIENT_SETTLE_SECS, self._on_settled):
+            # Cannot schedule the settle timer: keep the order watched instead, so
+            # it still has a future action, and never resolve on a missing timer.
+            patient.fallback_forbidden = True
+            patient.fallback_pending = False
+            self._arm_watchdog(patient, "settle_timer_failed")
 
     def _on_settled(self, event=None) -> None:
         """Settling window elapsed: re-read authoritative state, then decide once."""
@@ -1151,20 +1332,28 @@ class TrendStrategy(Strategy):
             return
         still_open = []
         for coid, patient in list(self._retiring.items()):
-            order = self._orders_by_coid.get(coid)
-            if order is not None and not getattr(order, "is_closed", False):
+            closed = self._order_is_closed(self._orders_by_coid.get(coid), coid)
+            if closed is not True:
                 still_open.append(coid)
+                # Reported terminal but the venue still shows it live (or we cannot
+                # prove otherwise): keep it watched rather than resolving on faith.
+                self._arm_watchdog(patient, "settle_found_still_open")
                 continue
             if patient.state == STATE_SETTLING:
                 patient.mark_terminal("settled", now_ns=self._now_ns())
         if still_open:
-            self.log.info(
+            self.log.warning(
                 f"patient settle waiting {self.instrument_id.symbol.value}: "
-                f"{len(still_open)} order(s) not closed yet ({self._retiring_summary()})"
+                f"{len(still_open)} order(s) not closed yet ({self._retiring_summary()}) "
+                f"— watchdogs re-armed, no fallback or replacement"
             )
             return
         if any(p.is_retiring for p in self._retiring.values()):
-            return  # something is still cancel-pending / retrying: nothing to resolve
+            # Still cancel-pending / retrying: guarantee each keeps a future action.
+            for patient in self._retiring.values():
+                if patient.is_retiring and not patient.watchdog_armed:
+                    self._arm_watchdog(patient, "settle_incomplete")
+            return
 
         retired = list(self._retiring.values())
         self._retiring.clear()
@@ -1184,6 +1373,8 @@ class TrendStrategy(Strategy):
         """Retain a bounded tombstone so a very late fill is still attributable."""
         self._tombstones[patient.client_order_id] = patient
         self._orders_by_coid.pop(patient.client_order_id, None)
+        self._kill_timer(self._watch_timer_name(patient.client_order_id))
+        patient.watchdog_armed = False
         now_ns = self._now_ns()
         for coid, old in list(self._tombstones.items()):
             expired = old.settled_ts_ns and (now_ns - old.settled_ts_ns) > (
@@ -1220,10 +1411,12 @@ class TrendStrategy(Strategy):
             return
         blocker = self._unowned_resting_entry()
         if blocker is not None:
+            coid, why = blocker
             self.log.error(
                 f"patient replacement blocked {self.instrument_id.symbol.value}: "
-                f"reason={SKIP_UNOWNED_RESTING_ORDER} order={blocker}"
+                f"reason={SKIP_UNOWNED_RESTING_ORDER} order={coid} ({why})"
             )
+            self._park_deferred(deferred)
             return
 
         current_units = float(self.portfolio.net_position(self.instrument_id))

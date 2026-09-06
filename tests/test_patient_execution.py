@@ -27,7 +27,9 @@ from kronos_mt5.execution import (
     SKIP_UNOWNED_RESTING_ORDER,
     STATE_CANCEL_PENDING,
     STATE_CANCEL_RETRY,
+    STATE_SETTLING,
     STATE_WORKING,
+    TAG_DECISION_TS,
     PatientOrder,
     adverse_drift_bps,
     classify_exec_role,
@@ -36,12 +38,17 @@ from kronos_mt5.execution import (
     implementation_shortfall_quote,
     liquidity_label,
     tag_float,
+    tag_int,
 )
 from kronos_mt5.strategies.trend_strategy import TrendStrategy
 
 # --------------------------------------------------------------------------
 # doubles
 # --------------------------------------------------------------------------
+
+
+STRATEGY_ID = "TrendStrategy-TEST"  # what the engine reports for our own orders
+OWNER_TAG = "OWNER_STRATEGY=TrendStrategy:BTCUSDT-PERP.BINANCE"  # stable identity
 
 
 class _Num(float):
@@ -92,7 +99,7 @@ class _FakeOrder:
         self.order_type = SimpleNamespace(
             name={"limit": "LIMIT", "market": "MARKET"}.get(kind, "OTHER")
         )
-        self.strategy_id = "TrendStrategy-TEST"
+        self.strategy_id = STRATEGY_ID
 
 
 class _FakeFactory:
@@ -131,6 +138,10 @@ class _FakeClock:
 
     def cancel_timer(self, name):
         self.timers.pop(name, None)
+
+    @property
+    def timer_names(self):
+        return list(self.timers)
 
     def fire(self, prefix: str) -> bool:
         """Fire the single timer whose name starts with `prefix` (like the engine
@@ -209,6 +220,7 @@ def _patient_strat(
     monkeypatch.setattr(
         TrendStrategy, "instrument_id", property(lambda self: _FakeInstrumentId()), raising=False
     )
+    monkeypatch.setattr(TrendStrategy, "id", property(lambda self: STRATEGY_ID), raising=False)
 
     clock_now = s._fake_clock.now_ns
     s.risk_state = SimpleNamespace(
@@ -305,6 +317,15 @@ def _external_limit(coid: str = "manual-1") -> _FakeOrder:
     order = _FakeOrder("limit", {}, coid)
     order.tags = None
     order.strategy_id = "SomeoneElse-001"
+    return order
+
+
+def _reconciled_own_limit(coid: str = "orphan-1", qty: float = 3.0) -> _FakeOrder:
+    """Our own limit as it comes back after a restart: the engine no longer
+    reports a strategy id, so only the stable OWNER_STRATEGY tag identifies it."""
+    order = _FakeOrder("limit", {"quantity": qty}, coid)
+    order.tags = [f"EXEC_ROLE={ROLE_PATIENT_LIMIT}", OWNER_TAG]
+    order.strategy_id = None
     return order
 
 
@@ -575,8 +596,7 @@ def test_replacement_below_the_rebalance_threshold_is_not_submitted(monkeypatch)
 def test_owned_restart_orphan_blocks_the_new_entry_until_terminal(monkeypatch):
     """6. An owned limit left by a previous run is retired, not raced."""
     s = _patient_strat(monkeypatch)
-    orphan = _FakeOrder("limit", {"quantity": 3.0}, "orphan-from-previous-run")
-    orphan.tags = [f"EXEC_ROLE={ROLE_PATIENT_LIMIT}"]  # our own tag vocabulary
+    orphan = _reconciled_own_limit("orphan-from-previous-run")
     s._fake_cache.orders_open = lambda instrument_id=None: [orphan]
 
     _submit_patient(s, units=10.0)
@@ -596,8 +616,7 @@ def test_owned_restart_orphan_blocks_the_new_entry_until_terminal(monkeypatch):
 
 def test_orphan_late_fill_reduces_the_deferred_entry(monkeypatch):
     s = _patient_strat(monkeypatch)
-    orphan = _FakeOrder("limit", {"quantity": 3.0}, "orphan-1")
-    orphan.tags = [f"EXEC_ROLE={ROLE_PATIENT_LIMIT}"]
+    orphan = _reconciled_own_limit("orphan-1")
     s._fake_cache.orders_open = lambda instrument_id=None: [orphan]
     _submit_patient(s, units=10.0)
 
@@ -637,20 +656,118 @@ def test_unknown_external_limit_blocks_the_new_entry(monkeypatch):
     assert len(s.submitted) == 1
 
 
-def test_ownership_is_proven_by_client_order_id_and_strategy_id(monkeypatch):
+def test_matching_engine_strategy_id_proves_ownership(monkeypatch):
     s = _patient_strat(monkeypatch)
-    ours_by_coid = _FakeOrder("limit", {}, "c-1")
-    ours_by_coid.tags = None
-    ours_by_coid.strategy_id = "SomeoneElse-001"
-    s._owned_coids.add("c-1")
-    assert s._owns_order(ours_by_coid) is True
+    order = _FakeOrder("limit", {}, "c-1")
+    order.tags = None
+    order.strategy_id = STRATEGY_ID
 
-    ours_by_tag = _FakeOrder("limit", {}, "c-2")
-    ours_by_tag.tags = [f"EXEC_ROLE={ROLE_PATIENT_LIMIT}"]
-    ours_by_tag.strategy_id = "SomeoneElse-001"
-    assert s._owns_order(ours_by_tag) is True
+    owned, why = s._ownership(order)
+    assert owned is True and "strategy_id" in why
 
-    assert s._owns_order(_external_limit("c-3")) is False
+
+def test_mismatching_strategy_id_is_foreign_even_with_an_exec_role_tag(monkeypatch):
+    """A purpose tag must never override an explicit foreign owner."""
+    s = _patient_strat(monkeypatch)
+    order = _FakeOrder("limit", {}, "c-2")
+    order.tags = [f"EXEC_ROLE={ROLE_PATIENT_LIMIT}", OWNER_TAG]
+    order.strategy_id = "SomeoneElse-001"
+
+    owned, why = s._ownership(order)
+    assert owned is False
+    assert "another strategy" in why
+
+
+def test_owner_tag_proves_ownership_when_the_engine_reports_no_strategy_id(monkeypatch):
+    """The restart-reconciliation path: stable identity, deterministic."""
+    s = _patient_strat(monkeypatch)
+    order = _reconciled_own_limit("c-3")
+
+    owned, why = s._ownership(order)
+    assert owned is True and "OWNER_STRATEGY=" in why
+
+
+def test_mismatching_owner_tag_is_foreign(monkeypatch):
+    s = _patient_strat(monkeypatch)
+    order = _FakeOrder("limit", {}, "c-4")
+    order.tags = ["OWNER_STRATEGY=TrendStrategy:ETHUSDT-PERP.BINANCE"]
+    order.strategy_id = None
+
+    owned, why = s._ownership(order)
+    assert owned is False and "another strategy" in why
+
+
+def test_exec_role_alone_cannot_prove_ownership(monkeypatch):
+    """EXEC_ROLE describes purpose, not provenance."""
+    s = _patient_strat(monkeypatch)
+    order = _FakeOrder("limit", {}, "c-5")
+    order.tags = [f"EXEC_ROLE={ROLE_PATIENT_LIMIT}"]  # no owner tag, no strategy id
+    order.strategy_id = None
+
+    owned, why = s._ownership(order)
+    assert owned is False
+    assert "purpose is not ownership" in why
+
+
+def test_client_order_id_from_this_process_proves_ownership(monkeypatch):
+    s = _patient_strat(monkeypatch)
+    order = _FakeOrder("limit", {}, "c-6")
+    order.tags = None
+    order.strategy_id = None
+    s._owned_coids.add("c-6")
+
+    assert s._owns_order(order) is True
+
+
+def test_manual_and_other_strategy_orders_are_never_cancelled(monkeypatch):
+    s = _patient_strat(monkeypatch)
+    manual = _FakeOrder("limit", {}, "manual-order")
+    manual.tags = None
+    manual.strategy_id = None
+    other = _external_limit("other-strategy-order")
+    tagged_but_foreign = _FakeOrder("limit", {}, "foreign-tagged")
+    tagged_but_foreign.tags = [f"EXEC_ROLE={ROLE_PATIENT_LIMIT}"]
+    tagged_but_foreign.strategy_id = "SomeoneElse-001"
+    s._fake_cache.orders_open = lambda instrument_id=None: [manual, other, tagged_but_foreign]
+
+    _submit_patient(s, units=10.0)
+
+    assert s.canceled == []
+    assert s.submitted == []
+
+
+def test_our_own_orders_carry_a_stable_owner_tag(monkeypatch):
+    """The tag must be deterministic across restarts — no per-process value."""
+    s = _patient_strat(monkeypatch)
+    order = _submit_patient(s, units=10.0)
+
+    assert OWNER_TAG in order.kwargs["tags"]
+    assert s._strategy_identity() == "TrendStrategy:BTCUSDT-PERP.BINANCE"
+    # a second, independent instance derives the identical identity
+    other = _patient_strat(monkeypatch)
+    assert other._strategy_identity() == s._strategy_identity()
+
+
+def test_a_correctly_tagged_order_survives_restart_and_is_adopted(monkeypatch):
+    """Simulates a restart: fresh strategy, no _owned_coids, engine reports no
+    strategy id — the owner tag alone must allow safe adoption."""
+    first = _patient_strat(monkeypatch)
+    submitted = _submit_patient(first, units=10.0)
+    tags = list(submitted.kwargs["tags"])
+
+    restarted = _patient_strat(monkeypatch)  # new process: nothing remembered
+    assert restarted._owned_coids == set()
+    reconciled = _FakeOrder("limit", {"quantity": 10.0}, submitted.client_order_id)
+    reconciled.tags = tags
+    reconciled.strategy_id = None
+    restarted._fake_cache.orders_open = lambda instrument_id=None: [reconciled]
+
+    owned, why = restarted._ownership(reconciled)
+    assert owned is True and "OWNER_STRATEGY=" in why
+
+    _submit_patient(restarted, units=10.0)
+    assert restarted.canceled == [reconciled]  # adopted and retired, not raced
+    assert restarted.submitted == []  # and it blocks the new entry until terminal
 
 
 # --------------------------------------------------------------------------
@@ -773,11 +890,11 @@ def test_synchronous_cancel_exception_is_logged_retried_and_blocks_fallback(monk
     assert "patient cancel FAILED" in log
     assert order.client_order_id in log
     assert retiring.symbol in log
-    assert s._fake_clock.armed("patient_cancel_retry_")  # never stuck without a timer
+    assert s._fake_clock.armed("patient_watch_")  # never stuck without a timer
 
     # the retry eventually succeeds, and still no fallback is taken
     s.cancel_raises = False
-    assert s._fake_clock.fire("patient_cancel_retry_") is True
+    assert s._fake_clock.fire("patient_watch_") is True
     assert s.canceled == [order]
     _confirm_cancel(s, order)
     _settle(s)
@@ -791,12 +908,12 @@ def test_cancel_retry_backoff_is_bounded_and_always_rearmed(monkeypatch):
     s._on_patient_timeout()
 
     for _ in range(8):
-        assert s._fake_clock.armed("patient_cancel_retry_")
-        s._fake_clock.fire("patient_cancel_retry_")
+        assert s._fake_clock.armed("patient_watch_")
+        s._fake_clock.fire("patient_watch_")
 
     (retiring,) = s._retiring.values()
     assert retiring.state == STATE_CANCEL_RETRY
-    assert s._fake_clock.armed("patient_cancel_retry_")  # still timed, never stuck
+    assert s._fake_clock.armed("patient_watch_")  # still timed, never stuck
     assert _markets(s) == []
 
 
@@ -814,9 +931,9 @@ def test_cancel_rejection_keeps_fallback_and_replacement_blocked(monkeypatch):
     assert retiring.state == STATE_CANCEL_RETRY
     assert retiring.fallback_forbidden is True
     assert _markets(s) == []
-    assert s._fake_clock.armed("patient_cancel_retry_")
+    assert s._fake_clock.armed("patient_watch_")
 
-    s._fake_clock.fire("patient_cancel_retry_")
+    s._fake_clock.fire("patient_watch_")
     _confirm_cancel(s, order)
     _settle(s)
     assert _markets(s) == []  # still never falls back
@@ -832,6 +949,194 @@ def test_cancel_failure_blocks_a_deferred_replacement_too(monkeypatch):
     assert s._deferred is not None
     _settle(s)
     assert len(s.submitted) == 1  # replacement stays blocked
+
+
+# --------------------------------------------------------------------------
+# watchdogs: no nonterminal state without a future action
+# --------------------------------------------------------------------------
+
+
+def _watchdog(s: TrendStrategy) -> bool:
+    return s._fake_clock.fire("patient_watch_")
+
+
+def test_accepted_cancel_with_no_terminal_callback_is_checked_again(monkeypatch):
+    """1. cancel_order() succeeded locally but the venue never called back."""
+    s = _patient_strat(monkeypatch)
+    order = _submit_patient(s, units=10.0)
+
+    s._on_patient_timeout()
+
+    assert s.canceled == [order]
+    assert s._fake_clock.armed("patient_watch_")  # armed even though nothing failed
+    assert s._unmonitored_states() == []
+
+    _watchdog(s)  # ... and the watchdog actually re-checks
+
+    log = s._fake_log.text()
+    assert "patient cancel watchdog expired" in log
+    assert order.client_order_id in log
+
+
+def test_watchdog_retries_cancel_while_the_order_is_still_open(monkeypatch):
+    """2. Still open ⇒ retry the cancel, never fall back or replace."""
+    s = _patient_strat(monkeypatch)
+    order = _submit_patient(s, units=10.0)
+    s._on_patient_timeout()
+
+    for expected in (2, 3, 4):
+        _watchdog(s)
+        assert s.canceled == [order] * expected  # the same order, retried
+        assert _markets(s) == []
+        assert len(s.submitted) == 1
+        assert s._unmonitored_states() == []
+
+    (retiring,) = s._retiring.values()
+    assert retiring.watchdog_expiries == 3
+    assert retiring.state == STATE_CANCEL_PENDING
+
+
+def test_watchdog_finds_the_order_closed_and_enters_settling(monkeypatch):
+    """3. A missed terminal callback still resolves, via settling."""
+    s = _patient_strat(monkeypatch)
+    order = _submit_patient(s, units=10.0)
+    s._on_patient_timeout()
+
+    order.is_closed = True  # the venue closed it; we simply never heard
+    _watchdog(s)
+
+    (retiring,) = s._retiring.values()
+    assert retiring.state == STATE_SETTLING
+    assert "watchdog_found_closed" in s._fake_log.text()
+    assert _markets(s) == []  # still nothing until settling completes
+
+    _settle(s)
+    assert len(_markets(s)) == 1
+
+
+def test_on_settled_rearms_when_an_order_is_still_open(monkeypatch):
+    """4. A terminal callback that disagrees with the order state must not
+    resolve — it must re-arm and keep blocking."""
+    s = _patient_strat(monkeypatch)
+    order = _submit_patient(s, units=10.0)
+    s._on_patient_timeout()
+    # cancel callback arrives, but the order still reports open
+    s.on_order_canceled(SimpleNamespace(client_order_id=order.client_order_id))
+
+    _settle(s)
+
+    assert _markets(s) == []
+    assert s._retiring  # not resolved
+    assert s._fake_clock.armed("patient_watch_")  # re-armed before returning
+    assert s._unmonitored_states() == []
+    assert "settle waiting" in s._fake_log.text()
+
+    order.is_closed = True
+    _watchdog(s)
+    _settle(s)
+    assert len(_markets(s)) == 1
+
+
+def test_multiple_retiring_orders_each_keep_their_own_watchdog(monkeypatch):
+    """5. Per-order timers: one retirement must not unmonitor another."""
+    s = _patient_strat(monkeypatch)
+    first = _submit_patient(s, units=10.0)
+    _submit_patient(s, units=12.0)  # supersede -> first retires
+
+    # the venue closes the first, and a second owned orphan appears
+    orphan = _reconciled_own_limit("orphan-2", qty=1.0)
+    s._fake_cache.orders_open = lambda instrument_id=None: [orphan]
+    s._submit_entry_order(_side("BUY"), s.instrument.make_qty(12.0), 100.0, target_units=12.0)
+
+    assert len(s._retiring) == 2
+    names = [n for n in s._fake_clock.timers if n.startswith("patient_watch_")]
+    assert len(names) == 2  # one per order, not one shared
+    assert str(first.client_order_id) in " ".join(names)
+    assert "orphan-2" in " ".join(names)
+    assert s._unmonitored_states() == []
+
+    # resolving one leaves the other monitored
+    first.is_closed = True
+    s.on_order_canceled(SimpleNamespace(client_order_id=first.client_order_id))
+    _settle(s)
+    assert s._unmonitored_states() == []
+    assert _markets(s) == []
+    assert len(s._retiring) == 2  # the orphan still holds the field
+
+
+def test_timer_scheduling_failure_is_visible_and_blocks_new_exposure(monkeypatch):
+    """6. A failed schedule must never be silently treated as 'always timed'."""
+    s = _patient_strat(monkeypatch)
+    order = _submit_patient(s, units=10.0)
+
+    def _boom(name, interval, callback):
+        raise RuntimeError("clock refused the timer")
+
+    s._fake_clock.set_timer = _boom
+    s._on_patient_timeout()
+
+    (retiring,) = s._retiring.values()
+    assert retiring.timer_failed is True
+    assert retiring.watchdog_armed is False
+    assert retiring.fallback_forbidden is True
+    assert retiring.fallback_pending is False
+    log = s._fake_log.text()
+    assert "FAILED to schedule timer" in log
+    assert "watchdog NOT armed" in log
+    assert _markets(s) == []
+
+    # the periodic control timer is the recovery path — it must not tight-loop
+    s._fake_clock.set_timer = _FakeClock.set_timer.__get__(s._fake_clock)
+    order.is_closed = True
+    s._on_control_timer(None)
+    assert "re-arming lost patient watchdog" in s._fake_log.text()
+    assert s._unmonitored_states() == []
+
+
+def test_control_timer_recovery_acts_inline_when_rearming_also_fails(monkeypatch):
+    s = _patient_strat(monkeypatch)
+    order = _submit_patient(s, units=10.0)
+
+    def _boom(name, interval, callback):
+        raise RuntimeError("clock refused the timer")
+
+    s._fake_clock.set_timer = _boom
+    s._on_patient_timeout()
+    order.is_closed = True
+
+    s._on_control_timer(None)  # re-arm fails -> run the watchdog check inline
+
+    (retiring,) = s._retiring.values()
+    assert retiring.state == STATE_SETTLING  # progress was still made
+    assert _markets(s) == []  # and never any new exposure
+
+
+@pytest.mark.parametrize(
+    "arrange",
+    [
+        pytest.param(lambda s, o: None, id="WORKING"),
+        pytest.param(lambda s, o: s._on_patient_timeout(), id="CANCEL_PENDING"),
+        pytest.param(
+            lambda s, o: (setattr(s, "cancel_raises", True), s._on_patient_timeout()),
+            id="CANCEL_RETRY",
+        ),
+        pytest.param(
+            lambda s, o: (
+                s._on_patient_timeout(),
+                setattr(o, "is_closed", True),
+                s.on_order_canceled(SimpleNamespace(client_order_id=o.client_order_id)),
+            ),
+            id="SETTLING",
+        ),
+    ],
+)
+def test_no_nonterminal_state_is_left_without_a_future_action(monkeypatch, arrange):
+    """7. WORKING, CANCEL_PENDING, CANCEL_RETRY and SETTLING all stay monitored."""
+    s = _patient_strat(monkeypatch)
+    arrange(s, _submit_patient(s, units=10.0))
+
+    assert s._unmonitored_states() == []
+    assert s._fake_clock.timers  # something is always scheduled
 
 
 # --------------------------------------------------------------------------
@@ -1083,6 +1388,35 @@ def test_implementation_shortfall_signs_for_buy_and_sell():
     # SELL filled above it is price improvement
     assert implementation_shortfall_bps("SELL", 100.0, 100.2) == pytest.approx(-19.96, rel=1e-3)
     assert implementation_shortfall_quote("SELL", 100.0, 100.2, 5.0) == pytest.approx(-1.0)
+
+
+def test_tag_int_round_trips_epoch_nanoseconds_exactly():
+    """Epoch nanoseconds (~1.8e18) are far past a float's 53-bit integer range,
+    so parsing must never route through float."""
+    for ns in (
+        1_757_112_345_678_901_234,
+        1_700_000_000_123_456_789,
+        2**62 + 12345,
+    ):
+        assert tag_int([f"{TAG_DECISION_TS}{ns}"], TAG_DECISION_TS) == ns
+        assert int(float(str(ns))) != ns  # the old float path really did lose digits
+
+    assert tag_int(["DEC_TS=-42"], "DEC_TS=") == -42
+    assert tag_int(["DEC_TS= 1234 "], "DEC_TS=") == 1234
+    assert tag_int(["DEC_TS=42.0"], "DEC_TS=") == 42  # small legacy float form
+    assert tag_int(["DEC_TS=4.5"], "DEC_TS=") is None  # not an integer
+    assert tag_int(["DEC_TS=1.7e18"], "DEC_TS=") is None  # float cannot be exact here
+    assert tag_int(["DEC_TS=nope"], "DEC_TS=") is None
+    assert tag_int(None, "DEC_TS=") is None
+
+
+def test_decision_timestamp_survives_the_tag_round_trip(monkeypatch):
+    """The strategy writes DEC_TS and the recorder reads it back, bit for bit."""
+    s = _patient_strat(monkeypatch)
+    s._fake_clock.now_ns = 1_757_112_345_678_901_234
+    order = _submit_patient(s, units=10.0)
+
+    assert tag_int(order.kwargs["tags"], TAG_DECISION_TS) == 1_757_112_345_678_901_234
 
 
 def test_liquidity_and_role_classification_of_untagged_orders():
