@@ -129,6 +129,13 @@ vectorized test did not improve Sharpe, so the bot does not enable it by default
   It never writes to its input. It deliberately refuses to score shadow models
   without OHLCV (`NOT_EVALUABLE`) and states plainly that testnet results are not
   evidence of live profitability. See [docs/performance_audit.md](docs/performance_audit.md).
+- **Historical research baseline** — resumable checksummed Binance USD-M candle and
+  funding downloads, strict Parquet/manifest validation, and a fixed-parameter
+  Nautilus replay with next-open entries, explicit costs and a separately gated
+  2026 holdout. Daily-bar execution and funding-mark approximations are reported;
+  chronological replay does not prove the dates were unseen during prior research.
+  See [docs/historical_data.md](docs/historical_data.md) for download, validation,
+  baseline, reproduction and offline synthetic smoke commands.
 - **Companion** — decoupled via SQLite so neither process can crash the other:
   dashboard, attributed performance ledger (starting equity, realized/unrealized
   PnL, commissions, funding, slippage, reconciliation residual), equity curve,

@@ -26,3 +26,6 @@ companion_sanitized.db
 *.sqlite3
 kronos-performance-report/
 performance-report/
+
+# Offline historical research data and reports
+research/
