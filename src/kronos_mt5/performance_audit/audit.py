@@ -75,13 +75,14 @@ def _build_context(source: ExportSource, con: sqlite3.Connection, fill_rows: lis
     # Provenance must be PROVEN, never inferred. A bare .db carries no sanitized
     # env file, so the audit cannot tell testnet from live, one run from several,
     # or an original from a copy — and says so instead of assuming.
-    provenance_known = bool(environment) and demo_only is not None
+    source_commit = source_block.get("source_commit")
+    provenance_known = bool(environment) and demo_only is not None and bool(source_commit)
     missing_provenance = sorted(
         name
         for name, value in (
             ("binance_environment", environment),
             ("demo_only", demo_only),
-            ("source_commit", source_block.get("source_commit")),
+            ("source_commit", source_commit),
         )
         if value in (None, "")
     )

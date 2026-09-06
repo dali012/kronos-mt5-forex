@@ -85,6 +85,14 @@ def write_fill_csv(path: Path, groups: list[dict]) -> None:
             writer.writerow({key: row.get(key) for key in CSV_FILL_FIELDS})
 
 
+def _reconciliation_verdict(accounting: dict) -> str:
+    """`yes` / `NO` / `UNRELIABLE` — never a verdict built on provisional totals."""
+    within = accounting.get("reconciled_within_tolerance")
+    if within is None:
+        return "**UNRELIABLE (validity withheld)**"
+    return "yes" if within else "NO"
+
+
 def _findings_table(items: list[dict]) -> list[str]:
     if not items:
         return ["No findings.", ""]
@@ -338,10 +346,7 @@ def render_report(analysis: dict, run: dict) -> str:
         add(f"| **Explained** | {_num(accounting.get('explained_change'), 4)} |")
         add(f"| **Residual** | {_num(accounting.get('residual'), 4)} |")
         add(f"| Tolerance | {_num(accounting.get('residual_tolerance'), 4)} |")
-        add(
-            f"| Reconciled within tolerance | "
-            f"{'yes' if accounting.get('reconciled_within_tolerance') else 'NO'} |"
-        )
+        add(f"| Reconciled within tolerance | " f"{_reconciliation_verdict(accounting)} |")
         add("")
         window = accounting.get("window") or {}
         income_window = accounting.get("income_window") or {}
@@ -390,7 +395,7 @@ def render_report(analysis: dict, run: dict) -> str:
             if not accounting.get("reconciliation_reliable", True):
                 add("")
                 add(
-                    f"> **Reconciliation unreliable.** "
+                    f"> **Reconciliation UNRELIABLE — totals above are provisional.** "
                     f"{accounting.get('reconciliation_unreliable_reason')}"
                 )
             add("")

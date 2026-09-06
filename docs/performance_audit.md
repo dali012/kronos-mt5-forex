@@ -121,6 +121,12 @@ calendar day; only those feed the volatility-based ratios.
 −0.3134 %. When `elapsed_days <= 0` (a single observation, or several
 observations on one day) CAGR is `null`, never zero.
 
+**Two populations, never mixed.** `positive_days`, `negative_days`, `flat_days`
+and `hit_rate_pct` are computed over **all** observed return periods, so
+`positive + negative + flat == return_periods` and the hit rate can never exceed
+100 %. Volatility, Sharpe and Sortino use **consecutive-day returns only**. The
+output states both bases explicitly in `day_count_basis` and `ratio_basis`.
+
 **Gap-spanning returns are excluded from the ratios.** A return bridging missing
 calendar days carries multi-day variance; pooling it with true daily returns
 deflates volatility and inflates Sharpe. Such returns stay in the return series,
@@ -187,9 +193,21 @@ Exact duplicates of an `income_id` or `fill_id` are counted once. The surviving
 row is chosen by the lexicographically smallest field signature, so the result is
 identical regardless of database row order.
 
-If the same id appears with **conflicting content**, no row is silently chosen:
-`reconciliation_reliable` becomes `false`, an `ERROR` finding `PA-ACC-005` is
-raised, and the affected totals are marked untrustworthy.
+If the same id appears with **conflicting content**, one row is still selected
+deterministically so diagnostic totals can be produced — but which row is correct
+is unknown, so **reconciliation validity is withheld**:
+
+| Field | Value |
+|---|---|
+| `reconciliation_reliable` | `false` |
+| `reconciled_within_tolerance` | `null` — withheld, never `true`/`false` |
+| `reconciliation_status` | `"UNRELIABLE"` |
+| `totals_provisional` | `true` |
+
+The report renders **UNRELIABLE (validity withheld)** rather than `yes` or `NO`,
+an `ERROR` finding `PA-ACC-005` is raised prominently, and the ordinary residual
+warning (`PA-ACC-001`) is suppressed — judging a residual computed from
+provisional totals would be its own false signal.
 
 ## Incident attribution
 
@@ -225,8 +243,15 @@ Codes are stable across releases: `PA-ENV-*` (environment), `PA-STAT-*`
 ### Provenance is proven, never assumed
 
 An export archive carries the sanitized environment file and the source commit. A
-bare `.db` usually does not. When the audit cannot establish the Binance
-environment, `DEMO_ONLY`, and the source commit, it raises a prominent
+bare `.db` usually does not. Provenance counts as known only when **all three** of
+the Binance environment, `DEMO_ONLY` and the source commit are established:
+
+```python
+provenance_known = bool(environment) and demo_only is not None and bool(source_commit)
+```
+
+`provenance_known` and `missing_provenance` can therefore never contradict each
+other. Whenever any one is missing the audit raises a prominent
 `PA-ENV-002 — Trading environment provenance is unknown` and the report states
 that it cannot tell whether the database represents testnet, live trading,
 several runs mixed together, or a copy of another account.

@@ -383,8 +383,11 @@ def build_findings(analysis: dict) -> list[dict]:
                     "total": accounting["conflicting_duplicate_ids"]["total"],
                 },
                 impact=(
-                    "No row was silently chosen, so the affected totals — and the "
-                    "reconciliation residual derived from them — are unreliable."
+                    "One row per conflicting id was selected deterministically so "
+                    "diagnostic totals could still be produced, but which row is "
+                    "correct is unknown. Reconciliation validity is therefore "
+                    "WITHHELD (`reconciled_within_tolerance: null`) and every "
+                    "affected total is provisional."
                 ),
                 remediation=(
                     "Fix the writer's id construction, then re-export. Until then "
@@ -430,7 +433,10 @@ def build_findings(analysis: dict) -> list[dict]:
                 ),
             )
         )
-    if accounting.get("available") and not accounting.get("reconciled_within_tolerance"):
+    # Only judge the residual when the totals behind it are trustworthy. With a
+    # conflicting id `reconciled_within_tolerance` is None (withheld), and firing a
+    # residual warning off provisional numbers would be its own false signal.
+    if accounting.get("available") and accounting.get("reconciled_within_tolerance") is False:
         out.append(
             finding(
                 "PA-ACC-001",

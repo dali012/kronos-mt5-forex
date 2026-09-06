@@ -351,6 +351,96 @@ def test_ratios_unavailable_when_every_return_spans_a_gap():
 
 
 # --------------------------------------------------------------------------
+# blocker 1 (round 3): hit rate can never exceed 100%
+# --------------------------------------------------------------------------
+
+
+def test_hit_rate_uses_all_return_periods_not_just_ratio_returns():
+    """The exact reproduction from the review: 3 positive returns, one gap."""
+    rows = [
+        _equity_row(0, 100.0),
+        _equity_row(1, 110.0),
+        _equity_row(2, 120.0),
+        _equity_row(9, 130.0),  # gap -> non-consecutive return
+    ]
+    result = equity.analyze_equity(rows)
+    assert result["positive_days"] == 3
+    assert result["return_periods"] == 3
+    assert result["ratio_return_periods"] == 2
+    assert result["excluded_gap_returns"] == 1
+    # previously 3/2 == 150.0
+    assert result["hit_rate_pct"] == pytest.approx(100.0)
+    assert result["day_count_basis"] == "all observed return periods"
+    assert result["ratio_basis"] == "consecutive-day returns only"
+    # ratios still restricted to consecutive-day returns
+    assert result["annualized_volatility_pct"] is not None
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        [100.0, 110.0, 120.0, 130.0],
+        [100.0, 90.0, 80.0, 70.0],
+        [100.0, 110.0, 100.0, 100.0, 130.0],
+        [100.0, 100.0, 100.0],
+        [100.0, 101.0],
+    ],
+)
+def test_hit_rate_never_exceeds_one_hundred_percent(values):
+    for gap_at in range(1, len(values)):
+        days = list(range(len(values)))
+        days[gap_at:] = [d + 7 for d in days[gap_at:]]  # punch a gap in
+        rows = [_equity_row(d, v) for d, v in zip(days, values)]
+        result = equity.analyze_equity(rows)
+        rate = result["hit_rate_pct"]
+        assert rate is None or 0.0 <= rate <= 100.0, (values, gap_at, rate)
+        counted = result["positive_days"] + result["negative_days"] + result["flat_days"]
+        assert counted == result["return_periods"]
+
+
+def test_mixed_signed_gap_spanning_returns_are_all_counted():
+    rows = [
+        _equity_row(0, 100.0),
+        _equity_row(5, 110.0),  # gap, positive
+        _equity_row(11, 99.0),  # gap, negative
+        _equity_row(12, 99.0),  # consecutive, flat
+    ]
+    result = equity.analyze_equity(rows)
+    assert result["return_periods"] == 3
+    assert result["ratio_return_periods"] == 1
+    assert (result["positive_days"], result["negative_days"], result["flat_days"]) == (
+        1,
+        1,
+        1,
+    )
+    assert result["hit_rate_pct"] == pytest.approx(100.0 / 3.0)
+
+
+def test_hit_rate_with_no_returns_is_none():
+    result = equity.analyze_equity([_equity_row(0, 100.0)])
+    assert result["return_periods"] == 0
+    assert result["hit_rate_pct"] is None
+    assert result["positive_days"] == 0
+
+
+def test_hit_rate_with_one_return():
+    positive = equity.analyze_equity([_equity_row(0, 100.0), _equity_row(1, 110.0)])
+    assert positive["return_periods"] == 1
+    assert positive["hit_rate_pct"] == pytest.approx(100.0)
+
+    negative = equity.analyze_equity([_equity_row(0, 100.0), _equity_row(1, 90.0)])
+    assert negative["hit_rate_pct"] == pytest.approx(0.0)
+
+    # a single gap-spanning return still counts for the hit rate
+    gapped = equity.analyze_equity([_equity_row(0, 100.0), _equity_row(9, 110.0)])
+    assert gapped["return_periods"] == 1
+    assert gapped["ratio_return_periods"] == 0
+    assert gapped["hit_rate_pct"] == pytest.approx(100.0)
+    assert gapped["ratios_available"] is False
+    assert gapped["sharpe_ratio"] is None
+
+
+# --------------------------------------------------------------------------
 # blocker 2: accounting scoped to the equity window
 # --------------------------------------------------------------------------
 
@@ -419,13 +509,21 @@ def test_exact_duplicate_records_are_counted_once():
     assert result["reconciliation_reliable"] is True
 
 
-def test_conflicting_duplicate_ids_make_reconciliation_unreliable():
+def test_conflicting_income_ids_withhold_reconciliation_validity():
     first = _income("REALIZED_PNL", 7.0, 1, 1)
     second = dict(first, amount=9.0)  # same id, different content
     result = _windowed([first, second])
+
     assert result["reconciliation_reliable"] is False
+    # validity is WITHHELD, never asserted either way, off provisional totals
+    assert result["reconciled_within_tolerance"] is None
+    assert result["reconciliation_status"] == "UNRELIABLE"
+    assert result["totals_provisional"] is True
     assert result["conflicting_duplicate_ids"]["income"] == ["REALIZED_PNL-1"]
-    assert "cannot be trusted" in result["reconciliation_unreliable_reason"]
+    reason = result["reconciliation_unreliable_reason"]
+    assert "selected deterministically" in reason
+    assert "provisional" in reason
+    assert "no row was silently chosen" not in reason.lower()
 
     findings = build_findings(
         {"accounting": result, "context": {"provenance_known": True}, "execution": {}}
@@ -433,6 +531,70 @@ def test_conflicting_duplicate_ids_make_reconciliation_unreliable():
     conflict = next(f for f in findings if f["code"] == "PA-ACC-005")
     assert conflict["severity"] == "ERROR"
     assert conflict["prominent"] is True
+    # a residual warning must NOT be raised from provisional numbers
+    assert "PA-ACC-001" not in {f["code"] for f in findings}
+
+
+def test_conflicting_fill_ids_withhold_reconciliation_validity():
+    fill = _fill(1, ts=_ts(1, 12))
+    conflicting = dict(fill, price=999.0)
+    result = _windowed([], [fill, conflicting])
+
+    assert result["reconciliation_reliable"] is False
+    assert result["reconciled_within_tolerance"] is None
+    assert result["reconciliation_status"] == "UNRELIABLE"
+    assert result["conflicting_duplicate_ids"]["fills"] == ["f1"]
+
+
+def test_conflicting_ids_render_as_unreliable_in_markdown(tmp_path, synthetic_db):
+    """The report must never print `yes` or `NO` for a provisional residual."""
+    con = sqlite3.connect(synthetic_db)
+    con.execute(
+        "INSERT INTO income (income_id, ts, income_type, amount, symbol) "
+        "VALUES ('REALIZED_PNL-1', ?, 'REALIZED_PNL', 999.0, 'BTCUSDT-PERP')",
+        (_ts(5, 13),),
+    )
+    con.commit()
+    con.close()
+
+    out = tmp_path / "report"
+    assert main(["--input", str(synthetic_db), "--output-dir", str(out), "--quiet"]) == 0
+    report = (out / "report.md").read_text()
+    assert "UNRELIABLE (validity withheld)" in report
+    assert "totals above are provisional" in report
+    assert "| Reconciled within tolerance | yes |" not in report
+    assert "| Reconciled within tolerance | NO |" not in report
+
+    payload = json.loads((out / "summary.json").read_text())["analysis"]["accounting"]
+    assert payload["reconciled_within_tolerance"] is None
+    assert payload["totals_provisional"] is True
+    assert payload["reconciliation_status"] == "UNRELIABLE"
+
+
+def test_exact_duplicates_stay_reliable_and_count_once():
+    row = _income("REALIZED_PNL", 7.0, 1, 1)
+    result = _windowed([row, dict(row)])
+    assert result["reconciliation_reliable"] is True
+    assert result["totals_provisional"] is False
+    assert result["reconciled_within_tolerance"] in (True, False)  # a real verdict
+    assert result["realized_pnl"] == pytest.approx(7.0)
+
+
+def test_conflicting_id_handling_is_order_independent():
+    first = _income("REALIZED_PNL", 7.0, 1, 1)
+    second = dict(first, amount=9.0)
+    forward = _windowed([first, second])
+    backward = _windowed([second, first])
+    for key in (
+        "reconciliation_reliable",
+        "reconciled_within_tolerance",
+        "reconciliation_status",
+        "totals_provisional",
+        "realized_pnl",
+        "residual",
+    ):
+        assert forward[key] == backward[key], key
+    assert forward["conflicting_duplicate_ids"] == backward["conflicting_duplicate_ids"]
 
 
 def test_deduplication_is_independent_of_row_order():
@@ -633,6 +795,86 @@ def test_direct_database_without_metadata_raises_unknown_provenance(tmp_path, sy
     assert unknown["severity"] == "WARNING"
     assert unknown["prominent"] is True
     assert sorted(unknown["evidence"]["missing"]) == unknown["evidence"]["missing"]
+
+
+def _archive_with_metadata(tmp_path, synthetic_db, env_text, head_text=None):
+    archive = tmp_path / f"export-{abs(hash((env_text, head_text))) % 10**8}.tar.gz"
+    base = "kronos-performance-export"
+    env = tmp_path / "env.live.sanitized.txt"
+    env.write_text(env_text)
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(synthetic_db, arcname=f"{base}/database/companion_sanitized.db")
+        tar.add(env, arcname=f"{base}/config/env.live.sanitized.txt")
+        if head_text is not None:
+            head = tmp_path / "git_head.txt"
+            head.write_text(head_text)
+            tar.add(head, arcname=f"{base}/project/git_head.txt")
+    with tempfile.TemporaryDirectory() as tmp:
+        return run_analysis(resolve_source(archive, Path(tmp)))
+
+
+def test_provenance_known_needs_environment_demo_status_and_commit(tmp_path, synthetic_db):
+    analysis = _archive_with_metadata(
+        tmp_path,
+        synthetic_db,
+        "BINANCE_ENVIRONMENT=TESTNET\nDEMO_ONLY=true\n",
+        "branch: main\ncommit: abc123\n",
+    )
+    context = analysis["context"]
+    assert context["provenance_known"] is True
+    assert context["missing_provenance"] == []
+    assert "PA-ENV-002" not in {f["code"] for f in analysis["findings"]}
+
+
+def test_missing_source_commit_makes_provenance_unknown(tmp_path, synthetic_db):
+    """The contradictory case from the review: known=True with a missing commit."""
+    analysis = _archive_with_metadata(
+        tmp_path, synthetic_db, "BINANCE_ENVIRONMENT=TESTNET\nDEMO_ONLY=true\n", None
+    )
+    context = analysis["context"]
+    assert context["provenance_known"] is False
+    assert context["missing_provenance"] == ["source_commit"]
+    assert "PA-ENV-002" in {f["code"] for f in analysis["findings"]}
+
+
+def test_missing_environment_makes_provenance_unknown(tmp_path, synthetic_db):
+    analysis = _archive_with_metadata(
+        tmp_path, synthetic_db, "DEMO_ONLY=true\n", "branch: main\ncommit: abc123\n"
+    )
+    context = analysis["context"]
+    assert context["provenance_known"] is False
+    assert "binance_environment" in context["missing_provenance"]
+    assert "PA-ENV-002" in {f["code"] for f in analysis["findings"]}
+
+
+def test_missing_demo_only_makes_provenance_unknown(tmp_path, synthetic_db):
+    analysis = _archive_with_metadata(
+        tmp_path,
+        synthetic_db,
+        "BINANCE_ENVIRONMENT=TESTNET\n",
+        "branch: main\ncommit: abc123\n",
+    )
+    context = analysis["context"]
+    assert context["provenance_known"] is False
+    assert "demo_only" in context["missing_provenance"]
+    assert "PA-ENV-002" in {f["code"] for f in analysis["findings"]}
+
+
+def test_provenance_known_is_never_true_with_missing_fields(tmp_path, synthetic_db):
+    """The invariant the review asked for: the two fields cannot contradict."""
+    cases = [
+        ("BINANCE_ENVIRONMENT=TESTNET\nDEMO_ONLY=true\n", "commit: abc123\n"),
+        ("BINANCE_ENVIRONMENT=TESTNET\nDEMO_ONLY=true\n", None),
+        ("DEMO_ONLY=true\n", "commit: abc123\n"),
+        ("BINANCE_ENVIRONMENT=TESTNET\n", "commit: abc123\n"),
+        ("", None),
+    ]
+    for env_text, head_text in cases:
+        context = _archive_with_metadata(tmp_path, synthetic_db, env_text, head_text)["context"]
+        if context["provenance_known"]:
+            assert context["missing_provenance"] == []
+        else:
+            assert context["missing_provenance"]
 
 
 def test_unknown_provenance_is_never_rendered_as_live(tmp_path, synthetic_db):

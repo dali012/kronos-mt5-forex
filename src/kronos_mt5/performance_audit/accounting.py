@@ -297,10 +297,14 @@ def reconcile(
         "total": conflicting,
     }
     result["reconciliation_reliable"] = conflicting == 0
+    result["totals_provisional"] = conflicting > 0
     if conflicting:
         result["reconciliation_unreliable_reason"] = (
-            f"{conflicting} record id(s) appear more than once with conflicting "
-            f"content; no row was silently chosen, so these totals cannot be trusted"
+            f"{conflicting} record id(s) appear more than once with CONFLICTING "
+            f"content. One row per id was selected deterministically so diagnostic "
+            f"totals could still be produced, but which row is correct is unknown, "
+            f"so reconciliation validity is WITHHELD: every total below is "
+            f"provisional and must not be trusted."
         )
     start_equity = as_float(first.get("equity")) or 0.0
     end_equity = as_float(last.get("equity")) or 0.0
@@ -349,7 +353,14 @@ def reconcile(
             "explained_change": explained,
             "residual": residual,
             "residual_tolerance": tolerance,
-            "reconciled_within_tolerance": abs(residual) <= tolerance,
+            # Withheld (None), never True/False, when a conflicting id means the
+            # residual was computed from a provisionally selected row.
+            "reconciled_within_tolerance": (None if conflicting else abs(residual) <= tolerance),
+            "reconciliation_status": (
+                "UNRELIABLE"
+                if conflicting
+                else ("RECONCILED" if abs(residual) <= tolerance else "RESIDUAL_EXCEEDS_TOLERANCE")
+            ),
             "recorded_by_bot": recorded,
             "recorded_vs_recomputed": {
                 "realized_delta": (

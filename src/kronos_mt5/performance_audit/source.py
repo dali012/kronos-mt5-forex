@@ -116,7 +116,11 @@ def safe_extract(archive_path: Path, dest: Path) -> Path:
                     )
             if not members:
                 raise AuditInputError(f"archive {archive_path.name} is empty")
-            tar.extractall(dest, members=members)
+            # Every member was validated above; also hand tarfile its own `data`
+            # filter where available (3.12+, backported to some 3.10/3.11 patch
+            # releases) so the guarantees hold when 3.14 changes the default.
+            extract_kwargs = {"filter": "data"} if hasattr(tarfile, "data_filter") else {}
+            tar.extractall(dest, members=members, **extract_kwargs)
     except (tarfile.TarError, EOFError) as exc:
         raise AuditInputError(f"malformed archive {archive_path.name}: {exc}") from exc
     return dest

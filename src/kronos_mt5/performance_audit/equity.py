@@ -388,10 +388,15 @@ def analyze_equity(rows: list[dict]) -> dict:
             "mean_daily_return_pct": mean * 100.0 if mean is not None else None,
             "median_daily_return_pct": (_median(all_returns) * 100.0 if all_returns else None),
             "mean_daily_return_basis": "consecutive-day returns only",
+            # Day counts and hit rate describe EVERY observed return period.
+            # Volatility, Sharpe and Sortino use consecutive-day returns only.
+            # Mixing the two populations previously let the hit rate exceed 100%.
             "positive_days": positive,
             "negative_days": negative,
             "flat_days": flat,
-            "hit_rate_pct": (positive / len(returns) * 100.0) if returns else None,
+            "hit_rate_pct": (positive / len(all_returns) * 100.0 if all_returns else None),
+            "day_count_basis": "all observed return periods",
+            "ratio_basis": "consecutive-day returns only",
             "best_day": {"date": best["date"], "return_pct": (best["return"] or 0.0) * 100.0},
             "worst_day": {"date": worst["date"], "return_pct": (worst["return"] or 0.0) * 100.0},
             "annualized_return_pct": (
