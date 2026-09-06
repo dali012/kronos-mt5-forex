@@ -43,14 +43,38 @@ from .deployed_trend_dc8a74c import (
     TrendStrategyConfig as DeployedTrendStrategyConfig,
 )
 from .instruments import (
+    exact,
     instrument,
     reject_reason,
     rejection_detail,
-    rounded_decimal,
+    step_aligned_quantity,
     tick_aligned_price,
 )
 
 DAY_NS = 86_400_000_000_000
+DECISION_TAG_PREFIX = "baseline_decision_ns="
+
+
+def decision_ts_from_tags(tags) -> int | None:
+    """Recover a baseline entry order's originating decision timestamp.
+
+    Protective orders are built by the pinned deployed logic and carry no
+    baseline tag, so unrelated or malformed tags yield ``None`` rather than
+    raising.
+    """
+
+    if not tags:
+        return None
+    if isinstance(tags, str):
+        tags = [tags]
+    for tag in tags:
+        text = str(tag)
+        if text.startswith(DECISION_TAG_PREFIX):
+            try:
+                return int(text[len(DECISION_TAG_PREFIX) :])
+            except ValueError:
+                return None
+    return None
 
 
 def funding_payment(units: float, mark_price: float, rate: float) -> float:
@@ -185,14 +209,19 @@ class ReplayStrategy(DeployedTrendStrategy):
         self.snapshot(bar.ts_event)
 
     def _submit_entry_order(self, side, qty, price):
+        # The decision record stays JSON-serializable for the replay export; the
+        # exact Quantity is kept only in private execution state, so the
+        # executable quantity is never reconstructed from a float.
+        exact_qty = exact(qty)
         decision = {
             "ts_ns": self.clock.timestamp_ns(),
             "side": side.name,
-            "qty": float(qty),
+            "qty": float(exact_qty),
+            "exact_qty": format(exact_qty, "f"),
             "reference_price": price,
         }
         self.decisions.append(decision)
-        self.pending = decision
+        self.pending = {"decision": decision, "qty": qty}
 
     def _order_passes_filters(self, qty, price):
         ok = super()._order_passes_filters(qty, price)
@@ -227,14 +256,20 @@ class ReplayStrategy(DeployedTrendStrategy):
         # Only the open quote can execute a pending closed-bar decision.
         if ts % DAY_NS == 0 and self.pending is not None:
             pending, self.pending = self.pending, None
-            if pending["ts_ns"] >= ts:
+            decision = pending["decision"]
+            if decision["ts_ns"] >= ts:
                 raise ValueError("look-ahead: decision must precede executable open")
-            side = OrderSide.BUY if pending["side"] == "BUY" else OrderSide.SELL
+            side = OrderSide.BUY if decision["side"] == "BUY" else OrderSide.SELL
             # Validate the exact exchange objects. float(Price) can render an
             # on-tick value as 88187.90000000001 and reject a valid price.
             price_obj = tick.ask_price if side == OrderSide.BUY else tick.bid_price
-            qty_decimal = rounded_decimal(pending["qty"], self.filters["step_size"])
-            qty_obj = self.instrument.make_qty(float(qty_decimal)) if qty_decimal > 0 else None
+            # The pinned Quantity is snapped in Decimal and rebuilt exactly.
+            qty_decimal = exact(pending["qty"])
+            qty_obj = (
+                step_aligned_quantity(self.instrument, qty_decimal, self.filters["step_size"])
+                if qty_decimal > 0
+                else None
+            )
             reason = (
                 reject_reason(qty_obj, price_obj, self.filters)
                 if qty_obj is not None
@@ -267,7 +302,7 @@ class ReplayStrategy(DeployedTrendStrategy):
                         qty_obj if qty_obj is not None else qty_decimal,
                         price_obj,
                         self.filters,
-                        decision_ts_ns=pending["ts_ns"],
+                        decision_ts_ns=decision["ts_ns"],
                     )
                 )
             else:
@@ -275,7 +310,7 @@ class ReplayStrategy(DeployedTrendStrategy):
                     self.instrument_id,
                     side,
                     qty_obj,
-                    tags=[f"baseline_decision_ns={pending['ts_ns']}"],
+                    tags=[f"{DECISION_TAG_PREFIX}{decision['ts_ns']}"],
                 )
                 self.submit_order(order)
         self.snapshot(ts)
@@ -308,20 +343,34 @@ class ReplayStrategy(DeployedTrendStrategy):
         if event.ts_event >= self.start_ns:
             self.snapshot(event.ts_event)
 
-    def on_order_rejected(self, event):
+    def _record_engine_rejection(self, event) -> dict:
+        """Attribute an engine rejection to its symbol, side and decision."""
+
         order = self.cache.order(event.client_order_id)
         quote = self.shared["quotes"].get(self.instrument_id)
-        self.rejections.append(
-            rejection_detail(
-                self.symbol,
-                event.ts_event,
-                str(event.reason),
-                getattr(order, "quantity", None),
-                getattr(quote, "bid_price", None),
-                self.filters,
-                decision_ts_ns=None,
-            )
+        side = getattr(order, "side", None)
+        # A BUY lifts the ask and a SELL hits the bid; recording one side for
+        # both would misreport the price the order actually attempted.
+        if side == OrderSide.BUY:
+            attempted_price = getattr(quote, "ask_price", None)
+        elif side == OrderSide.SELL:
+            attempted_price = getattr(quote, "bid_price", None)
+        else:
+            attempted_price = None
+        record = rejection_detail(
+            self.symbol,
+            event.ts_event,
+            str(event.reason),
+            getattr(order, "quantity", None),
+            attempted_price,
+            self.filters,
+            decision_ts_ns=decision_ts_from_tags(getattr(order, "tags", None)),
         )
+        self.rejections.append(record)
+        return record
+
+    def on_order_rejected(self, event):
+        self._record_engine_rejection(event)
         super().on_order_rejected(event)
 
     def snapshot(self, ts):

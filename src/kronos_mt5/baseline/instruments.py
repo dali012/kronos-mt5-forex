@@ -65,17 +65,66 @@ def rounded_decimal(value, step: str, *, up: bool = False) -> Decimal:
     ) * increment
 
 
+def exact_price(inst, value) -> Price:
+    """Build a ``Price`` exactly equal to ``value``, without a float round-trip.
+
+    Nautilus accepts a ``Decimal`` directly, so no float is involved. The result
+    is still compared back to the intended decimal: a value needing more digits
+    than the instrument's precision would otherwise be silently rounded, moving
+    the price by up to a whole tick.
+    """
+
+    target = exact(value)
+    price = Price(target, inst.price_precision)
+    if price.as_decimal() != target:
+        raise ValueError(
+            f"price {target} is not representable at precision {inst.price_precision}: "
+            f"got {price.as_decimal()}"
+        )
+    return price
+
+
+def exact_quantity(inst, value) -> Quantity:
+    """Build a ``Quantity`` exactly equal to ``value``, without a float round-trip."""
+
+    target = exact(value)
+    quantity = Quantity(target, inst.size_precision)
+    if quantity.as_decimal() != target:
+        raise ValueError(
+            f"quantity {target} is not representable at precision {inst.size_precision}: "
+            f"got {quantity.as_decimal()}"
+        )
+    return quantity
+
+
 def tick_aligned_price(inst, value, tick: str, *, up: bool = False) -> Price:
-    """Return a ``Price`` snapped onto ``tick`` and verified exactly aligned.
+    """Return a ``Price`` snapped onto ``tick``, built and verified exactly.
 
     Simulated quotes are submitted to execution validation, so a synthetic price
     that drifted off the tick would surface as a genuine exchange rejection.
+    Both checks are needed: equality catches a value silently moved by a whole
+    tick during construction, modulo catches one that is merely off-grid.
     """
 
-    price = inst.make_price(float(rounded_decimal(value, tick, up=up)))
-    if exact(price) % Decimal(tick):
+    snapped = rounded_decimal(value, tick, up=up)
+    price = exact_price(inst, snapped)
+    if price.as_decimal() != snapped:
+        raise ValueError(f"synthetic quote {price} does not equal snapped value {snapped}")
+    if price.as_decimal() % Decimal(tick):
         raise ValueError(f"synthetic quote {price} is not aligned to tick size {tick}")
     return price
+
+
+def step_aligned_quantity(inst, value, step: str, *, up: bool = False) -> Quantity:
+    """Return a ``Quantity`` snapped onto ``step``, built and verified exactly."""
+
+    snapped = rounded_decimal(value, step, up=up)
+    quantity = exact_quantity(inst, snapped)
+    if quantity.as_decimal() != snapped:
+        raise ValueError(f"quantity {quantity} does not equal snapped value {snapped}")
+    if quantity.as_decimal() % Decimal(step):
+        raise ValueError(f"quantity {quantity} is not aligned to step size {step}")
+    return quantity
 
 
 def reject_reason(qty, price, filters: dict, *, reduce_only: bool = False) -> str | None:
@@ -115,8 +164,10 @@ def rejection_detail(
     """Build a fully attributed rejection record with exact attempted values."""
 
     def render(value):
+        """Render an exact value as plain decimal text, never scientific."""
+
         try:
-            return str(exact(value))
+            return format(exact(value), "f")
         except (TypeError, ValueError, InvalidOperation):
             return None
 
