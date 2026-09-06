@@ -1,0 +1,5 @@
+# Offline historical pipeline + fixed-strategy replay (no model/GPU required).
+-r requirements-live.txt
+pyarrow>=17
+pytest
+ruff
