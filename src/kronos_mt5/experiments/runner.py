@@ -85,7 +85,10 @@ def summary(metrics: dict) -> dict:
         for symbol, values in metrics.get("per_symbol", {}).items()
     }
     out["market_regime"] = {
-        regime: values.get("net_pnl") for regime, values in metrics.get("market_regime", {}).items()
+        # Full metrics carry a dict per regime; an already-summarised block
+        # carries the net PnL scalar directly, so this stays idempotent.
+        regime: values.get("net_pnl") if isinstance(values, dict) else values
+        for regime, values in metrics.get("market_regime", {}).items()
     }
     out["rejections_by_reason"] = dict(metrics.get("rejections_by_reason", {}))
     out["rejections_by_symbol"] = dict(metrics.get("rejections_by_symbol", {}))
@@ -151,7 +154,10 @@ def run_experiment(
     control_development: dict | None = None,
     control_windows: list[dict] | None = None,
 ) -> dict:
-    """Run every predeclared variant of one experiment and score the gate."""
+    """Run every predeclared variant of one experiment and score the gate.
+
+    ``control_development`` is an already-summarised control metrics block.
+    """
 
     output = safe_output(output)
     variants: dict[str, dict] = {}
@@ -237,7 +243,7 @@ def run_experiment(
         "acceptance_gate": gate,
     }
     if control_development is not None:
-        result["delta_vs_control"] = deltas(summary(development), summary(control_development))
+        result["delta_vs_control"] = deltas(summary(development), control_development)
     if control_windows is not None:
         result["control_window_statistics"] = gates.window_statistics(control_windows)
     return result

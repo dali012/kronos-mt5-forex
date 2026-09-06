@@ -588,6 +588,27 @@ def test_runner_summary_and_deltas_are_json_serialisable():
     assert deltas["total_return"]["delta"] == pytest.approx(0.01)
 
 
+def test_summary_is_idempotent_so_a_control_summary_can_be_reused():
+    """run_all passes an already-summarised control into every experiment."""
+
+    metrics = {
+        "total_return": 0.05,
+        "sharpe": 0.3,
+        "costs": {"commission": 1.0},
+        "exposure": {"max_gross_exposure": 0.4},
+        "long_short": {"long": {"trades": 5, "net_pnl": 10.0}},
+        "per_symbol": {"BTCUSDT": {"trades": 5, "net_pnl": 10.0}},
+        "market_regime": {"HIGH_VOL": {"net_pnl": -1.0, "start_equity": 1.0}},
+        "rejections_by_reason": {},
+    }
+    once = runner.summary(metrics)
+    twice = runner.summary(once)
+    assert once["market_regime"] == {"HIGH_VOL": -1.0}
+    assert twice["market_regime"] == once["market_regime"]
+    # A control summary must be usable directly as the delta reference.
+    assert runner.deltas(once, once)["total_return"]["delta"] == 0
+
+
 def test_ohlc_and_olhc_are_reported_separately():
     experiment = registry.get("long-only")
     keys = []
