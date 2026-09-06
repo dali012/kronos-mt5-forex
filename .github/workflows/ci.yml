@@ -32,6 +32,7 @@ jobs:
             src/kronos_mt5/marketdata \
             src/kronos_mt5/walk_forward.py \
             tests/test_baseline.py \
+            tests/test_baseline_precision.py \
             tests/test_marketdata.py
 
   tests:

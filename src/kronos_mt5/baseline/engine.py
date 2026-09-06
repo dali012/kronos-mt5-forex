@@ -42,9 +42,39 @@ from .deployed_trend_dc8a74c import (
 from .deployed_trend_dc8a74c import (
     TrendStrategyConfig as DeployedTrendStrategyConfig,
 )
-from .instruments import instrument, reject_reason, rounded
+from .instruments import (
+    exact,
+    instrument,
+    reject_reason,
+    rejection_detail,
+    step_aligned_quantity,
+    tick_aligned_price,
+)
 
 DAY_NS = 86_400_000_000_000
+DECISION_TAG_PREFIX = "baseline_decision_ns="
+
+
+def decision_ts_from_tags(tags) -> int | None:
+    """Recover a baseline entry order's originating decision timestamp.
+
+    Protective orders are built by the pinned deployed logic and carry no
+    baseline tag, so unrelated or malformed tags yield ``None`` rather than
+    raising.
+    """
+
+    if not tags:
+        return None
+    if isinstance(tags, str):
+        tags = [tags]
+    for tag in tags:
+        text = str(tag)
+        if text.startswith(DECISION_TAG_PREFIX):
+            try:
+                return int(text[len(DECISION_TAG_PREFIX) :])
+            except ValueError:
+                return None
+    return None
 
 
 def funding_payment(units: float, mark_price: float, rate: float) -> float:
@@ -155,6 +185,7 @@ class ReplayStrategy(DeployedTrendStrategy):
         self.end_ns = end_ns
         self.shared = shared
         self.pending = None
+        self.symbol = self.instrument_id.symbol.value
         self.decisions = []
         self.fills = []
         self.rejections = []
@@ -178,20 +209,33 @@ class ReplayStrategy(DeployedTrendStrategy):
         self.snapshot(bar.ts_event)
 
     def _submit_entry_order(self, side, qty, price):
+        # The decision record stays JSON-serializable for the replay export; the
+        # exact Quantity is kept only in private execution state, so the
+        # executable quantity is never reconstructed from a float.
+        exact_qty = exact(qty)
         decision = {
             "ts_ns": self.clock.timestamp_ns(),
             "side": side.name,
-            "qty": float(qty),
+            "qty": float(exact_qty),
+            "exact_qty": format(exact_qty, "f"),
             "reference_price": price,
         }
         self.decisions.append(decision)
-        self.pending = decision
+        self.pending = {"decision": decision, "qty": qty}
 
     def _order_passes_filters(self, qty, price):
         ok = super()._order_passes_filters(qty, price)
         if not ok:
             self.rejections.append(
-                {"ts_ns": self.clock.timestamp_ns(), "reason": "production_filters"}
+                rejection_detail(
+                    self.symbol,
+                    self.clock.timestamp_ns(),
+                    "production_filters",
+                    qty,
+                    price,
+                    self.filters,
+                    decision_ts_ns=self.clock.timestamp_ns(),
+                )
             )
         return ok
 
@@ -212,12 +256,28 @@ class ReplayStrategy(DeployedTrendStrategy):
         # Only the open quote can execute a pending closed-bar decision.
         if ts % DAY_NS == 0 and self.pending is not None:
             pending, self.pending = self.pending, None
-            if pending["ts_ns"] >= ts:
+            decision = pending["decision"]
+            if decision["ts_ns"] >= ts:
                 raise ValueError("look-ahead: decision must precede executable open")
-            side = OrderSide.BUY if pending["side"] == "BUY" else OrderSide.SELL
-            price = float(tick.ask_price if side == OrderSide.BUY else tick.bid_price)
-            qty = rounded(pending["qty"], self.filters["step_size"])
-            reason = reject_reason(qty, price, self.filters)
+            side = OrderSide.BUY if decision["side"] == "BUY" else OrderSide.SELL
+            # Validate the exact exchange objects. float(Price) can render an
+            # on-tick value as 88187.90000000001 and reject a valid price.
+            price_obj = tick.ask_price if side == OrderSide.BUY else tick.bid_price
+            # The pinned Quantity is snapped in Decimal and rebuilt exactly.
+            qty_decimal = exact(pending["qty"])
+            qty_obj = (
+                step_aligned_quantity(self.instrument, qty_decimal, self.filters["step_size"])
+                if qty_decimal > 0
+                else None
+            )
+            reason = (
+                reject_reason(qty_obj, price_obj, self.filters)
+                if qty_obj is not None
+                else "nonpositive_or_nonfinite"
+            )
+            # Only after exact validation are these used for metrics/arithmetic.
+            price = float(price_obj)
+            qty = float(qty_obj) if qty_obj is not None else float(qty_decimal)
             current = float(self.portfolio.net_position(self.instrument_id))
             delta = qty if side == OrderSide.BUY else -qty
             gross = sum(
@@ -234,13 +294,23 @@ class ReplayStrategy(DeployedTrendStrategy):
             ):
                 reason = "leverage_limit"
             if reason:
-                self.rejections.append({"ts_ns": ts, "reason": reason})
+                self.rejections.append(
+                    rejection_detail(
+                        self.symbol,
+                        ts,
+                        reason,
+                        qty_obj if qty_obj is not None else qty_decimal,
+                        price_obj,
+                        self.filters,
+                        decision_ts_ns=decision["ts_ns"],
+                    )
+                )
             else:
                 order = self.order_factory.market(
                     self.instrument_id,
                     side,
-                    self.instrument.make_qty(qty),
-                    tags=[f"baseline_decision_ns={pending['ts_ns']}"],
+                    qty_obj,
+                    tags=[f"{DECISION_TAG_PREFIX}{decision['ts_ns']}"],
                 )
                 self.submit_order(order)
         self.snapshot(ts)
@@ -273,8 +343,34 @@ class ReplayStrategy(DeployedTrendStrategy):
         if event.ts_event >= self.start_ns:
             self.snapshot(event.ts_event)
 
+    def _record_engine_rejection(self, event) -> dict:
+        """Attribute an engine rejection to its symbol, side and decision."""
+
+        order = self.cache.order(event.client_order_id)
+        quote = self.shared["quotes"].get(self.instrument_id)
+        side = getattr(order, "side", None)
+        # A BUY lifts the ask and a SELL hits the bid; recording one side for
+        # both would misreport the price the order actually attempted.
+        if side == OrderSide.BUY:
+            attempted_price = getattr(quote, "ask_price", None)
+        elif side == OrderSide.SELL:
+            attempted_price = getattr(quote, "bid_price", None)
+        else:
+            attempted_price = None
+        record = rejection_detail(
+            self.symbol,
+            event.ts_event,
+            str(event.reason),
+            getattr(order, "quantity", None),
+            attempted_price,
+            self.filters,
+            decision_ts_ns=decision_ts_from_tags(getattr(order, "tags", None)),
+        )
+        self.rejections.append(record)
+        return record
+
     def on_order_rejected(self, event):
-        self.rejections.append({"ts_ns": event.ts_event, "reason": str(event.reason)})
+        self._record_engine_rejection(event)
         super().on_order_rejected(event)
 
     def snapshot(self, ts):
@@ -314,8 +410,10 @@ def events_for_frame(frame: pd.DataFrame, inst, config: BaselineConfig, funding_
             if start <= ts < start + DAY_NS and ts not in prices:
                 prices[ts] = prices[max(t for t in prices if t <= ts)]
         for ts, mid in sorted(prices.items()):
-            bid = inst.make_price(rounded(mid * (1 - half), tick))
-            ask = inst.make_price(rounded(mid * (1 + half), tick, up=True))
+            # Snap onto the tick and verify exactly; a misaligned synthetic quote
+            # would otherwise reach execution validation as a genuine rejection.
+            bid = tick_aligned_price(inst, mid * (1 - half), tick)
+            ask = tick_aligned_price(inst, mid * (1 + half), tick, up=True)
             result.append(
                 QuoteTick(
                     inst.id,

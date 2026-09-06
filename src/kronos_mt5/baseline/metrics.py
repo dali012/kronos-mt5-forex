@@ -11,6 +11,20 @@ import pandas as pd
 from .engine import DAY_NS
 
 
+def rejection_counts(rejections: list[dict], *fields: str) -> dict:
+    """Count rejections grouped by the given record fields, sorted by key.
+
+    A rejection must always carry its symbol; an unattributed record is counted
+    under ``UNATTRIBUTED`` rather than silently dropped.
+    """
+
+    counts: dict[str, int] = {}
+    for rejection in rejections:
+        key = "/".join(str(rejection.get(field) or "UNATTRIBUTED") for field in fields)
+        counts[key] = counts.get(key, 0) + 1
+    return dict(sorted(counts.items()))
+
+
 def equity_metrics(points: list[dict]) -> dict:
     if len(points) < 2:
         raise ValueError("need starting equity and at least one endpoint")
@@ -166,6 +180,11 @@ def summarize(result: dict) -> dict:
     metrics["turnover_over_start_equity"] = metrics["turnover_notional"] / metrics["start_equity"]
     metrics["fills"] = len(fills)
     metrics["rejected_orders"] = len(result["rejections"])
+    metrics["rejections_by_reason"] = rejection_counts(result["rejections"], "reason")
+    metrics["rejections_by_symbol"] = rejection_counts(result["rejections"], "symbol")
+    metrics["rejections_by_symbol_reason"] = rejection_counts(
+        result["rejections"], "symbol", "reason"
+    )
     metrics["accounting_residual"] = metrics["net_pnl"] - sum(t["net_pnl"] for t in trades)
     # Nautilus cash is rounded to settlement currency precision; retain/report residual.
     tolerance = 0.02 * (len(fills) + len(funding) + 1)
