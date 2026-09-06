@@ -48,8 +48,8 @@ python -m kronos_mt5.baseline run \
   --config research/baseline-config.json --exchange-info research/exchange-info.json \
   --include-holdout --output research/baseline
 
-# Offline reproduction: verifies source/dependency hashes and dataset identity,
-# reruns the original config, and fails if any reported metrics differ.
+# Offline reproduction: verifies the exact research commit, frozen deployed source,
+# adapter/config/filter/data hashes and dependencies before comparing every metric.
 python -m kronos_mt5.baseline reproduce \
   --report research/baseline/report.json \
   --manifest research/data/manifests/dataset-<ID>.json \
@@ -190,10 +190,13 @@ Each partition records:
 
 Series manifests (`manifest_version: 1.0.0`) are mutable resume indexes. Dataset
 snapshots carry copies of their partition metadata, so later index updates do not
-change previous reports. The report embeds the exact snapshot and its SHA-256,
-configuration and fingerprint, exchange filter snapshot, source commit, dirty-tree
-flag, source-file hashes, and dependency versions. Keep these artifacts privately;
-none belong in a commit.
+change previous reports. The report embeds the exact dataset snapshot and its
+SHA-256, configuration and fingerprint, exchange-filter digest, deployed bot
+commit, deployed strategy and risk blob hashes, research implementation commit,
+research-adapter hashes, all relevant source hashes, snapshot-verification result,
+and dependency versions. A run fails when a tracked baseline, market-data, or
+walk-forward source differs from `HEAD`. Ignored downloads and generated reports
+do not affect that check. Keep these artifacts privately; none belong in a commit.
 
 ## Production reconstruction and approximations
 
@@ -204,13 +207,23 @@ with production state in `logs/companion.db`. Services, configuration, that data
 orders and positions were not modified. Research never imports the live runner,
 loads `.env`, opens the companion database or connects a trading execution client.
 
-The non-secret snapshot is in `baseline/config.py`: BTC, ETH, BNB, XRP, ADA, SOL,
-LTC and LINK; daily sign-momentum lookbacks 21/63/126/252; 33-return volatility;
-15% per-leg vol target; allocator target 10%; volatility stops; cost-aware
-rebalancing; adverse-funding veto; and 20% portfolio drawdown kill-switch. These
-signal/risk parameters cannot be tuned through the baseline configuration reader.
-Nautilus dispatches symbols in the deployed order. Its existing allocator's
-one-cycle lag is preserved. Shadow challengers are not evaluated.
+The byte-exact strategy snapshot is
+`baseline/deployed_trend_dc8a74c.py`; its SHA-256 is
+`33a8821d843d2b8c472c6f1a832b6d66fd297bd90ef9ff81fe8293c70eab085d`, the
+declared deployed blob hash. The strategy's deployed risk/allocator dependency is
+also frozen in `baseline/deployed_risk_dc8a74c.py`. The adapter imports these
+modules directly and never imports the current production `TrendStrategy` or
+`RiskState`, so later live-strategy edits cannot change this baseline.
+
+The non-secret parameter snapshot is in `baseline/config.py`: BTC, ETH, BNB, XRP,
+ADA, SOL, LTC and LINK; daily sign-momentum lookbacks 21/63/126/252; 33-return
+volatility; 15% per-leg vol target; allocator target 10%; volatility stops;
+cost-aware rebalancing; adverse-funding veto; shadow configuration; and the 20%
+portfolio drawdown limit. Effective defaults omitted by the live runner are
+recorded too. Only `warmup_request` changes from true to false for offline startup.
+These decision/risk parameters cannot be tuned through the baseline configuration
+reader. Nautilus dispatches symbols in the deployed order and preserves the
+allocator's one-cycle lag. Shadow targets are not scored as candidate strategies.
 
 The Phase 2 sanitized audit confirms this universe and deployment. Its summary
 SHA-256 is recorded in configuration provenance. It has 460 fills, 29 missing
@@ -221,11 +234,28 @@ uses an **explicit conservative approximation of 5bps taker commission per side*
 about an account's current Binance rate. They can be varied as execution sensitivity
 inputs before the holdout lock is established.
 
-The actual `TrendStrategy` and `RiskState` supply signals, volatility sizing,
-allocator, stops and rebalance decisions. A research-only subclass changes timing
-and execution transport; production files are unchanged. The repository strategy
-has newer patient-order safety code than the server. Its signal/risk calculations
-are reused; exact old patient-limit lifecycle behavior is not reconstructed.
+The frozen deployed `TrendStrategy` and `RiskState` supply signals, volatility
+sizing, allocator and funding decisions, stop distances, and protective-order
+construction. The research subclass has exactly these behavior overrides:
+
+- `on_start` subscribes to supplied offline bars and quotes without live history
+  requests or wall-clock timers;
+- `on_bar` loads the fixed warm-up, calls the pinned closed-bar decision logic,
+  blocks new decisions at the predetermined end, and records observations;
+- `_submit_entry_order` records the pinned intent for execution at the next open;
+- `_order_passes_filters` calls the pinned filter decision and records rejection;
+- `on_quote_tick` supplies synthetic OHLC quotes, executes queued next-open intents,
+  applies the research gross-leverage/drawdown boundary, and forces deterministic
+  liquidation at the fixed end;
+- `on_order_filled` calls pinned protection handling and records fill/cost data;
+- `on_order_rejected` calls pinned rejection handling and records the rejection;
+- `snapshot` records equity, exposure, open positions, and regime for the report.
+
+Historical funding settlement and conservative transaction costs are simulation
+modules around that adapter. Production files are unchanged. This is a replay of
+the deployed decision and protection logic with explicitly approximate execution.
+It does not claim byte-identical live execution: patient limits, intraday marks,
+outages, latency, and exchange behavior remain approximations.
 
 Important limits, repeated in every report:
 
@@ -271,8 +301,9 @@ used for this fixed-parameter replay. Windows are adjacent 90-day periods with a
 possibly shorter tail. All windows reset to initial capital, use preceding warm-up
 only, start flat, and liquidate at their predetermined final close with costs.
 
-A `baseline-lock.json` created before evaluation freezes configuration, source hashes,
-exchange filters and the fixed holdout boundary. `--include-holdout` is explicit.
+A `baseline-lock.json` created before evaluation freezes the configuration,
+deployed identity, research commit and adapter hashes, dataset-manifest digest,
+exchange-filter digest, and fixed holdout boundary. `--include-holdout` is explicit.
 It does not pretend to prevent someone from copying data or creating a new output
 directory; maintaining an untouched future holdout is also a research discipline.
 Once its results are inspected, the 2026 holdout must not guide later strategy
@@ -315,3 +346,6 @@ sequences and small Nautilus replays. They cover resume/pagination, checksums,
 corrupt files, UTC/current candles, gaps/duplicates, atomic writes, precision and
 notional filters, next-bar execution, future-data perturbations, funding/accounting,
 warm-up, chronological boundaries, frozen holdout, and exact report reproduction.
+They also prove the deployed blob relationship, pinned inheritance and parameters,
+isolation from the current production strategy, dirty-source rejection, commit and
+adapter mismatch rejection, and clean exact-source/config/data reproduction.

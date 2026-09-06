@@ -13,6 +13,7 @@ from kronos_mt5.marketdata.spec import PRODUCTION_UNIVERSE
 
 DEPLOYED_COMMIT = "dc8a74c2a9afda9f28a0d8b2f7a1bf6044df35b2"
 DEPLOYED_STRATEGY_SHA256 = "33a8821d843d2b8c472c6f1a832b6d66fd297bd90ef9ff81fe8293c70eab085d"
+DEPLOYED_RISK_SHA256 = "17330fd3eda6a622d29ef17d4a597ed1deb7198049346b286b3dffcab0f2e31a"
 
 AUDIT_PROVENANCE = {
     "summary_sha256": "5116d73288b41a311875e5d0edba029b111d94d023960cd698c4530786d383bb",
@@ -25,8 +26,10 @@ AUDIT_PROVENANCE = {
     "cost_decision": "Incomplete testnet commission/liquidity telemetry cannot identify a live fee tier; use explicit conservative 5bps per side, no discounts.",
 }
 
-# Algorithm/risk parameters: frozen, no CLI parameter search or strategy grid.
-STRATEGY = {
+# Effective non-instrument strategy configuration observed on the deployed bot.
+# This includes defaults which the live runner did not explicitly override. The
+# research adapter changes only ``warmup_request`` for offline startup.
+DEPLOYED_STRATEGY_PARAMETERS = {
     "lookbacks": (21, 63, 126, 252),
     "vol_window": 33,
     "target_vol": 0.15,
@@ -34,6 +37,7 @@ STRATEGY = {
     "ppy": 365,
     "vol_floor": 0.02,
     "rebalance_threshold": 0.10,
+    "warmup_request": True,
     "use_stop_loss": True,
     "stop_pct": 0.20,
     "use_vol_stop": True,
@@ -41,9 +45,17 @@ STRATEGY = {
     "min_stop_pct": 0.08,
     "max_stop_pct": 0.30,
     "use_take_profit": False,
+    "tp_pct": 0.50,
     "use_trailing_stop": False,
+    "trailing_activation_r": 1.0,
+    "trailing_vol_mult": 3.0,
+    "min_trailing_pct": 0.005,
+    "max_trailing_pct": 0.10,
     "flatten_on_stop": False,
     "use_correlation_scaling": False,
+    "corr_window": 90,
+    "corr_threshold": 0.65,
+    "corr_min_scalar": 0.50,
     "use_portfolio_allocator": True,
     "portfolio_target_vol": 0.10,
     "portfolio_cov_window": 90,
@@ -57,15 +69,27 @@ STRATEGY = {
     "funding_filter_enabled": True,
     "funding_rate_limit": 0.001,
     "funding_continuous_sizing": False,
+    "funding_rate_soft_limit": 0.0001,
+    "funding_min_scalar": 0.0,
     "cost_aware_rebalance": True,
     "round_trip_cost_bps": 8.0,
     "slippage_bps": 2.0,
+    "cost_threshold_mult": 4.0,
+    "min_notional_buffer": 1.05,
     "use_patient_limit": True,
     "patient_limit_offset_bps": 2.0,
     "patient_limit_timeout_secs": 300,
     "patient_limit_market_fallback": True,
-    "shadow_enabled": False,
+    "shadow_enabled": True,
+    "shadow_lookbacks": (7, 21, 63, 126),
 }
+
+
+def research_strategy_parameters() -> dict:
+    """Return deployed parameters with the single offline-startup override."""
+    parameters = deepcopy(DEPLOYED_STRATEGY_PARAMETERS)
+    parameters["warmup_request"] = False
+    return parameters
 
 
 @dataclass(frozen=True)
@@ -111,10 +135,11 @@ class BaselineConfig:
         return {
             "schema_version": 1,
             "replay": asdict(self),
-            "strategy": deepcopy(STRATEGY),
+            "strategy": deepcopy(DEPLOYED_STRATEGY_PARAMETERS),
             "audit_provenance": deepcopy(AUDIT_PROVENANCE),
             "deployed_commit": DEPLOYED_COMMIT,
             "deployed_strategy_sha256": DEPLOYED_STRATEGY_SHA256,
+            "deployed_risk_sha256": DEPLOYED_RISK_SHA256,
         }
 
     def fingerprint(self) -> str:

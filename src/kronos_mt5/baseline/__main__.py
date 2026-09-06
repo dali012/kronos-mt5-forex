@@ -8,11 +8,12 @@ import sys
 from pathlib import Path
 
 from kronos_mt5.marketdata.manifest import save_manifest
-from kronos_mt5.marketdata.pipeline import safe_output
+from kronos_mt5.marketdata.pipeline import digest, safe_output
 
 from .config import BaselineConfig
 from .metrics import summarize
-from .report import clean, provenance, run
+from .provenance import canonical_sha256, collect_provenance, verify_recorded_provenance
+from .report import clean, run
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -75,27 +76,34 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
         elif args.command == "reproduce":
-            from kronos_mt5.marketdata.pipeline import digest
-
-            from .config import STRATEGY
-
             original = json.loads(args.report.read_text())
-            source = provenance()
-            for key in ("source_sha256", "python", "nautilus_trader", "pandas", "numpy", "pyarrow"):
-                if original[key] != source[key]:
-                    raise ValueError(
-                        f"reproduction {key} differs from original; use original commit/environment"
-                    )
-            if digest(args.manifest) != original["validation"]["manifest_sha256"]:
+            source = collect_provenance()
+            verify_recorded_provenance(original["provenance"], source)
+            verify_recorded_provenance(original, source)
+            manifest_sha256 = original["dataset_manifest_sha256"]
+            if manifest_sha256 != original["validation"]["manifest_sha256"]:
+                raise ValueError("recorded dataset manifest checksums disagree")
+            if digest(args.manifest) != manifest_sha256:
                 raise ValueError("reproduction dataset manifest checksum differs")
             conf = original["configuration"]
-            if conf["strategy"] != json.loads(json.dumps(STRATEGY)):
-                raise ValueError("reproduction strategy differs")
             kw = dict(conf["replay"])
             kw["symbols"] = tuple(kw["symbols"])
+            replay_config = BaselineConfig(**kw)
+            if canonical_sha256(replay_config.payload()) != canonical_sha256(conf):
+                raise ValueError("reproduction strategy configuration differs")
+            if replay_config.fingerprint() != original["strategy_configuration_fingerprint"]:
+                raise ValueError("reproduction strategy configuration fingerprint differs")
+            if original["configuration_sha256"] != original[
+                "strategy_configuration_fingerprint"
+            ]:
+                raise ValueError("recorded strategy configuration fingerprints disagree")
+            if canonical_sha256(original["exchange_filters"]) != original[
+                "exchange_filter_snapshot_sha256"
+            ]:
+                raise ValueError("reproduction exchange-filter snapshot differs")
             result = run(
                 args.manifest,
-                BaselineConfig(**kw),
+                replay_config,
                 original["exchange_filters"],
                 args.output,
                 include_holdout=original["holdout"]["status"] == "EVALUATED_FIXED_BASELINE_ONLY",

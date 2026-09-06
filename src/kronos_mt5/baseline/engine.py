@@ -1,7 +1,19 @@
-"""Replay the production TrendStrategy in Nautilus with explicit event timing.
+"""Replay the pinned deployed TrendStrategy in Nautilus with explicit event timing.
 
-The subclass changes transport/execution only: closed-bar decisions are queued
-until the following open. Native protective orders use synthetic OHLC quotes.
+``ReplayStrategy`` inherits the byte-exact strategy snapshot from deployed commit
+``dc8a74c``. It does not override signal, sizing, allocator, funding-veto, stop
+distance, or protective-order construction. The research-only overrides are:
+
+* ``on_start``: subscribe to supplied offline data, without live history/timers;
+* ``on_bar``: load/report warm-up and suppress decisions at the fixed end boundary;
+* ``_submit_entry_order``: queue the deployed decision for next-open execution;
+* ``_order_passes_filters``: retain deployed filters and collect rejections;
+* ``on_quote_tick``: supply synthetic OHLC execution, risk checks and liquidation;
+* fill/rejection callbacks: retain pinned protection logic and collect reports;
+* ``snapshot``: collect research-only equity/exposure observations.
+
+Historical funding and conservative costs are simulation transport. Patient-limit
+queueing, live intraday marks, outages and exchange behavior remain approximations.
 """
 
 from __future__ import annotations
@@ -22,10 +34,14 @@ from nautilus_trader.model.enums import AccountType, OmsType, OrderSide
 from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.model.objects import Money, Quantity
 
-from kronos_mt5.strategies.risk_manager import RiskState
-from kronos_mt5.strategies.trend_strategy import TrendStrategy, TrendStrategyConfig
-
-from .config import STRATEGY, BaselineConfig
+from .config import BaselineConfig, research_strategy_parameters
+from .deployed_risk_dc8a74c import RiskState
+from .deployed_trend_dc8a74c import (
+    TrendStrategy as DeployedTrendStrategy,
+)
+from .deployed_trend_dc8a74c import (
+    TrendStrategyConfig as DeployedTrendStrategyConfig,
+)
 from .instruments import instrument, reject_reason, rounded
 
 DAY_NS = 86_400_000_000_000
@@ -108,7 +124,21 @@ class FundingModule(SimulationModule):
         self.rates.clear()
 
 
-class ReplayStrategy(TrendStrategy):
+RESEARCH_OVERRIDES = frozenset(
+    {
+        "on_start",
+        "on_bar",
+        "_submit_entry_order",
+        "_order_passes_filters",
+        "on_quote_tick",
+        "on_order_filled",
+        "on_order_rejected",
+        "snapshot",
+    }
+)
+
+
+class ReplayStrategy(DeployedTrendStrategy):
     def __init__(
         self,
         config,
@@ -147,13 +177,12 @@ class ReplayStrategy(TrendStrategy):
         self.signal_history.append({"ts_ns": bar.ts_event, "closes": list(self._closes)})
         self.snapshot(bar.ts_event)
 
-    def _submit_entry_order(self, side, qty, price, *, target_units, threshold_notional):
+    def _submit_entry_order(self, side, qty, price):
         decision = {
             "ts_ns": self.clock.timestamp_ns(),
             "side": side.name,
             "qty": float(qty),
             "reference_price": price,
-            "target_units": target_units,
         }
         self.decisions.append(decision)
         self.pending = decision
@@ -314,6 +343,22 @@ def events_for_frame(frame: pd.DataFrame, inst, config: BaselineConfig, funding_
     return result
 
 
+def build_deployed_strategy_config(
+    instrument_id: str,
+    bar_type: str,
+    portfolio_instrument_ids: tuple[str, ...],
+) -> DeployedTrendStrategyConfig:
+    """Build the pinned strategy config, applying only offline startup transport."""
+
+    return DeployedTrendStrategyConfig(
+        instrument_id=instrument_id,
+        bar_type=bar_type,
+        portfolio_instrument_ids=portfolio_instrument_ids,
+        n_instruments=len(portfolio_instrument_ids),
+        **research_strategy_parameters(),
+    )
+
+
 def run_engine(
     frames: dict[str, pd.DataFrame],
     funding: dict[str, pd.DataFrame],
@@ -387,13 +432,10 @@ def run_engine(
             )
             engine.add_data(data)
             strategy = ReplayStrategy(
-                TrendStrategyConfig(
-                    instrument_id=str(inst.id),
-                    bar_type=f"{inst.id}-1-DAY-LAST-EXTERNAL",
-                    portfolio_instrument_ids=iids,
-                    n_instruments=len(config.symbols),
-                    warmup_request=False,
-                    **STRATEGY,
+                build_deployed_strategy_config(
+                    str(inst.id),
+                    f"{inst.id}-1-DAY-LAST-EXTERNAL",
+                    iids,
                 ),
                 config,
                 filters[symbol],

@@ -3,25 +3,21 @@
 from __future__ import annotations
 
 import json
-import platform
-import subprocess
 from pathlib import Path
 
-import nautilus_trader
-import numpy as np
 import pandas as pd
-import pyarrow
 
 from kronos_mt5.marketdata.manifest import save_manifest
-from kronos_mt5.marketdata.pipeline import digest, load_series, safe_output, validate_dataset
+from kronos_mt5.marketdata.pipeline import load_series, safe_output, validate_dataset
 from kronos_mt5.walk_forward import generate_windows
 
 from .config import BaselineConfig
 from .engine import DAY_NS, run_engine
 from .metrics import equity_metrics, summarize, trade_metrics
+from .provenance import canonical_sha256, collect_provenance
 
 LIMITATIONS = [
-    "Fixed deployed signal/risk parameters; current repository TrendStrategy execution safety code is newer than deployed dc8a74c. No strategy tuning.",
+    "This replays the deployed dc8a74c decision, sizing and protective-order logic from verified frozen source snapshots. Execution remains explicitly approximate; this is not a claim of byte-identical live execution.",
     "Historical in-sample status before this PR is unknown: repository research has already used parts of 2023+. Chronological replay is not proof these dates were unseen during original strategy selection.",
     "Patient limits are approximated as next-open market orders paying conservative 5bps/side taker commission by default. No maker fill, queue position, cancellation latency or fallback drift reconstruction.",
     "Daily bars produce an assumed OHLC path: open, high at 08:00+1ns, low at 16:00+1ns, close at day-end-2ns (OLHC sensitivity supported). Stops fill at executable quotes after gaps, not ideal trigger prices.",
@@ -33,31 +29,6 @@ LIMITATIONS = [
     "Gross PnL adds measured spread/slippage back to execution-price PnL; net equity already contains these costs and never subtracts them twice. Currency rounding residual is reported.",
     "CAGR and risk ratios from less than 365 days have low confidence. Undefined metrics are null, never invented as zero.",
 ]
-
-
-def provenance() -> dict:
-    root = Path(__file__).resolve().parents[3]
-    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
-    dirty = bool(
-        subprocess.check_output(["git", "status", "--porcelain"], cwd=root, text=True).strip()
-    )
-    files = [
-        root / "src/kronos_mt5/strategies/trend_strategy.py",
-        root / "src/kronos_mt5/strategies/risk_manager.py",
-    ]
-    files += [root / "src/kronos_mt5/walk_forward.py"]
-    files += sorted((root / "src/kronos_mt5/baseline").glob("*.py"))
-    files += sorted((root / "src/kronos_mt5/marketdata").glob("*.py"))
-    return {
-        "source_commit": commit,
-        "worktree_dirty": dirty,
-        "source_sha256": {str(p.relative_to(root)): digest(p) for p in files},
-        "python": platform.python_version(),
-        "nautilus_trader": nautilus_trader.__version__,
-        "pandas": pd.__version__,
-        "numpy": np.__version__,
-        "pyarrow": pyarrow.__version__,
-    }
 
 
 def chronological_windows(
@@ -75,13 +46,23 @@ def chronological_windows(
     return result
 
 
-def freeze(path: Path, config: BaselineConfig, filters: dict, source: dict) -> None:
+def freeze(
+    path: Path,
+    config: BaselineConfig,
+    filters: dict,
+    source: dict,
+    dataset_manifest_sha256: str,
+) -> None:
     # A filesystem lock records the exact pre-holdout configuration. It does not
     # claim to prevent a human from creating another directory and data snooping.
     payload = {
         "configuration_sha256": config.fingerprint(),
-        "filters": filters,
-        "source_sha256": source["source_sha256"],
+        "exchange_filter_snapshot_sha256": canonical_sha256(filters),
+        "dataset_manifest_sha256": dataset_manifest_sha256,
+        "deployed_bot_commit": source["deployed_bot_commit"],
+        "deployed_strategy_blob_sha256": source["deployed_strategy_blob_sha256"],
+        "research_implementation_commit": source["research_implementation_commit"],
+        "research_adapter_sha256": source["research_adapter_sha256"],
         "holdout_start": config.holdout_start,
     }
     if path.exists():
@@ -141,8 +122,15 @@ def run(
     if not set(config.symbols) <= set(filters):
         raise ValueError("missing exchange constraints")
     output = safe_output(output)
-    source = provenance()
-    freeze(output / "baseline-lock.json", config, filters_payload, source)
+    source = collect_provenance()
+    filters_sha256 = canonical_sha256(filters_payload)
+    freeze(
+        output / "baseline-lock.json",
+        config,
+        filters_payload,
+        source,
+        validation["manifest_sha256"],
+    )
     # Daily history for eight symbols is small (~11k rows). Downloader/validator
     # remain bounded per partition; higher-frequency history is never loaded here.
     frames = {s: load_series(manifest_path, s, "1d") for s in config.symbols}
@@ -206,12 +194,16 @@ def run(
     report = {
         "schema_version": 1,
         **source,
+        "provenance": source,
         "dataset_manifest": manifest,
         "dataset_manifest_path": str(manifest_path.resolve()),
+        "dataset_manifest_sha256": validation["manifest_sha256"],
         "validation": validation,
         "configuration": config.payload(),
         "configuration_sha256": config.fingerprint(),
+        "strategy_configuration_fingerprint": config.fingerprint(),
         "exchange_filters": filters_payload,
+        "exchange_filter_snapshot_sha256": filters_sha256,
         "limitations": LIMITATIONS,
         "universe_scope": "full_deployed" if len(config.symbols) == 8 else "subset_smoke_only",
         "completeness": "APPROXIMATE_BASELINE"
@@ -253,7 +245,9 @@ def render(report: dict) -> str:
         "",
         f"Status: **{report['completeness']}**.",
         "",
-        f"Source commit: `{report['source_commit']}`; dirty worktree: `{report['worktree_dirty']}`.",
+        f"Deployed bot commit: `{report['deployed_bot_commit']}`.",
+        f"Deployed strategy SHA-256: `{report['deployed_strategy_blob_sha256']}`; snapshot verified: `{report['deployed_snapshot_verification_passed']}`.",
+        f"Research implementation commit: `{report['research_implementation_commit']}`.",
         f"Manifest SHA-256: `{report['validation']['manifest_sha256']}`.",
         f"Configuration SHA-256: `{report['configuration_sha256']}`.",
         "",

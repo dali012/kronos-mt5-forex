@@ -22,5 +22,10 @@ line-length = 100
 # Generated Kaggle notebook (built by kaggle/_make_notebook.py); not hand-edited.
 extend-exclude = ["kaggle/kronos_walkforward.ipynb"]
 
+[tool.ruff.lint.per-file-ignores]
+# Frozen byte-for-byte from deployed commit dc8a74c; changing it would break provenance.
+"src/kronos_mt5/baseline/deployed_trend_dc8a74c.py" = ["FURB157", "I001", "RUF100", "SIM103"]
+"src/kronos_mt5/baseline/deployed_risk_dc8a74c.py" = ["I001", "RUF100"]
+
 [tool.black]
 line-length = 100

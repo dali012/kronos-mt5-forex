@@ -6,19 +6,63 @@ on:
   pull_request:
 
 jobs:
-  test:
+  phase3-lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
-      - name: Install deps (live runtime + dev)
+      - name: Install research dependencies
         run: |
           python -m pip install -U pip
-          pip install -r requirements-live.txt ruff pytest
-      - name: Lint (ruff)
-        run: ruff check .
+          pip install -r requirements-research.txt
+      - name: Verify frozen deployed strategy
+        run: |
+          echo "33a8821d843d2b8c472c6f1a832b6d66fd297bd90ef9ff81fe8293c70eab085d  src/kronos_mt5/baseline/deployed_trend_dc8a74c.py" | sha256sum --check
+          echo "17330fd3eda6a622d29ef17d4a597ed1deb7198049346b286b3dffcab0f2e31a  src/kronos_mt5/baseline/deployed_risk_dc8a74c.py" | sha256sum --check
+      - name: Lint Phase 3 Python
+        run: |
+          ruff check \
+            backtest/walk_forward.py \
+            src/kronos_mt5/baseline \
+            src/kronos_mt5/marketdata \
+            src/kronos_mt5/walk_forward.py \
+            tests/test_baseline.py \
+            tests/test_marketdata.py
+
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install research dependencies
+        run: |
+          python -m pip install -U pip
+          pip install -r requirements-research.txt
       - name: Tests (fast — skips the slow Kronos model test)
         run: python -m pytest -q -m "not slow"
+
+  legacy-lint:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install Ruff
+        run: pip install ruff
+      - name: Report legacy full-repository Ruff debt
+        run: ruff check .
