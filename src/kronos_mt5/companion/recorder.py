@@ -16,6 +16,21 @@ from nautilus_trader.model.identifiers import InstrumentId, Venue
 from nautilus_trader.trading.strategy import Strategy, StrategyConfig
 
 from kronos_mt5.companion import store
+from kronos_mt5.execution import (
+    ROLE_PATIENT_FALLBACK,
+    TAG_DECISION_TS,
+    TAG_FALLBACK_DRIFT,
+    TAG_FALLBACK_REASON,
+    TAG_LIMIT_PX,
+    TAG_REF_PX,
+    TAG_RISK_PCT,
+    classify_exec_role,
+    implementation_shortfall_bps,
+    implementation_shortfall_quote,
+    liquidity_label,
+    tag_float,
+    tag_int,
+)
 
 
 class CompanionConfig(StrategyConfig, frozen=True):
@@ -300,39 +315,57 @@ class Companion(Strategy):
     def _record_new_fills(self) -> None:
         for order in self.cache.orders():
             ot = order.order_type.name
+            reduce_only = bool(getattr(order, "is_reduce_only", False))
             if ot == "STOP_MARKET":
                 kind = "STOP"
             elif ot == "TRAILING_STOP_MARKET":
                 kind = "TRAIL"
-            elif getattr(order, "is_reduce_only", False):
+            elif reduce_only:
                 kind = "TP" if ot == "LIMIT" else "STOP"
             else:
                 kind = "TREND"
+            tags = getattr(order, "tags", None)
             reference = self._reference_price(order)
+            exec_role = classify_exec_role(ot, reduce_only=reduce_only, tags=tags)
+            decision_ts_ns = tag_int(tags, TAG_DECISION_TS)
+            limit_price = tag_float(tags, TAG_LIMIT_PX)
+            if limit_price is None and ot == "LIMIT":
+                limit_price = self._as_float(getattr(order, "price", None))
+            fallback_reason = None
+            adverse_drift = None
+            if exec_role == ROLE_PATIENT_FALLBACK:
+                fallback_reason = self._tag_text(order, TAG_FALLBACK_REASON)
+                adverse_drift = tag_float(tags, TAG_FALLBACK_DRIFT)
             for index, event in enumerate(order.events):
                 if not isinstance(event, OrderFilled):
                     continue
                 qty = float(event.last_qty)
                 price = float(event.last_px)
+                side = event.order_side.name
                 trade_id = event.trade_id.value if event.trade_id is not None else ""
                 fill_id = (
                     f"{order.instrument_id.symbol.value}:{trade_id}"
                     if trade_id
                     else f"{order.client_order_id.value}:{event.ts_event}:{index}"
                 )
-                slippage = None
-                if reference is not None:
-                    slippage = (
-                        (price - reference) * qty
-                        if event.is_buy
-                        else (reference - price) * qty
-                    )
+                # `slippage` and `impl_shortfall_quote` are the same measurement,
+                # kept under both names for backward compatibility. POSITIVE means
+                # the fill was worse than the decision price. It is embedded in the
+                # execution price and is never booked as a separate cash expense.
+                shortfall_quote = None
+                shortfall_bps = None
+                if reference is not None and reference > 0 and price > 0:
+                    shortfall_quote = implementation_shortfall_quote(side, reference, price, qty)
+                    shortfall_bps = implementation_shortfall_bps(side, reference, price)
+                latency_ms = None
+                if decision_ts_ns:
+                    latency_ms = max(0.0, (int(event.ts_event) - decision_ts_ns) / 1e6)
                 commission = event.commission.as_double() if event.commission is not None else None
                 ts = datetime.fromtimestamp(event.ts_event / 1e9, tz=timezone.utc).isoformat()
                 store.record_fill(
                     fill_id=fill_id,
                     symbol=order.instrument_id.symbol.value,
-                    side=event.order_side.name,
+                    side=side,
                     qty=qty,
                     price=price,
                     kind=kind,
@@ -340,8 +373,20 @@ class Companion(Strategy):
                     trade_id=trade_id,
                     commission=commission,
                     reference_price=reference,
-                    slippage=slippage,
+                    slippage=shortfall_quote,
                     reconciliation=bool(event.reconciliation),
+                    order_type=ot,
+                    liquidity=liquidity_label(
+                        getattr(getattr(event, "liquidity_side", None), "name", None)
+                    ),
+                    exec_role=exec_role,
+                    decision_price=reference,
+                    limit_price=limit_price,
+                    decision_to_fill_ms=latency_ms,
+                    fallback_reason=fallback_reason,
+                    adverse_drift_bps=adverse_drift,
+                    impl_shortfall_quote=shortfall_quote,
+                    impl_shortfall_bps=shortfall_bps,
                     db_path=self.config.db_path,
                 )
 
@@ -353,7 +398,7 @@ class Companion(Strategy):
                 if position.closing_order_id is not None
                 else None
             )
-            risk_pct = self._tag_float(opening, "RISK_PCT=")
+            risk_pct = self._tag_float(opening, TAG_RISK_PCT)
             peak_qty = float(position.peak_qty)
             entry = float(position.avg_px_open)
             initial_risk = peak_qty * entry * risk_pct if risk_pct else None
@@ -385,13 +430,25 @@ class Companion(Strategy):
     def _tag_float(order, prefix: str) -> float | None:  # noqa: ANN001
         if order is None:
             return None
-        for tag in order.tags or []:
-            if tag.startswith(prefix):
-                try:
-                    return float(tag.removeprefix(prefix))
-                except ValueError:
-                    return None
+        return tag_float(getattr(order, "tags", None), prefix)
+
+    @staticmethod
+    def _tag_text(order, prefix: str) -> str | None:  # noqa: ANN001
+        if order is None:
+            return None
+        for tag in getattr(order, "tags", None) or []:
+            if str(tag).startswith(prefix):
+                return str(tag)[len(prefix) :]
         return None
+
+    @staticmethod
+    def _as_float(value) -> float | None:  # noqa: ANN001
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _exit_reason(order) -> str:  # noqa: ANN001
@@ -408,12 +465,9 @@ class Companion(Strategy):
 
     @staticmethod
     def _reference_price(order) -> float | None:  # noqa: ANN001
-        for tag in order.tags or []:
-            if tag.startswith("REF_PX="):
-                try:
-                    return float(tag.removeprefix("REF_PX="))
-                except ValueError:
-                    pass
+        tagged = tag_float(getattr(order, "tags", None), TAG_REF_PX)
+        if tagged is not None:
+            return tagged
         for name in ("trigger_price", "price", "activation_price"):
             value = getattr(order, name, None)
             if value is not None:
