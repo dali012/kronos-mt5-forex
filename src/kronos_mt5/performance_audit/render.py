@@ -157,10 +157,17 @@ def render_report(analysis: dict, run: dict) -> str:
             add(f"- {key.replace('_', ' ')}: `{source[key]}`")
     else:
         add("- No export provenance available (database supplied directly).")
-    add(
-        f"- Environment: `{context.get('binance_environment') or 'unknown'}`, "
-        f"DEMO_ONLY=`{context.get('demo_only')}`"
-    )
+    if context.get("provenance_known"):
+        add(
+            f"- Environment: `{context.get('binance_environment')}`, "
+            f"DEMO_ONLY=`{context.get('demo_only')}`"
+        )
+    else:
+        add(
+            "- Environment: **UNKNOWN — provenance could not be established.** The "
+            "audit does not guess the environment from table contents. Missing: "
+            f"`{context.get('missing_provenance')}`"
+        )
     add(f"- Symbols traded: {', '.join(context.get('symbols') or []) or 'n/a'}")
     add(f"- OHLCV available: **{'yes' if context.get('ohlcv_available') else 'no'}**")
     add("")
@@ -192,7 +199,14 @@ def render_report(analysis: dict, run: dict) -> str:
         add("|---|---:|")
         add(f"| Window | {equity.get('first_day')} .. {equity.get('last_day')} |")
         add(
-            f"| Days covered / observed | {equity.get('days_covered')} / {equity.get('days_observed')} |"
+            f"| Calendar days covered | {equity.get('calendar_days_covered')} "
+            f"(inclusive dates) |"
+        )
+        add(f"| Elapsed days | {equity.get('elapsed_days')} (CAGR basis) |")
+        add(f"| Days observed | {equity.get('days_observed')} |")
+        add(
+            f"| Return periods | {equity.get('return_periods')} "
+            f"({equity.get('ratio_return_periods')} used for ratios) |"
         )
         add(f"| Starting equity | {_num(equity.get('start_equity'), 4)} |")
         add(f"| Ending equity | {_num(equity.get('end_equity'), 4)} |")
@@ -200,7 +214,10 @@ def render_report(analysis: dict, run: dict) -> str:
         add(f"| Maximum equity | {_num(equity.get('max_equity'), 4)} |")
         add(f"| Absolute return | {_num(equity.get('absolute_return'), 4)} |")
         add(f"| Total return | {_num(equity.get('total_return_pct'), 4, '%')} |")
-        add(f"| Annualized return | {_num(equity.get('annualized_return_pct'), 2, '%')} |")
+        add(
+            f"| Annualized return (CAGR) | "
+            f"{_num(equity.get('annualized_return_pct'), 4, '%')} |"
+        )
         add(f"| Annualized volatility | {_num(equity.get('annualized_volatility_pct'), 2, '%')} |")
         add(f"| Sharpe (rf=0) | {_num(equity.get('sharpe_ratio'), 3)} |")
         add(f"| Sortino | {_num(equity.get('sortino_ratio'), 3)} |")
@@ -215,6 +232,12 @@ def render_report(analysis: dict, run: dict) -> str:
         add(f"| Best day | {best.get('date')} ({_num(best.get('return_pct'), 3, '%')}) |")
         add(f"| Worst day | {worst.get('date')} ({_num(worst.get('return_pct'), 3, '%')}) |")
         add("")
+        if equity.get("ratios_note"):
+            add(f"> **Ratio basis:** {equity['ratios_note']}")
+            add("")
+        if not equity.get("ratios_available", True):
+            add("> Volatility, Sharpe and Sortino are reported as **unavailable**.")
+            add("")
         if equity.get("annualized_low_confidence"):
             add(f"> **Low confidence:** {equity.get('annualized_confidence_note')}")
             add("")
@@ -320,6 +343,57 @@ def render_report(analysis: dict, run: dict) -> str:
             f"{'yes' if accounting.get('reconciled_within_tolerance') else 'NO'} |"
         )
         add("")
+        window = accounting.get("window") or {}
+        income_window = accounting.get("income_window") or {}
+        fills_window = accounting.get("fills_window") or {}
+        if window:
+            add("### Reconciliation window")
+            add("")
+            add(f"`{window.get('rule')}`")
+            add("")
+            add(f"- Start (exclusive): `{window.get('start_exclusive')}`")
+            add(f"- End (inclusive): `{window.get('end_inclusive')}`")
+            add("")
+            add("| Ledger | Included | Before | After | Bad timestamp |")
+            add("|---|---:|---:|---:|---:|")
+            for label, block in (("income", income_window), ("fills", fills_window)):
+                add(
+                    f"| {label} | {block.get('included')} | "
+                    f"{block.get('before_window')} | {block.get('after_window')} | "
+                    f"{block.get('invalid_timestamp')} |"
+                )
+            add("")
+            excluded = income_window.get("excluded_amounts_by_type") or {}
+            if any(excluded.values()):
+                add("Excluded income amounts by type:")
+                add("")
+                for bucket, amounts in excluded.items():
+                    if amounts:
+                        add(f"- `{bucket}`: {amounts}")
+                add("")
+            excluded_commission = fills_window.get("excluded_commission") or {}
+            if any(excluded_commission.values()):
+                add(f"- Excluded fill commission: `{excluded_commission}`")
+                add(
+                    f"- Excluded fill slippage (quote): "
+                    f"`{fills_window.get('excluded_slippage_quote')}`"
+                )
+                add("")
+            for label, block in (("income", income_window), ("fills", fills_window)):
+                dedupe = block.get("deduplication") or {}
+                if dedupe.get("exact_duplicates") or dedupe.get("conflicting_id_count"):
+                    add(
+                        f"- `{label}` de-duplication: "
+                        f"{dedupe.get('exact_duplicates')} exact duplicate(s), "
+                        f"{dedupe.get('conflicting_id_count')} conflicting id(s)"
+                    )
+            if not accounting.get("reconciliation_reliable", True):
+                add("")
+                add(
+                    f"> **Reconciliation unreliable.** "
+                    f"{accounting.get('reconciliation_unreliable_reason')}"
+                )
+            add("")
         add(
             "Recorded slippage (measurement only, **not** a cash expense): "
             f"{_num(accounting.get('fills_slippage_total_quote'), 4)} quote currency "
@@ -471,6 +545,19 @@ def render_report(analysis: dict, run: dict) -> str:
     )
     add(f"- Distinct restart days: {regimes.get('distinct_restart_days')}")
     add("")
+    add(
+        f"- Incident windows evaluable: {operations.get('incidents_evaluable')} / "
+        f"{operations.get('incidents_total')} "
+        f"(freshness tolerance {_num(operations.get('freshness_tolerance_seconds'), 0)}s)"
+    )
+    add("")
+    reasons = operations.get("not_evaluable_reasons") or {}
+    if reasons:
+        add("Incident windows reported as **not evaluable**, and why:")
+        add("")
+        for reason, count in reasons.items():
+            add(f"- {count} x {reason}")
+        add("")
     worst = operations.get("most_negative_incident_windows") or []
     if worst:
         add(
@@ -478,12 +565,14 @@ def render_report(analysis: dict, run: dict) -> str:
             "(association, not causation):"
         )
         add("")
-        add("| Incident | Started | Equity change in window |")
-        add("|---|---|---:|")
+        add("| Incident | Started | Before | After | Equity change |")
+        add("|---|---|---:|---:|---:|")
         for item in worst[:5]:
             add(
                 f"| {item['kind']} | {item['started_ts']} | "
-                f"{_num(item['equity_change_in_window'], 4)} |"
+                f"{_num(item.get('equity_before'), 4)} | "
+                f"{_num(item.get('equity_after'), 4)} | "
+                f"{_num(item.get('equity_change'), 4)} |"
             )
         add("")
 

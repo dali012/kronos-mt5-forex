@@ -77,6 +77,35 @@ def build_findings(analysis: dict) -> list[dict]:
             )
         )
 
+    if not context.get("provenance_known"):
+        out.append(
+            finding(
+                "PA-ENV-002",
+                WARNING,
+                "Trading environment provenance is unknown",
+                scope="context/provenance",
+                evidence={
+                    "missing": context.get("missing_provenance"),
+                    "binance_environment": context.get("binance_environment"),
+                    "demo_only": context.get("demo_only"),
+                    "source_commit": (context.get("source") or {}).get("source_commit"),
+                },
+                impact=(
+                    "The audit cannot establish whether this database represents "
+                    "testnet, live trading, several runs mixed together, or a copy "
+                    "of another account. Environment was NOT guessed from table "
+                    "contents. Every profitability conclusion is therefore "
+                    "unsupported, and these results must not be presented as live."
+                ),
+                remediation=(
+                    "Audit the full sanitized export archive rather than a bare "
+                    "database, so the environment and source commit travel with "
+                    "the data."
+                ),
+                prominent=True,
+            )
+        )
+
     # --- sample length ---------------------------------------------------
     days = equity.get("days_covered")
     if isinstance(days, int) and days < 365:
@@ -341,6 +370,66 @@ def build_findings(analysis: dict) -> list[dict]:
         )
 
     # --- accounting -------------------------------------------------------
+    if accounting.get("conflicting_duplicate_ids", {}).get("total"):
+        out.append(
+            finding(
+                "PA-ACC-005",
+                ERROR,
+                "Record ids appear more than once with conflicting content",
+                scope="income.income_id / fills.fill_id",
+                evidence={
+                    "income_ids": accounting["conflicting_duplicate_ids"]["income"][:20],
+                    "fill_ids": accounting["conflicting_duplicate_ids"]["fills"][:20],
+                    "total": accounting["conflicting_duplicate_ids"]["total"],
+                },
+                impact=(
+                    "No row was silently chosen, so the affected totals — and the "
+                    "reconciliation residual derived from them — are unreliable."
+                ),
+                remediation=(
+                    "Fix the writer's id construction, then re-export. Until then "
+                    "treat the accounting section as indicative only."
+                ),
+                prominent=True,
+            )
+        )
+    income_window = accounting.get("income_window") or {}
+    fills_window = accounting.get("fills_window") or {}
+    outside = sum(
+        (window.get(key) or 0)
+        for window in (income_window, fills_window)
+        for key in ("before_window", "after_window", "invalid_timestamp")
+    )
+    if outside:
+        out.append(
+            finding(
+                "PA-ACC-006",
+                INFO,
+                f"{outside} ledger record(s) fall outside the equity window",
+                scope="income + fills vs equity window",
+                evidence={
+                    "window": accounting.get("window"),
+                    "income": {
+                        k: income_window.get(k)
+                        for k in ("before_window", "after_window", "invalid_timestamp")
+                    },
+                    "fills": {
+                        k: fills_window.get(k)
+                        for k in ("before_window", "after_window", "invalid_timestamp")
+                    },
+                    "excluded_income_amounts": income_window.get("excluded_amounts_by_type"),
+                },
+                impact=(
+                    "Those records are excluded so the identity is evaluated over "
+                    "exactly the equity interval. Totals here will not match a naive "
+                    "SUM over the whole table."
+                ),
+                remediation=(
+                    "Expected when the income cursor starts before the first equity "
+                    "snapshot; investigate only if the excluded amounts are large."
+                ),
+            )
+        )
     if accounting.get("available") and not accounting.get("reconciled_within_tolerance"):
         out.append(
             finding(
@@ -451,6 +540,30 @@ def build_findings(analysis: dict) -> list[dict]:
             )
         )
     incidents = operations.get("incidents_by_kind") or {}
+    if operations.get("incidents_not_evaluable"):
+        out.append(
+            finding(
+                "PA-OPS-005",
+                INFO,
+                f"{operations['incidents_not_evaluable']} incident window(s) not evaluable",
+                scope="incidents vs equity",
+                evidence={
+                    "not_evaluable": operations.get("incidents_not_evaluable"),
+                    "evaluable": operations.get("incidents_evaluable"),
+                    "reasons": operations.get("not_evaluable_reasons"),
+                    "freshness_tolerance_seconds": operations.get("freshness_tolerance_seconds"),
+                },
+                impact=(
+                    "No equity change is reported for those incidents. A stale or "
+                    "missing endpoint would otherwise produce a number that looks "
+                    "like measurement but describes a different moment."
+                ),
+                remediation=(
+                    "Usually a telemetry gap around the incident; correlate with "
+                    "BOT_DOWN and restart events."
+                ),
+            )
+        )
     if incidents.get("MARK_STALE"):
         out.append(
             finding(

@@ -20,6 +20,9 @@ from kronos_mt5.performance_audit.loading import as_float, parse_ts
 PERIODS_PER_YEAR = 365  # crypto trades every calendar day
 MIN_DAYS_FOR_ANNUALIZATION = 30
 CONFIDENT_HISTORY_DAYS = 365
+# Below this many consecutive-day returns the volatility-based ratios are
+# reported as unavailable rather than computed from an unusable sample.
+MIN_RATIO_RETURNS = 2
 # A snapshot cadence of ~60s means anything beyond this is a real telemetry hole.
 GAP_ALERT_SECONDS = 3600.0
 
@@ -88,14 +91,24 @@ def normalize_daily(rows: list[dict]) -> dict:
         entry["max_n_open"] = max(opens) if opens else None
         daily.append(entry)
 
-    # Attach the day-over-day return once the series is ordered.
-    previous = None
+    # Attach the day-over-day return once the series is ordered. `gap_days`
+    # records how many calendar days the return actually spans: a return that
+    # bridges missing days is NOT a daily return and is excluded from the
+    # volatility-based ratios. Nothing is ever interpolated.
+    previous_value = None
+    previous_date = None
     for entry in daily:
-        if previous is None or previous <= 0:
+        current_date = date.fromisoformat(entry["date"])
+        if previous_value is None or previous_value <= 0:
             entry["return"] = None
+            entry["gap_days"] = None
+            entry["consecutive"] = False
         else:
-            entry["return"] = entry["equity"] / previous - 1.0
-        previous = entry["equity"]
+            entry["return"] = entry["equity"] / previous_value - 1.0
+            entry["gap_days"] = (current_date - previous_date).days
+            entry["consecutive"] = entry["gap_days"] == 1
+        previous_value = entry["equity"]
+        previous_date = current_date
 
     gaps = _observation_gaps(observations)
     missing = _missing_days(daily)
@@ -280,15 +293,30 @@ def analyze_equity(rows: list[dict]) -> dict:
         return out
 
     first, last = daily[0], daily[-1]
-    covered_days = (date.fromisoformat(last["date"]) - date.fromisoformat(first["date"])).days + 1
+    first_date = date.fromisoformat(first["date"])
+    last_date = date.fromisoformat(last["date"])
+    # Three counts, deliberately not interchangeable:
+    #   calendar_days_covered - inclusive span of dates (16 Jun..05 Sep == 82)
+    #   elapsed_days          - time actually elapsed   (81) -> the CAGR exponent
+    #   days_observed         - dates that actually carry an observation
+    calendar_days_covered = (last_date - first_date).days + 1
+    elapsed_days = (last_date - first_date).days
     start_equity, end_equity = first["equity"], last["equity"]
     total_return = end_equity / start_equity - 1.0 if start_equity > 0 else None
 
-    returns = [e["return"] for e in daily if e["return"] is not None]
-    positive = sum(1 for r in returns if r > 0)
-    negative = sum(1 for r in returns if r < 0)
-    flat = sum(1 for r in returns if r == 0)
+    all_returns = [e["return"] for e in daily if e["return"] is not None]
+    # Only a return spanning exactly one calendar day is a daily return. A
+    # multi-day return carries multi-day variance and would deflate volatility
+    # and inflate Sharpe if pooled with the rest.
+    ratio_returns = [e["return"] for e in daily if e.get("consecutive") and e["return"] is not None]
+    excluded_gap_returns = len(all_returns) - len(ratio_returns)
 
+    positive = sum(1 for r in all_returns if r > 0)
+    negative = sum(1 for r in all_returns if r < 0)
+    flat = sum(1 for r in all_returns if r == 0)
+
+    ratios_available = len(ratio_returns) >= MIN_RATIO_RETURNS
+    returns = ratio_returns if ratios_available else []
     stdev = _stdev(returns)
     mean = (sum(returns) / len(returns)) if returns else None
     downside = [min(r, 0.0) for r in returns]
@@ -302,9 +330,11 @@ def analyze_equity(rows: list[dict]) -> dict:
     if downside_dev and downside_dev > 0 and mean is not None:
         sortino = mean / downside_dev * math.sqrt(PERIODS_PER_YEAR)
 
+    # CAGR compounds over ELAPSED time, not over the inclusive date count. With a
+    # single observation day elapsed_days is 0 and the figure is undefined.
     annualized_return = None
-    if total_return is not None and covered_days > 0 and (1.0 + total_return) > 0:
-        annualized_return = (1.0 + total_return) ** (PERIODS_PER_YEAR / covered_days) - 1.0
+    if total_return is not None and elapsed_days > 0 and (1.0 + total_return) > 0:
+        annualized_return = (1.0 + total_return) ** (PERIODS_PER_YEAR / elapsed_days) - 1.0
 
     drawdown = max_drawdown(daily)
     calmar = None
@@ -317,24 +347,47 @@ def analyze_equity(rows: list[dict]) -> dict:
     opens = [e["mean_n_open"] for e in daily if e["mean_n_open"] is not None]
     days_flat_book = sum(1 for e in daily if (e["max_n_open"] or 0) == 0)
 
-    low_confidence = covered_days < CONFIDENT_HISTORY_DAYS
+    ratios_note = None
+    if not ratios_available:
+        ratios_note = (
+            f"only {len(ratio_returns)} consecutive-day returns are available "
+            f"(minimum {MIN_RATIO_RETURNS}); volatility, Sharpe and Sortino are "
+            f"reported as unavailable rather than computed from an unusable sample"
+        )
+    elif excluded_gap_returns:
+        ratios_note = (
+            f"{excluded_gap_returns} return(s) spanned missing calendar days and "
+            f"were excluded from the volatility-based ratios; they remain in the "
+            f"return series and in the positive/negative day counts"
+        )
+
+    low_confidence = elapsed_days < CONFIDENT_HISTORY_DAYS
     out.update(
         {
             "first_observation": first["ts"],
             "last_observation": last["ts"],
             "first_day": first["date"],
             "last_day": last["date"],
-            "days_covered": covered_days,
+            "calendar_days_covered": calendar_days_covered,
+            "elapsed_days": elapsed_days,
             "days_observed": len(daily),
+            "return_periods": len(all_returns),
+            "ratio_return_periods": len(ratio_returns),
+            "excluded_gap_returns": excluded_gap_returns,
+            "ratios_available": ratios_available,
+            "ratios_note": ratios_note,
+            # kept so a consumer written against schema 1.0.0 keeps working
+            "days_covered": calendar_days_covered,
             "start_equity": start_equity,
             "end_equity": end_equity,
             "min_equity": min(e["equity"] for e in daily),
             "max_equity": max(e["equity"] for e in daily),
             "absolute_return": end_equity - start_equity,
             "total_return_pct": total_return * 100.0 if total_return is not None else None,
-            "daily_return_count": len(returns),
+            "daily_return_count": len(all_returns),
             "mean_daily_return_pct": mean * 100.0 if mean is not None else None,
-            "median_daily_return_pct": (_median(returns) * 100.0 if returns else None),
+            "median_daily_return_pct": (_median(all_returns) * 100.0 if all_returns else None),
+            "mean_daily_return_basis": "consecutive-day returns only",
             "positive_days": positive,
             "negative_days": negative,
             "flat_days": flat,
@@ -354,12 +407,13 @@ def analyze_equity(rows: list[dict]) -> dict:
             "periods_per_year": PERIODS_PER_YEAR,
             "annualized_low_confidence": low_confidence,
             "annualized_confidence_note": (
-                f"history covers {covered_days} days; annualized figures extrapolate "
+                f"history spans {elapsed_days} elapsed days; annualized figures extrapolate "
                 f"from less than {CONFIDENT_HISTORY_DAYS} days and are indicative only"
                 if low_confidence
                 else None
             ),
-            "annualization_suppressed": covered_days < MIN_DAYS_FOR_ANNUALIZATION,
+            "annualization_suppressed": elapsed_days < MIN_DAYS_FOR_ANNUALIZATION,
+            "annualization_basis": "elapsed_days",
             "zero_variance": bool(stdev is not None and stdev == 0),
             "exposure": {
                 "mean_positions": (sum(opens) / len(opens)) if opens else None,

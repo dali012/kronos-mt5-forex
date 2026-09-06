@@ -18,7 +18,14 @@ from pathlib import Path
 
 import pytest
 
-from kronos_mt5.performance_audit import accounting, equity, fills, positions, shadow
+from kronos_mt5.performance_audit import (
+    accounting,
+    equity,
+    fills,
+    operations,
+    positions,
+    shadow,
+)
 from kronos_mt5.performance_audit.audit import build_run_metadata, run_analysis
 from kronos_mt5.performance_audit.cli import main
 from kronos_mt5.performance_audit.findings import build_findings
@@ -166,10 +173,10 @@ def test_short_history_is_flagged_low_confidence():
 # --------------------------------------------------------------------------
 
 
-def _income(kind: str, amount: float, day: int, index: int) -> dict:
+def _income(kind: str, amount: float, day: int, index: int, hour: int = 12) -> dict:
     return {
         "income_id": f"{kind}-{index}",
-        "ts": _ts(day),
+        "ts": _ts(day, hour),
         "income_type": kind,
         "amount": amount,
         "symbol": "BTCUSDT-PERP",
@@ -181,10 +188,11 @@ def test_accounting_residual_is_exact():
         _equity_row(0, 1000.0, unrealized=0.0),
         _equity_row(1, 1010.0, unrealized=5.0),
     ]
+    # day 1 at 12:00 sits strictly inside (day 0 23:00, day 1 23:00]
     income_rows = [
-        _income("REALIZED_PNL", 8.0, 0, 1),
-        _income("COMMISSION", -1.0, 0, 2),
-        _income("FUNDING_FEE", 0.5, 0, 3),
+        _income("REALIZED_PNL", 8.0, 1, 1),
+        _income("COMMISSION", -1.0, 1, 2),
+        _income("FUNDING_FEE", 0.5, 1, 3),
     ]
     daily = equity.analyze_equity(equity_rows)["daily"]
     result = accounting.reconcile(equity_rows, income_rows, [], daily)
@@ -199,8 +207,8 @@ def test_accounting_residual_is_exact():
 def test_accounting_reconciles_within_tolerance():
     equity_rows = [_equity_row(0, 1000.0), _equity_row(1, 1009.5)]
     income_rows = [
-        _income("REALIZED_PNL", 10.0, 0, 1),
-        _income("COMMISSION", -0.5, 0, 2),
+        _income("REALIZED_PNL", 10.0, 1, 1),
+        _income("COMMISSION", -0.5, 1, 2),
     ]
     daily = equity.analyze_equity(equity_rows)["daily"]
     result = accounting.reconcile(equity_rows, income_rows, [], daily)
@@ -232,6 +240,443 @@ def test_restart_regimes_are_detected():
     assert result["starts"] == 2
     assert result["continuous_single_run"] is False
     assert result["distinct_restart_days"] == 2
+
+
+# --------------------------------------------------------------------------
+# blocker 1: elapsed days, CAGR basis, gap-aware ratios
+# --------------------------------------------------------------------------
+
+
+def test_inclusive_dates_and_elapsed_days_are_separate():
+    """16 Jun .. 05 Sep is 82 inclusive dates but only 81 elapsed days."""
+    rows = [_equity_row(i, 1000.0 + i) for i in range(82)]
+    result = equity.analyze_equity(rows)
+    assert result["calendar_days_covered"] == 82
+    assert result["elapsed_days"] == 81
+    assert result["days_observed"] == 82
+    assert result["return_periods"] == 81
+    assert result["annualization_basis"] == "elapsed_days"
+
+
+def test_cagr_uses_elapsed_days_exactly():
+    """The corrected figure for the export's return over 81 elapsed days."""
+    total = -0.0006962588685214266  # -0.06962588685214266 %
+    rows = [
+        _equity_row(0, 1000.0),
+        _equity_row(81, 1000.0 * (1 + total)),
+    ]
+    result = equity.analyze_equity(rows)
+    assert result["elapsed_days"] == 81
+    expected = (1 + total) ** (365 / 81) - 1
+    assert result["annualized_return_pct"] == pytest.approx(expected * 100.0)
+    assert round(result["annualized_return_pct"], 4) == pytest.approx(-0.3134)
+    # the old inclusive-count basis would have produced a different number
+    wrong = ((1 + total) ** (365 / 82) - 1) * 100.0
+    assert round(wrong, 4) != round(result["annualized_return_pct"], 4)
+
+
+def test_single_observation_has_no_cagr():
+    result = equity.analyze_equity([_equity_row(0, 1000.0)])
+    assert result["calendar_days_covered"] == 1
+    assert result["elapsed_days"] == 0
+    assert result["return_periods"] == 0
+    assert result["annualized_return_pct"] is None  # undefined, not zero
+    assert result["total_return_pct"] == pytest.approx(0.0)
+
+
+def test_two_observations_on_the_same_day_have_no_cagr():
+    rows = [_equity_row(0, 1000.0, hour=1), _equity_row(0, 1100.0, hour=23)]
+    result = equity.analyze_equity(rows)
+    assert result["days_observed"] == 1
+    assert result["elapsed_days"] == 0
+    assert result["return_periods"] == 0
+    assert result["annualized_return_pct"] is None
+    # the daily series keeps the last observation, so total return is zero
+    assert result["start_equity"] == 1100.0
+    assert result["observation_series"]["first_equity"] == 1000.0
+
+
+def test_multi_day_gap_marks_the_return_non_consecutive():
+    rows = [_equity_row(0, 100.0), _equity_row(1, 110.0), _equity_row(5, 121.0)]
+    result = equity.analyze_equity(rows)
+    gaps = [(d["date"], d["gap_days"], d["consecutive"]) for d in result["daily"]]
+    assert gaps == [
+        ("2026-01-01", None, False),
+        ("2026-01-02", 1, True),
+        ("2026-01-06", 4, False),
+    ]
+    assert result["return_periods"] == 2
+    assert result["ratio_return_periods"] == 1
+    assert result["excluded_gap_returns"] == 1
+    assert result["missing_day_count"] == 3
+    # nothing was interpolated into the hole
+    assert [d["date"] for d in result["daily"]] == [
+        "2026-01-01",
+        "2026-01-02",
+        "2026-01-06",
+    ]
+
+
+def test_ratios_exclude_gap_spanning_returns():
+    """A gap-spanning return must not be pooled into daily volatility."""
+    consecutive = [_equity_row(i, 100.0 * (1.01**i)) for i in range(6)]
+    result = equity.analyze_equity(consecutive)
+    clean_vol = result["annualized_volatility_pct"]
+    assert result["excluded_gap_returns"] == 0
+
+    # same series, but the last point jumps 40 days ahead with a large move
+    with_gap = consecutive[:-1] + [_equity_row(45, 300.0)]
+    gapped = equity.analyze_equity(with_gap)
+    assert gapped["excluded_gap_returns"] == 1
+    assert gapped["ratio_return_periods"] == 4
+    # the huge multi-day move is excluded, so volatility matches the clean run
+    assert gapped["annualized_volatility_pct"] == pytest.approx(clean_vol, rel=1e-9)
+    # but it is still visible in the descriptive counts and in total return
+    assert gapped["return_periods"] == 5
+    assert gapped["positive_days"] == 5
+    assert "excluded from the volatility-based ratios" in gapped["ratios_note"]
+
+
+def test_ratios_unavailable_when_every_return_spans_a_gap():
+    rows = [_equity_row(0, 100.0), _equity_row(10, 110.0), _equity_row(20, 120.0)]
+    result = equity.analyze_equity(rows)
+    assert result["ratios_available"] is False
+    assert result["annualized_volatility_pct"] is None
+    assert result["sharpe_ratio"] is None
+    assert result["sortino_ratio"] is None
+    assert "unavailable" in result["ratios_note"]
+    # total return and CAGR remain well defined
+    assert result["total_return_pct"] == pytest.approx(20.0)
+    assert result["annualized_return_pct"] is not None
+
+
+# --------------------------------------------------------------------------
+# blocker 2: accounting scoped to the equity window
+# --------------------------------------------------------------------------
+
+
+def _windowed(income_rows, fills_rows=None):
+    equity_rows = [_equity_row(0, 1000.0), _equity_row(2, 1000.0)]
+    daily = equity.analyze_equity(equity_rows)["daily"]
+    return accounting.reconcile(equity_rows, income_rows, fills_rows or [], daily)
+
+
+def test_income_before_the_first_equity_observation_is_excluded():
+    result = _windowed([_income("REALIZED_PNL", 99.0, 0, 1, hour=1)])
+    assert result["income_window"]["before_window"] == 1
+    assert result["income_window"]["included"] == 0
+    assert result["realized_pnl"] == 0.0
+    assert result["income_window"]["excluded_amounts_by_type"]["before_window"] == {
+        "REALIZED_PNL": 99.0
+    }
+
+
+def test_income_after_the_last_equity_observation_is_excluded():
+    result = _windowed([_income("REALIZED_PNL", 42.0, 9, 1)])
+    assert result["income_window"]["after_window"] == 1
+    assert result["realized_pnl"] == 0.0
+    assert result["income_window"]["excluded_amounts_by_type"]["after_window"] == {
+        "REALIZED_PNL": 42.0
+    }
+
+
+def test_record_exactly_at_the_start_timestamp_is_excluded():
+    """The start is exclusive: the opening balance already contains it."""
+    boundary = {
+        "income_id": "edge-start",
+        "ts": _ts(0, 23),  # identical to the first equity observation
+        "income_type": "REALIZED_PNL",
+        "amount": 5.0,
+    }
+    result = _windowed([boundary])
+    assert result["income_window"]["before_window"] == 1
+    assert result["income_window"]["included"] == 0
+    assert result["realized_pnl"] == 0.0
+
+
+def test_record_exactly_at_the_end_timestamp_is_included():
+    """The end is inclusive: the closing balance must contain it."""
+    boundary = {
+        "income_id": "edge-end",
+        "ts": _ts(2, 23),  # identical to the last equity observation
+        "income_type": "REALIZED_PNL",
+        "amount": 5.0,
+    }
+    result = _windowed([boundary])
+    assert result["income_window"]["included"] == 1
+    assert result["income_window"]["after_window"] == 0
+    assert result["realized_pnl"] == pytest.approx(5.0)
+
+
+def test_exact_duplicate_records_are_counted_once():
+    row = _income("REALIZED_PNL", 7.0, 1, 1)
+    fill = _fill(1, ts=_ts(1, 12))
+    result = _windowed([row, dict(row)], [fill, dict(fill)])
+    assert result["realized_pnl"] == pytest.approx(7.0)  # not 14
+    assert result["income_window"]["deduplication"]["exact_duplicates"] == 1
+    assert result["fills_window"]["deduplication"]["exact_duplicates"] == 1
+    assert result["fills_commission_total"] == pytest.approx(0.1)  # not 0.2
+    assert result["reconciliation_reliable"] is True
+
+
+def test_conflicting_duplicate_ids_make_reconciliation_unreliable():
+    first = _income("REALIZED_PNL", 7.0, 1, 1)
+    second = dict(first, amount=9.0)  # same id, different content
+    result = _windowed([first, second])
+    assert result["reconciliation_reliable"] is False
+    assert result["conflicting_duplicate_ids"]["income"] == ["REALIZED_PNL-1"]
+    assert "cannot be trusted" in result["reconciliation_unreliable_reason"]
+
+    findings = build_findings(
+        {"accounting": result, "context": {"provenance_known": True}, "execution": {}}
+    )
+    conflict = next(f for f in findings if f["code"] == "PA-ACC-005")
+    assert conflict["severity"] == "ERROR"
+    assert conflict["prominent"] is True
+
+
+def test_deduplication_is_independent_of_row_order():
+    rows = [
+        _income("REALIZED_PNL", 7.0, 1, 1),
+        _income("COMMISSION", -1.0, 1, 2),
+        _income("REALIZED_PNL", 7.0, 1, 1),
+    ]
+    forward = _windowed(rows)
+    backward = _windowed(list(reversed(rows)))
+    assert forward["realized_pnl"] == backward["realized_pnl"]
+    assert forward["commissions_cost"] == backward["commissions_cost"]
+    assert forward["residual"] == backward["residual"]
+
+
+def test_residual_uses_only_the_aligned_interval():
+    equity_rows = [_equity_row(0, 1000.0), _equity_row(2, 1010.0)]
+    daily = equity.analyze_equity(equity_rows)["daily"]
+    income_rows = [
+        _income("REALIZED_PNL", 500.0, 0, 1, hour=1),  # before -> excluded
+        _income("REALIZED_PNL", 10.0, 1, 2),  # inside
+        _income("REALIZED_PNL", 500.0, 9, 3),  # after -> excluded
+    ]
+    result = accounting.reconcile(equity_rows, income_rows, [], daily)
+    assert result["realized_pnl"] == pytest.approx(10.0)
+    assert result["explained_change"] == pytest.approx(10.0)
+    assert result["residual"] == pytest.approx(0.0, abs=1e-9)
+    assert result["reconciled_within_tolerance"] is True
+
+
+def test_fill_commission_and_slippage_respect_the_window():
+    fills_rows = [
+        _fill(1, ts=_ts(0, 1)),  # before
+        _fill(2, ts=_ts(1, 12)),  # inside
+        _fill(3, ts=_ts(9, 12)),  # after
+        _fill(4, ts="not-a-timestamp"),  # invalid
+    ]
+    result = _windowed([], fills_rows)
+    assert result["fills_window"]["included"] == 1
+    assert result["fills_window"]["before_window"] == 1
+    assert result["fills_window"]["after_window"] == 1
+    assert result["fills_window"]["invalid_timestamp"] == 1
+    assert result["fills_commission_total"] == pytest.approx(0.1)
+    assert result["fills_slippage_total_quote"] == pytest.approx(2.0)
+    assert result["fills_window"]["excluded_commission"]["before_window"] == pytest.approx(0.1)
+    assert result["fills_window"]["excluded_slippage_quote"]["after_window"] == pytest.approx(2.0)
+
+
+# --------------------------------------------------------------------------
+# blocker 3: freshness-aware incident attribution
+# --------------------------------------------------------------------------
+
+
+def _points(minutes: list[int], base: float = 1000.0) -> list[tuple]:
+    return [(START + timedelta(minutes=m), base + m) for m in minutes]
+
+
+def _incident_rows(started, ended=None):
+    return [
+        {
+            "id": 1,
+            "kind": "MARK_STALE",
+            "started_ts": started.isoformat(),
+            "ended_ts": ended.isoformat() if ended else None,
+            "details": "SYMBOL",
+        }
+    ]
+
+
+def _equity_every_minute(count: int) -> list[dict]:
+    return [
+        {"ts": (START + timedelta(minutes=m)).isoformat(), "equity": 1000.0 + m, "n_open": 1}
+        for m in range(count)
+    ]
+
+
+def test_incident_window_is_evaluable_with_continuous_observations():
+    rows = _equity_every_minute(24 * 60)
+    started = START + timedelta(hours=8)
+    ended = started + timedelta(hours=1)
+    result = operations.analyze_operations(_incident_rows(started, ended), [], rows, [])
+    incident = result["incidents"][0]
+    assert incident["status"] == "EVALUABLE"
+    # boundaries are start-6h (minute 120) and end+6h (minute 900): a 13h span
+    assert incident["equity_change"] == pytest.approx(13 * 60.0)
+    assert incident["before_distance_seconds"] == 0.0
+    assert incident["after_distance_seconds"] == 0.0
+    assert result["incidents_evaluable"] == 1
+
+
+def test_missing_before_endpoint_is_not_evaluable():
+    """The incident starts before the recorded history begins."""
+    rows = _equity_every_minute(600)
+    started = START + timedelta(hours=1)
+    result = operations.analyze_operations(
+        _incident_rows(started, started + timedelta(minutes=5)), [], rows, []
+    )
+    incident = result["incidents"][0]
+    assert incident["status"] == "NOT_EVALUABLE"
+    assert "pre-incident boundary" in incident["reason"]
+    assert incident["equity_change"] is None
+
+
+def test_missing_after_endpoint_is_not_evaluable():
+    rows = _equity_every_minute(600)
+    started = START + timedelta(minutes=595)
+    result = operations.analyze_operations(_incident_rows(started), [], rows, [])
+    incident = result["incidents"][0]
+    assert incident["status"] == "NOT_EVALUABLE"
+    assert "post-incident boundary" in incident["reason"]
+    assert incident["equity_change"] is None
+
+
+def test_stale_endpoint_is_refused_rather_than_reached_for():
+    """The old behaviour grabbed the nearest observation however far away."""
+    started = START + timedelta(hours=12)
+    # dense early data, then nothing near the pre-incident boundary
+    rows = [
+        {"ts": (START + timedelta(minutes=m)).isoformat(), "equity": 1000.0, "n_open": 1}
+        for m in range(120)
+    ] + [
+        {"ts": (started + timedelta(hours=6, minutes=m)).isoformat(), "equity": 900.0, "n_open": 1}
+        for m in range(5)
+    ]
+    result = operations.analyze_operations(_incident_rows(started, started), [], rows, [])
+    incident = result["incidents"][0]
+    assert incident["status"] == "NOT_EVALUABLE"
+    assert incident["equity_change"] is None
+    # the far-away observation must NOT have been selected
+    assert incident["actual_before_ts"] is None
+
+
+def test_telemetry_gap_spanning_the_incident_is_not_evaluable():
+    before = [
+        {"ts": (START + timedelta(minutes=m)).isoformat(), "equity": 1000.0, "n_open": 1}
+        for m in range(60)
+    ]
+    after = [
+        {"ts": (START + timedelta(hours=30, minutes=m)).isoformat(), "equity": 800.0, "n_open": 1}
+        for m in range(60)
+    ]
+    started = START + timedelta(hours=12)
+    result = operations.analyze_operations(
+        _incident_rows(started, started + timedelta(hours=2)), [], before + after, []
+    )
+    incident = result["incidents"][0]
+    assert incident["status"] == "NOT_EVALUABLE"
+    assert incident["equity_change"] is None
+    assert result["incidents_not_evaluable"] == 1
+
+
+def test_open_incident_anchors_on_its_start_and_says_so():
+    rows = _equity_every_minute(24 * 60)
+    started = START + timedelta(hours=8)
+    result = operations.analyze_operations(_incident_rows(started, None), [], rows, [])
+    incident = result["incidents"][0]
+    assert incident["open_incident"] is True
+    assert incident["end_anchor_source"] == "incident_start"
+    assert incident["end_anchor"] == started.isoformat()
+    assert incident["status"] == "EVALUABLE"
+    assert incident["equity_change"] == pytest.approx(12 * 60.0)
+
+
+def test_same_observation_on_both_sides_is_not_evaluable():
+    single = [{"ts": (START + timedelta(hours=8)).isoformat(), "equity": 1000.0, "n_open": 1}]
+    started = START + timedelta(hours=8)
+    result = operations.analyze_operations(_incident_rows(started, started), [], single, [])
+    incident = result["incidents"][0]
+    assert incident["status"] == "NOT_EVALUABLE"
+    assert incident["equity_change"] is None
+
+
+def test_nearest_observation_is_deterministic_on_ties():
+    points = _points([0, 20])
+    target = START + timedelta(minutes=10)
+    chosen = operations.nearest_observation(points, target, timedelta(minutes=15))
+    # equidistant: always the earlier observation, never row-order dependent
+    assert chosen[0] == points[0][0]
+    assert operations.nearest_observation(list(reversed(points)), target, timedelta(minutes=15))
+
+
+# --------------------------------------------------------------------------
+# blocker 4: fail closed on unknown provenance
+# --------------------------------------------------------------------------
+
+
+def test_direct_database_without_metadata_raises_unknown_provenance(tmp_path, synthetic_db):
+    with tempfile.TemporaryDirectory() as tmp:
+        source = resolve_source(synthetic_db, Path(tmp))
+        analysis = run_analysis(source)
+    context = analysis["context"]
+    assert context["provenance_known"] is False
+    assert context["binance_environment"] is None
+    codes = {f["code"] for f in analysis["findings"]}
+    assert "PA-ENV-002" in codes
+    assert "PA-ENV-001" not in codes  # no testnet claim without proof
+    unknown = next(f for f in analysis["findings"] if f["code"] == "PA-ENV-002")
+    assert unknown["severity"] == "WARNING"
+    assert unknown["prominent"] is True
+    assert sorted(unknown["evidence"]["missing"]) == unknown["evidence"]["missing"]
+
+
+def test_unknown_provenance_is_never_rendered_as_live(tmp_path, synthetic_db):
+    out = tmp_path / "report"
+    assert main(["--input", str(synthetic_db), "--output-dir", str(out), "--quiet"]) == 0
+    report = (out / "report.md").read_text()
+    assert "provenance could not be established" in report
+    assert "does not guess the environment" in report
+    lowered = report.lower()
+    assert "environment: `live`" not in lowered
+    assert "live capital" not in lowered
+
+
+def test_archive_with_testnet_metadata_keeps_the_testnet_warning(tmp_path, synthetic_db):
+    archive = tmp_path / "export.tar.gz"
+    env = tmp_path / "env.live.sanitized.txt"
+    env.write_text("BINANCE_ENVIRONMENT=TESTNET\nDEMO_ONLY=true\nBINANCE_TARGET_VOL=0.15\n")
+    head = tmp_path / "git_head.txt"
+    head.write_text("branch: main\ncommit: abc123\n")
+    with tarfile.open(archive, "w:gz") as tar:
+        base = "kronos-performance-export"
+        tar.add(synthetic_db, arcname=f"{base}/database/companion_sanitized.db")
+        tar.add(env, arcname=f"{base}/config/env.live.sanitized.txt")
+        tar.add(head, arcname=f"{base}/project/git_head.txt")
+    with tempfile.TemporaryDirectory() as tmp:
+        source = resolve_source(archive, Path(tmp))
+        analysis = run_analysis(source)
+    context = analysis["context"]
+    assert context["provenance_known"] is True
+    assert context["binance_environment"] == "TESTNET"
+    assert context["demo_only"] is True
+    codes = {f["code"] for f in analysis["findings"]}
+    assert "PA-ENV-001" in codes
+    assert "PA-ENV-002" not in codes
+
+
+def test_provenance_finding_is_deterministic(tmp_path, synthetic_db):
+    with tempfile.TemporaryDirectory() as tmp:
+        first = run_analysis(resolve_source(synthetic_db, Path(tmp)))
+    with tempfile.TemporaryDirectory() as tmp:
+        second = run_analysis(resolve_source(synthetic_db, Path(tmp)))
+    left = next(f for f in first["findings"] if f["code"] == "PA-ENV-002")
+    right = next(f for f in second["findings"] if f["code"] == "PA-ENV-002")
+    assert json.dumps(left, sort_keys=True) == json.dumps(right, sort_keys=True)
 
 
 # --------------------------------------------------------------------------
@@ -442,8 +887,8 @@ def synthetic_db(tmp_path) -> Path:
             "equity": [_equity_row(i, 1000.0 + i * 5) for i in range(10)],
             "fills": [_fill(i) for i in range(6)],
             "income": [
-                _income("REALIZED_PNL", 50.0, 0, 1),
-                _income("COMMISSION", -0.6, 0, 2),
+                _income("REALIZED_PNL", 50.0, 5, 1),
+                _income("COMMISSION", -0.6, 5, 2),
             ],
             "closed_positions": [_position(1, 10.0)],
             "incidents": [

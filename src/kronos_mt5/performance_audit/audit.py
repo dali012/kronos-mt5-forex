@@ -70,11 +70,28 @@ def _build_context(source: ExportSource, con: sqlite3.Connection, fill_rows: lis
         for key, value in sorted(meta.items())
         if key.startswith(("source_", "export_")) and value
     }
+    environment = config.get("BINANCE_ENVIRONMENT")
+    demo_only = _truthy(config.get("DEMO_ONLY"))
+    # Provenance must be PROVEN, never inferred. A bare .db carries no sanitized
+    # env file, so the audit cannot tell testnet from live, one run from several,
+    # or an original from a copy — and says so instead of assuming.
+    provenance_known = bool(environment) and demo_only is not None
+    missing_provenance = sorted(
+        name
+        for name, value in (
+            ("binance_environment", environment),
+            ("demo_only", demo_only),
+            ("source_commit", source_block.get("source_commit")),
+        )
+        if value in (None, "")
+    )
     return {
         "source": source_block,
         "config": {k: v for k, v in sorted(config.items()) if k in CONTEXT_CONFIG_KEYS},
-        "binance_environment": config.get("BINANCE_ENVIRONMENT"),
-        "demo_only": _truthy(config.get("DEMO_ONLY")),
+        "binance_environment": environment,
+        "demo_only": demo_only,
+        "provenance_known": provenance_known,
+        "missing_provenance": missing_provenance,
         "symbols": symbols,
         "ohlcv_available": ohlcv_files > 0,
         "market_data_files": ohlcv_files,
@@ -110,7 +127,9 @@ def run_analysis(source: ExportSource) -> dict:
     # Cross-check the income window against the equity window: an income cursor
     # that starts late is a common source of an unexplained residual.
     income_first = parse_ts((accounting_result.get("income") or {}).get("first_ts"))
-    equity_first = parse_ts(equity_result.get("first_observation"))
+    # compare against the RAW first observation, which is what the reconciliation
+    # window uses — not the daily series' first point (the last obs of day one)
+    equity_first = parse_ts((equity_result.get("observation_series") or {}).get("first_ts"))
     if income_first and equity_first:
         accounting_result["income_starts_after_equity_hours"] = (
             income_first - equity_first
