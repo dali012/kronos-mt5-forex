@@ -29,10 +29,12 @@ jobs:
           ruff check \
             backtest/walk_forward.py \
             src/kronos_mt5/baseline \
+            src/kronos_mt5/experiments \
             src/kronos_mt5/marketdata \
             src/kronos_mt5/walk_forward.py \
             tests/test_baseline.py \
             tests/test_baseline_precision.py \
+            tests/test_experiments.py \
             tests/test_marketdata.py
 
   tests:

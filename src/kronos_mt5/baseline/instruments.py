@@ -160,6 +160,8 @@ def rejection_detail(
     filters: dict,
     *,
     decision_ts_ns: int | None = None,
+    category: str = "engine_exchange_rejection",
+    source: str = "matching_engine",
 ) -> dict:
     """Build a fully attributed rejection record with exact attempted values."""
 
@@ -175,6 +177,8 @@ def rejection_detail(
         "symbol": symbol,
         "ts_ns": ts_ns,
         "reason": reason,
+        "category": category,
+        "source": source,
         "attempted_price": render(price),
         "attempted_qty": render(qty),
         "tick_size": filters["tick_size"],
