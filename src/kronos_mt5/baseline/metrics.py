@@ -185,6 +185,18 @@ def summarize(result: dict) -> dict:
     metrics["rejections_by_symbol_reason"] = rejection_counts(
         result["rejections"], "symbol", "reason"
     )
+    metrics["rejections_by_category"] = rejection_counts(result["rejections"], "category")
+    metrics["policy_vetoes"] = metrics["rejections_by_category"].get("policy_veto", 0)
+    metrics["suppressed_decisions"] = metrics["policy_vetoes"]
+    metrics["engine_exchange_rejections"] = metrics["rejections_by_category"].get(
+        "engine_exchange_rejection", 0
+    )
+    metrics["pre_submission_rejections"] = metrics["rejections_by_category"].get(
+        "pre_submission_rejection", 0
+    )
+    metrics["invalid_precision_rejections"] = metrics["rejections_by_category"].get(
+        "invalid_precision_rejection", 0
+    )
     metrics["accounting_residual"] = metrics["net_pnl"] - sum(t["net_pnl"] for t in trades)
     # Nautilus cash is rounded to settlement currency precision; retain/report residual.
     tolerance = 0.02 * (len(fills) + len(funding) + 1)

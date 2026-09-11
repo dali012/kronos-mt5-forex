@@ -123,28 +123,91 @@ def test_bearish_overlay_is_fixed_and_not_optimised():
 # --- HIGH_VOL entry gate -----------------------------------------------------
 
 
-def test_high_vol_gate_blocks_increases_but_allows_reductions_and_exits():
-    overlay = NormalVolEntryGateOverlay("0")
-    high = _strategy(regime=HIGH_VOL)
-    # New exposure and increases are blocked.
-    assert overlay.adjust(high, BUY, Decimal(5), Decimal(0))[2] == overlay.veto_reason
-    assert overlay.adjust(high, BUY, Decimal(3), Decimal(5))[2] == overlay.veto_reason
-    assert overlay.adjust(high, SELL, Decimal(3), Decimal(-5))[2] == overlay.veto_reason
-    # Reductions, exits and stop-driven flattening always pass.
-    assert overlay.adjust(high, SELL, Decimal(2), Decimal(5)) == (SELL, Decimal(2), None)
-    assert overlay.adjust(high, SELL, Decimal(5), Decimal(5)) == (SELL, Decimal(5), None)
-    assert overlay.adjust(high, BUY, Decimal(5), Decimal(-5)) == (BUY, Decimal(5), None)
+@pytest.mark.parametrize(
+    ("scale", "side", "quantity", "current", "expected_quantity", "vetoed"),
+    [
+        # Same-side reductions and exact flattening are always unchanged.
+        ("0", SELL, "2", "5", "2", False),
+        ("0.5", SELL, "2", "5", "2", False),
+        ("0", BUY, "2", "-5", "2", False),
+        ("0.5", BUY, "2", "-5", "2", False),
+        ("0", SELL, "5", "5", "5", False),
+        ("0.5", SELL, "5", "5", "5", False),
+        ("0", BUY, "5", "-5", "5", False),
+        ("0.5", BUY, "5", "-5", "5", False),
+        # Same-side increases are blocked or halved.
+        ("0", BUY, "3", "5", "3", True),
+        ("0.5", BUY, "3", "5", "1.5", False),
+        ("0", SELL, "3", "-5", "3", True),
+        ("0.5", SELL, "3", "-5", "1.5", False),
+        # Smaller and larger cross-zero targets preserve the close and scale
+        # only the requested opposite-side exposure.
+        ("0", SELL, "8", "5", "5", False),
+        ("0.5", SELL, "8", "5", "6.5", False),
+        ("0", SELL, "12", "5", "5", False),
+        ("0.5", SELL, "12", "5", "8.5", False),
+        ("0", BUY, "8", "-5", "5", False),
+        ("0.5", BUY, "8", "-5", "6.5", False),
+        ("0", BUY, "12", "-5", "5", False),
+        ("0.5", BUY, "12", "-5", "8.5", False),
+        # From flat, the whole target is new exposure.
+        ("0", BUY, "8", "0", "8", True),
+        ("0.5", BUY, "8", "0", "4.0", False),
+        ("0", SELL, "8", "0", "8", True),
+        ("0.5", SELL, "8", "0", "4.0", False),
+    ],
+)
+def test_high_vol_gate_handles_signed_position_cases(
+    scale, side, quantity, current, expected_quantity, vetoed
+):
+    overlay = NormalVolEntryGateOverlay(scale)
+    adjusted_side, adjusted_quantity, veto = overlay.adjust(
+        _strategy(regime=HIGH_VOL), side, Decimal(quantity), Decimal(current)
+    )
+    assert adjusted_side is side
+    assert adjusted_quantity == Decimal(expected_quantity)
+    assert (veto == overlay.veto_reason) is vetoed
+
+
+@pytest.mark.parametrize(
+    ("current", "side", "quantity", "scale", "expected_quantity", "expected_target"),
+    [
+        ("5", SELL, "8", "0", "5", "0"),
+        ("-5", BUY, "8", "0", "5", "0"),
+        ("5", SELL, "8", "0.5", "6.5", "-1.5"),
+        ("-5", BUY, "8", "0.5", "6.5", "1.5"),
+    ],
+)
+def test_high_vol_gate_explicit_reversal_examples(
+    current, side, quantity, scale, expected_quantity, expected_target
+):
+    adjusted_side, adjusted_quantity, veto = NormalVolEntryGateOverlay(scale).adjust(
+        _strategy(regime=HIGH_VOL), side, Decimal(quantity), Decimal(current)
+    )
+    assert veto is None
+    assert adjusted_quantity == Decimal(expected_quantity)
+    assert Decimal(current) + (
+        adjusted_quantity if adjusted_side == BUY else -adjusted_quantity
+    ) == Decimal(expected_target)
 
 
 def test_high_vol_gate_is_inert_outside_high_vol():
-    overlay = NormalVolEntryGateOverlay("0")
-    for regime in ("NORMAL_VOL", "LOW_VOL", "UNKNOWN"):
-        strategy = _strategy(regime=regime)
-        assert overlay.adjust(strategy, BUY, Decimal(5), Decimal(0)) == (
-            BUY,
-            Decimal(5),
-            None,
-        )
+    cases = (
+        (BUY, Decimal(3), Decimal(5)),
+        (SELL, Decimal(8), Decimal(5)),
+        (BUY, Decimal(8), Decimal(-5)),
+        (SELL, Decimal(5), Decimal(0)),
+    )
+    for scale in ("0", "0.5"):
+        overlay = NormalVolEntryGateOverlay(scale)
+        for regime in ("NORMAL_VOL", "LOW_VOL", "UNKNOWN"):
+            strategy = _strategy(regime=regime)
+            for side, quantity, current in cases:
+                assert overlay.adjust(strategy, side, quantity, current) == (
+                    side,
+                    quantity,
+                    None,
+                )
 
 
 def test_high_vol_scaled_gate_halves_only_the_increase():
@@ -192,6 +255,36 @@ def test_combined_experiment_applies_both_rules():
     assert overlay.adjust(normal, BUY, Decimal(5), Decimal(0)) == (BUY, Decimal(5), None)
     # Reductions pass both rules.
     assert overlay.adjust(high, SELL, Decimal(2), Decimal(5)) == (SELL, Decimal(2), None)
+
+
+@pytest.mark.parametrize(
+    ("regime", "side", "quantity", "current", "expected_quantity", "expected_veto"),
+    [
+        (HIGH_VOL, SELL, "2", "5", "2", None),
+        (HIGH_VOL, SELL, "5", "5", "5", None),
+        (HIGH_VOL, BUY, "3", "5", "3", "high_vol_entry_blocked"),
+        (HIGH_VOL, SELL, "3", "-5", "3", "long_only_short_blocked"),
+        (HIGH_VOL, SELL, "8", "5", "5", None),
+        (HIGH_VOL, SELL, "12", "5", "5", None),
+        (HIGH_VOL, BUY, "8", "-5", "5", None),
+        (HIGH_VOL, BUY, "12", "-5", "5", None),
+        (HIGH_VOL, BUY, "8", "0", "8", "high_vol_entry_blocked"),
+        (HIGH_VOL, SELL, "8", "0", "8", "long_only_short_blocked"),
+        ("NORMAL_VOL", BUY, "8", "0", "8", None),
+        ("NORMAL_VOL", SELL, "2", "5", "2", None),
+    ],
+)
+def test_long_only_normal_vol_composite_signed_cases(
+    regime, side, quantity, current, expected_quantity, expected_veto
+):
+    adjusted_side, adjusted_quantity, veto = (
+        registry.get("long-only-normal-vol")
+        .overlay()
+        .adjust(_strategy(regime=regime), side, Decimal(quantity), Decimal(current))
+    )
+    assert adjusted_side is side
+    assert adjusted_quantity == Decimal(expected_quantity)
+    assert veto == expected_veto
 
 
 def test_composite_veto_stops_the_chain():
@@ -479,6 +572,115 @@ def test_ranking_excludes_ineligible_experiments_and_never_uses_return_alone():
     }
 
 
+def _rankable(experiment_id, *, status=gates.FAILED, metric=1.0):
+    return {
+        "development": {
+            "total_return": metric,
+            "sharpe": metric,
+            "profit_factor": metric,
+            "max_drawdown": metric,
+        },
+        "acceptance_gate": {
+            "eligible_for_selection": True,
+            "status": status,
+            "window_statistics": {
+                "median_window_return": metric,
+                "median_window_sharpe": metric,
+                "profitable_windows": metric,
+                "worst_window_return": metric,
+            },
+        },
+        "eligibility": "candidate",
+    }
+
+
+@pytest.mark.parametrize("missing", [None, float("nan"), float("inf"), float("-inf")])
+def test_ranking_puts_missing_and_nonfinite_metrics_last(missing):
+    results = {
+        "valid": _rankable("valid", metric=1.0),
+        "missing": _rankable("missing", metric=missing),
+    }
+    rows = report.ranking(results)
+    assert [row["experiment_id"] for row in rows] == ["valid", "missing"]
+    assert set(rows[1]["axis_ranks"].values()) == {len(rows) + 1}
+
+
+def test_ranking_keeps_passed_first_and_breaks_exact_ties_by_id():
+    results = {
+        "zeta": _rankable("zeta", status=gates.PASSED, metric=1.0),
+        "alpha": _rankable("alpha", status=gates.PASSED, metric=1.0),
+        "failed-with-better-metrics": _rankable(
+            "failed-with-better-metrics", status=gates.FAILED, metric=99.0
+        ),
+    }
+    rows = report.ranking(results)
+    assert [row["experiment_id"] for row in rows] == [
+        "alpha",
+        "zeta",
+        "failed-with-better-metrics",
+    ]
+    assert rows[0]["axis_ranks"] == rows[1]["axis_ranks"]
+
+
+def test_measured_determinism_failure_prevents_candidate_from_passing(monkeypatch, tmp_path):
+    """A mutating evaluation double cannot be blessed by assumed evidence."""
+
+    primary_runs = 0
+
+    def fake_run(manifest, config, filters_payload, output, *, overlay=None):
+        nonlocal primary_runs
+        is_primary = config.bar_path == "OHLC" and config.commission_bps == 5.0
+        primary_runs += int(is_primary)
+        total_return = 0.05 + (0.001 if is_primary and primary_runs == 2 else 0.0)
+        development = {
+            "total_return": total_return,
+            "sharpe": 0.5,
+            "profit_factor": 1.5,
+            "max_drawdown": -0.05,
+            "accounting_residual": 0.0,
+            "fills": 100,
+            "rejections_by_reason": {},
+        }
+        windows = [{"total_return": 0.01, "sharpe": 0.5, "max_drawdown": -0.01} for _ in range(10)]
+        return {
+            "development": development,
+            "walk_forward": windows,
+            "holdout": {"status": "UNTOUCHED"},
+            "configuration": config.payload(),
+            "configuration_sha256": config.fingerprint(),
+            "dataset_manifest_sha256": "dataset",
+            "relevant_source_sha256": {"source.py": "source"},
+            "research_adapter_sha256": {"adapter.py": "adapter"},
+            "research_implementation_commit": "commit",
+            "deployed_bot_commit": "deployed",
+            "deployed_strategy_snapshot_sha256": "strategy",
+            "deployed_risk_snapshot_sha256": "risk",
+            "deployed_snapshot_verification_passed": True,
+            "exchange_filter_snapshot_sha256": "filters",
+            "dependency_versions": {"python": "test"},
+        }
+
+    monkeypatch.setattr(runner, "run_baseline", fake_run)
+    result = runner.run_experiment(
+        registry.get("long-only"),
+        tmp_path / "manifest.json",
+        {},
+        tmp_path / "output",
+        control_development={
+            "profit_factor": 1.0,
+            "sharpe": 0.1,
+            "max_drawdown": -0.10,
+        },
+    )
+    assert result["deterministic_verification"]["comparison_result"] is False
+    assert (
+        result["deterministic_verification"]["first_result_sha256"]
+        != result["deterministic_verification"]["second_result_sha256"]
+    )
+    assert result["acceptance_gate"]["status"] == gates.FAILED
+    assert result["acceptance_gate"]["failed_checks"] == ["deterministic_reproduction"]
+
+
 # --- engine integration ------------------------------------------------------
 
 
@@ -526,12 +728,37 @@ def test_long_only_replay_holds_no_short_exposure(overlay_fixture):
     assert metrics["long_short"]["short"]["net_pnl"] == 0
 
 
-def test_overlay_vetoes_are_attributed_rejections(overlay_fixture):
+def test_overlay_vetoes_are_attributed_suppressed_decisions(overlay_fixture):
     result = _run(overlay_fixture, LongOnlyOverlay())
     for rejection in result["rejections"]:
         assert rejection["symbol"]
         assert rejection["reason"]
+        assert rejection["category"]
+        assert rejection["source"]
         assert "attempted_qty" in rejection and "attempted_price" in rejection
+    vetoes = [r for r in result["rejections"] if r["reason"] == "long_only_short_blocked"]
+    assert all(r["category"] == "policy_veto" for r in vetoes)
+    assert all(r["source"] == "research_overlay" for r in vetoes)
+    metrics = summarize(result)
+    assert metrics["policy_vetoes"] == metrics["suppressed_decisions"] == len(vetoes)
+    assert metrics["invalid_precision_rejections"] == 0
+
+
+def test_scaled_quantity_below_step_is_a_policy_veto(overlay_fixture):
+    class BelowStepOverlay(Overlay):
+        def adjust(self, strategy, side, quantity, current):
+            return side, Decimal("0.0005"), None
+
+    result = _run(overlay_fixture, BelowStepOverlay())
+    assert result["rejections"]
+    assert {r["reason"] for r in result["rejections"]} == {"policy_scaled_quantity_below_step"}
+    assert {r["category"] for r in result["rejections"]} == {"policy_veto"}
+    assert result["fills"] == []
+    metrics = summarize(result)
+    assert metrics["policy_vetoes"] == metrics["suppressed_decisions"]
+    assert metrics["policy_vetoes"] == len(result["rejections"])
+    assert metrics["engine_exchange_rejections"] == 0
+    assert metrics["invalid_precision_rejections"] == 0
 
 
 def test_experiments_retain_exact_price_and_quantity_validation(overlay_fixture):

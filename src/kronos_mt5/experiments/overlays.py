@@ -169,22 +169,38 @@ class NormalVolEntryGateOverlay(Overlay):
     def adjust(self, strategy, side, quantity, current):
         quantity, current = _decimal(quantity), _decimal(current)
         target = _target(side, quantity, current)
-        if abs(target) <= abs(current):
-            return side, quantity, None  # reduction, exit or flip-to-smaller
         if strategy.current_regime() != HIGH_VOL:
             return side, quantity, None
-        if self.scale == 0:
-            return side, quantity, self.veto_reason
-        increase = abs(target) - abs(current)
-        permitted = abs(current) + increase * self.scale
-        capped = permitted if target > 0 else -permitted
-        delta = capped - current
+
+        if target == 0:
+            # Exact flattening never creates exposure.
+            return side, quantity, None
+        if current != 0 and (current > 0) == (target > 0):
+            if abs(target) <= abs(current):
+                # Same-side reduction (including an order that remains open).
+                return side, quantity, None
+            # Scale only the same-side increase above the current exposure.
+            permitted_exposure = abs(current) + (abs(target) - abs(current)) * self.scale
+            permitted_target = permitted_exposure if target > 0 else -permitted_exposure
+        elif current != 0:
+            # A cross-zero order first closes the current position. That portion
+            # is always permitted; only the requested exposure beyond flat is
+            # new exposure and therefore scaled.
+            permitted_target = target * self.scale
+        else:
+            # From flat, the entire requested target is new exposure.
+            permitted_target = target * self.scale
+
+        delta = permitted_target - current
         if delta == 0:
             return side, quantity, self.veto_reason
         if (delta > 0) != (side == OrderSide.BUY):
             # Scaling must never reverse the pinned decision's direction.
             return side, quantity, self.veto_reason
-        return side, abs(delta), None
+        permitted_quantity = abs(delta)
+        if permitted_quantity > quantity:
+            raise ValueError("HIGH_VOL gate must never increase the requested quantity")
+        return side, permitted_quantity, None
 
 
 class CompositeOverlay(Overlay):

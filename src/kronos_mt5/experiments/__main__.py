@@ -17,7 +17,7 @@ from kronos_mt5.marketdata.pipeline import safe_output
 
 from .registry import BY_ID, CONTROL, EXPERIMENTS, HYPOTHESIS_COUNT, get
 from .report import ranking, render
-from .runner import run_all, run_experiment
+from .runner import normalized_experiment_result, run_all, run_experiment
 
 
 def _write(bundle: dict, output: Path) -> None:
@@ -164,6 +164,9 @@ def main(argv: list[str] | None = None) -> int:
                 raise ProvenanceError(f"recorded {field} does not match the current checkout")
         only = tuple(k for k in original["results"] if k != CONTROL.experiment_id)
         repeated = run_all(args.manifest, filters_payload, args.output, only=only or None)
+        # Preserve the independent rerun even when comparison fails so both
+        # sides of a nondeterministic result remain inspectable.
+        _write(repeated, args.output)
         identical = True
         differing = []
         for key, result in original["results"].items():
@@ -171,18 +174,13 @@ def main(argv: list[str] | None = None) -> int:
             if fresh is None:
                 identical, _ = False, differing.append(f"{key}: missing")
                 continue
-            for section in ("development", "walk_forward", "path_sensitivity", "cost_stress"):
-                if fresh[section] != result[section]:
-                    identical = False
-                    differing.append(f"{key}.{section}")
-            if fresh["experiment_fingerprint"] != result["experiment_fingerprint"]:
+            if normalized_experiment_result(fresh) != normalized_experiment_result(result):
                 identical = False
-                differing.append(f"{key}.experiment_fingerprint")
+                differing.append(f"{key}.normalized_result_including_acceptance_gate")
             if fresh["holdout"]["status"] != "UNTOUCHED":
                 raise ValueError(f"{key}: holdout must remain UNTOUCHED")
         if not identical:
             raise ValueError(f"reproduction failed: {', '.join(differing)}")
-        _write(repeated, args.output)
         print(
             json.dumps(
                 {

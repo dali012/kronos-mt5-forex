@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from kronos_mt5.baseline.provenance import collect_provenance
+from kronos_mt5.baseline.provenance import canonical_sha256, collect_provenance
 from kronos_mt5.baseline.report import run as run_baseline
 from kronos_mt5.marketdata.pipeline import safe_output
 
@@ -43,6 +43,11 @@ SUMMARY_KEYS = (
     "turnover_over_start_equity",
     "accounting_residual",
     "rejected_orders",
+    "policy_vetoes",
+    "suppressed_decisions",
+    "engine_exchange_rejections",
+    "pre_submission_rejections",
+    "invalid_precision_rejections",
     "annualized_low_confidence",
     "suppressed_metrics",
 )
@@ -64,6 +69,10 @@ DELTA_KEYS = (
     "gross_pnl",
     "turnover_notional",
     "rejected_orders",
+    "policy_vetoes",
+    "engine_exchange_rejections",
+    "pre_submission_rejections",
+    "invalid_precision_rejections",
 )
 
 
@@ -93,6 +102,7 @@ def summary(metrics: dict) -> dict:
     out["rejections_by_reason"] = dict(metrics.get("rejections_by_reason", {}))
     out["rejections_by_symbol"] = dict(metrics.get("rejections_by_symbol", {}))
     out["rejections_by_symbol_reason"] = dict(metrics.get("rejections_by_symbol_reason", {}))
+    out["rejections_by_category"] = dict(metrics.get("rejections_by_category", {}))
     return out
 
 
@@ -110,6 +120,10 @@ def window_rows(windows: list[dict]) -> list[dict]:
             "profit_factor": w.get("profit_factor"),
             "net_pnl": w.get("net_pnl"),
             "rejected_orders": w.get("rejected_orders"),
+            "policy_vetoes": w.get("policy_vetoes"),
+            "engine_exchange_rejections": w.get("engine_exchange_rejections"),
+            "pre_submission_rejections": w.get("pre_submission_rejections"),
+            "invalid_precision_rejections": w.get("invalid_precision_rejections"),
             "annualized_low_confidence": w.get("annualized_low_confidence"),
         }
         for w in windows
@@ -143,6 +157,72 @@ def _variant(
     if report["holdout"]["status"] != "UNTOUCHED":
         raise ValueError(f"holdout must remain UNTOUCHED, got {report['holdout']['status']}")
     return report
+
+
+def deterministic_content(report: dict, experiment: Experiment) -> dict:
+    """Return the exact output-path-independent content used for reproduction."""
+
+    return {
+        "development": report["development"],
+        "walk_forward": report["walk_forward"],
+        "path_cost_configuration": report["configuration"],
+        "holdout_status": report["holdout"]["status"],
+        "experiment_fingerprint": experiment.fingerprint(),
+        "configuration_sha256": report["configuration_sha256"],
+        "dataset_manifest_sha256": report["dataset_manifest_sha256"],
+        "relevant_source_sha256": report["relevant_source_sha256"],
+        "research_adapter_sha256": report["research_adapter_sha256"],
+        "deployed_strategy_snapshot_sha256": report["deployed_strategy_snapshot_sha256"],
+        "deployed_risk_snapshot_sha256": report["deployed_risk_snapshot_sha256"],
+    }
+
+
+def deterministic_verification(
+    first: dict,
+    second: dict,
+    experiment: Experiment,
+    first_path: Path,
+    second_path: Path,
+) -> dict:
+    """Hash and compare two independent primary evaluations."""
+
+    first_hash = canonical_sha256(deterministic_content(first, experiment))
+    second_hash = canonical_sha256(deterministic_content(second, experiment))
+    return {
+        "comparison_result": first_hash == second_hash,
+        "first_result_sha256": first_hash,
+        "second_result_sha256": second_hash,
+        "first_report_path": str((first_path / "report.json").resolve()),
+        "second_report_path": str((second_path / "report.json").resolve()),
+        "excluded_fields": ["output report paths"],
+    }
+
+
+def normalized_experiment_result(result: dict) -> dict:
+    """Normalize a result for the independent external reproduce command."""
+
+    variants = {
+        key: {k: v for k, v in value.items() if k != "report_path"}
+        for key, value in result["variants"].items()
+    }
+    verification = {
+        k: v
+        for k, v in result["deterministic_verification"].items()
+        if k not in {"first_report_path", "second_report_path"}
+    }
+    return {
+        "experiment": result["experiment"],
+        "experiment_fingerprint": result["experiment_fingerprint"],
+        "provenance": result["provenance"],
+        "development": result["development"],
+        "walk_forward": result["walk_forward"],
+        "path_sensitivity": result["path_sensitivity"],
+        "cost_stress": result["cost_stress"],
+        "variants": variants,
+        "holdout": result["holdout"],
+        "deterministic_verification": verification,
+        "acceptance_gate": result["acceptance_gate"],
+    }
 
 
 def run_experiment(
@@ -200,6 +280,24 @@ def run_experiment(
     if primary is None:
         raise ValueError("primary OHLC 1.0x variant did not run")
 
+    primary_path = output / "OHLC-1.0x"
+    repeat_path = output / "deterministic-reproduction" / "OHLC-1.0x"
+    repeated_primary = _variant(
+        experiment,
+        manifest,
+        filters_payload,
+        repeat_path,
+        bar_path="OHLC",
+        cost_multiplier="1.0",
+    )
+    deterministic = deterministic_verification(
+        primary,
+        repeated_primary,
+        experiment,
+        primary_path,
+        repeat_path,
+    )
+
     development = primary["development"]
     windows = primary["walk_forward"]
     baseline_reference = control_development if control_development is not None else development
@@ -210,7 +308,7 @@ def run_experiment(
         baseline=baseline_reference,
         cost_stress=cost_stress,
         path_sensitivity=path_sensitivity,
-        deterministic=True,  # replaced by the reproduce step for passing candidates
+        deterministic=deterministic["comparison_result"],
         holdout_status=primary["holdout"]["status"],
     )
     result = {
@@ -240,6 +338,7 @@ def run_experiment(
         "cost_stress": cost_stress,
         "variants": variants,
         "holdout": primary["holdout"],
+        "deterministic_verification": deterministic,
         "acceptance_gate": gate,
     }
     if control_development is not None:

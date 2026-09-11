@@ -289,14 +289,21 @@ def render(report: dict) -> str:
             "net_pnl",
             "accounting_residual",
             "funding_mark_approximations",
-            "rejected_orders",
+            "policy_vetoes",
+            "engine_exchange_rejections",
+            "pre_submission_rejections",
+            "invalid_precision_rejections",
+            "rejected_orders",  # backward-compatible raw event count
         ):
-            lines.append(f"| {key} | {metrics.get(key)} |")
+            label = (
+                "raw_suppression_and_rejection_records" if key == "rejected_orders" else key
+            )
+            lines.append(f"| {label} | {metrics.get(key)} |")
         for key, value in metrics["costs"].items():
             lines.append(f"| {key} cost (positive paid) | {value} |")
         lines += [
             "",
-            "#### Rejected orders",
+            "#### Decision suppression and execution rejections",
             "",
         ]
         if metrics.get("rejected_orders"):
@@ -313,6 +320,14 @@ def render(report: dict) -> str:
                 "By symbol: "
                 + ", ".join(f"{k}={v}" for k, v in metrics["rejections_by_symbol"].items())
                 + ".",
+                "",
+                (
+                    f"Policy vetoes / suppressed decisions: {metrics['policy_vetoes']}; "
+                    "these were not submitted to Binance. Actual matching-engine/exchange "
+                    f"rejections: {metrics['engine_exchange_rejections']}; pre-submission "
+                    f"validation rejections: {metrics['pre_submission_rejections']}; invalid "
+                    f"precision rejections: {metrics['invalid_precision_rejections']}."
+                ),
             ]
         else:
             lines.append("None.")

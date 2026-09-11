@@ -240,6 +240,8 @@ class ReplayStrategy(DeployedTrendStrategy):
                     price,
                     self.filters,
                     decision_ts_ns=self.clock.timestamp_ns(),
+                    category="pre_submission_rejection",
+                    source="deployed_strategy_filter",
                 )
             )
         return ok
@@ -270,18 +272,53 @@ class ReplayStrategy(DeployedTrendStrategy):
             price_obj = tick.ask_price if side == OrderSide.BUY else tick.bid_price
             # The pinned Quantity is snapped in Decimal and rebuilt exactly.
             qty_decimal = exact(pending["qty"])
-            current = float(self.portfolio.net_position(self.instrument_id))
-            side, qty_decimal, veto = self._experiment_adjust(side, qty_decimal, current)
+            current_exact = exact(self.portfolio.net_position(self.instrument_id))
+            current = float(current_exact)
+            requested_side = side
+            requested_qty = qty_decimal
+            side, qty_decimal, veto = self._experiment_adjust(side, qty_decimal, current_exact)
             qty_obj = (
                 step_aligned_quantity(self.instrument, qty_decimal, self.filters["step_size"])
                 if qty_decimal > 0
                 else None
             )
-            reason = veto or (
-                reject_reason(qty_obj, price_obj, self.filters)
-                if qty_obj is not None
-                else "nonpositive_or_nonfinite"
+            snapped_qty = exact(qty_obj) if qty_obj is not None else Decimal(0)
+            if side != requested_side:
+                raise ValueError("overlay changed the requested order side")
+            if snapped_qty > qty_decimal or qty_decimal > requested_qty:
+                raise ValueError("overlay/step snapping increased the requested quantity")
+            # Snapping always moves the final target back toward ``current``.
+            # This signed comparison proves it cannot cross the overlay's
+            # permitted target and create more exposure on the order side.
+            permitted_target = current_exact + (
+                qty_decimal if side == OrderSide.BUY else -qty_decimal
             )
+            final_target = current_exact + (snapped_qty if side == OrderSide.BUY else -snapped_qty)
+            if side == OrderSide.BUY and final_target > permitted_target:
+                raise ValueError("BUY step snapping exceeded permitted exposure")
+            if side == OrderSide.SELL and final_target < permitted_target:
+                raise ValueError("SELL step snapping exceeded permitted exposure")
+
+            if veto:
+                reason = veto
+                rejection_category = "policy_veto"
+                rejection_source = "research_overlay"
+            elif qty_decimal > 0 and snapped_qty == 0 and qty_decimal < requested_qty:
+                reason = "policy_scaled_quantity_below_step"
+                rejection_category = "policy_veto"
+                rejection_source = "research_overlay"
+            else:
+                reason = (
+                    reject_reason(qty_obj, price_obj, self.filters)
+                    if qty_obj is not None
+                    else "nonpositive_or_nonfinite"
+                )
+                rejection_category = (
+                    "invalid_precision_rejection"
+                    if reason in {"price_precision", "quantity_precision"}
+                    else "pre_submission_rejection"
+                )
+                rejection_source = "simulation_validation"
             # Only after exact validation are these used for metrics/arithmetic.
             price = float(price_obj)
             qty = float(qty_obj) if qty_obj is not None else float(qty_decimal)
@@ -295,8 +332,10 @@ class ReplayStrategy(DeployedTrendStrategy):
                 - abs(current) * self.shared["mid"][self.instrument_id]
                 + abs(current + delta) * price
             )
-            if future_gross > max(0, equity) * self.replay.leverage and abs(current + delta) > abs(
-                current
+            if (
+                not reason
+                and future_gross > max(0, equity) * self.replay.leverage
+                and abs(current + delta) > abs(current)
             ):
                 reason = "leverage_limit"
             if reason:
@@ -309,6 +348,8 @@ class ReplayStrategy(DeployedTrendStrategy):
                         price_obj,
                         self.filters,
                         decision_ts_ns=decision["ts_ns"],
+                        category=rejection_category,
+                        source=rejection_source,
                     )
                 )
             else:
@@ -371,6 +412,8 @@ class ReplayStrategy(DeployedTrendStrategy):
             attempted_price,
             self.filters,
             decision_ts_ns=decision_ts_from_tags(getattr(order, "tags", None)),
+            category="engine_exchange_rejection",
+            source="matching_engine",
         )
         self.rejections.append(record)
         return record

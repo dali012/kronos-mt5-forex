@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from .gates import FAILED, INELIGIBLE, PASSED
 from .registry import CONTROL
 
@@ -85,18 +87,43 @@ def ranking(results: dict) -> list[dict]:
         ("max_drawdown", True),  # less negative is better
     )
     for axis, higher_is_better in axes:
-        ordered = sorted(
-            rows,
-            key=lambda r: (r.get(axis) is None, r.get(axis) if r.get(axis) is not None else 0),
-            reverse=higher_is_better,
+        finite = [
+            row
+            for row in rows
+            if isinstance(row.get(axis), (int, float))
+            and not isinstance(row.get(axis), bool)
+            and math.isfinite(row[axis])
+        ]
+        finite.sort(
+            key=lambda row: (
+                -row[axis] if higher_is_better else row[axis],
+                row["experiment_id"],
+            )
         )
-        for position, row in enumerate(ordered, start=1):
-            row.setdefault("_ranks", {})[axis] = position
+        previous = object()
+        rank = 0
+        for position, row in enumerate(finite, start=1):
+            if row[axis] != previous:
+                rank = position
+                previous = row[axis]
+            row.setdefault("_ranks", {})[axis] = rank
+        # Missing and non-finite values receive a fixed penalty after every
+        # valid value. Their ordering can therefore never improve composite
+        # rank, and final ties remain deterministic by experiment id.
+        for row in rows:
+            if axis not in row.get("_ranks", {}):
+                row.setdefault("_ranks", {})[axis] = len(rows) + 1
     for row in rows:
         ranks = row.pop("_ranks")
         row["axis_ranks"] = ranks
         row["composite_rank_score"] = sum(ranks.values()) / len(ranks)
-    rows.sort(key=lambda r: (r["status"] != PASSED, r["composite_rank_score"]))
+    rows.sort(
+        key=lambda r: (
+            r["status"] != PASSED,
+            r["composite_rank_score"],
+            r["experiment_id"],
+        )
+    )
     for position, row in enumerate(rows, start=1):
         row["composite_rank"] = position
     return rows
@@ -150,9 +177,16 @@ def render(bundle: dict) -> str:
         "trades",
         "fills",
         "net_pnl",
-        "rejected_orders",
+        "policy_vetoes",
+        "engine_exchange_rejections",
+        "pre_submission_rejections",
+        "invalid_precision_rejections",
+        "rejected_orders",  # backward-compatible raw event count
     ):
-        lines.append(f"| {key} | {_fmt(control_dev.get(key))} |")
+        label = (
+            "raw_suppression_and_rejection_records" if key == "rejected_orders" else key
+        )
+        lines.append(f"| {label} | {_fmt(control_dev.get(key))} |")
 
     lines += [
         "",
@@ -160,9 +194,10 @@ def render(bundle: dict) -> str:
         "",
         (
             "| Experiment | Status | Eligibility | Return | Δ Return | Sharpe | Δ Sharpe | "
-            "Profit factor | Max DD | Trades | Net PnL | Profitable windows |"
+            "Profit factor | Max DD | Trades | Net PnL | Policy vetoes | Engine/exchange "
+            "rejections | Invalid precision | Profitable windows |"
         ),
-        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for experiment_id, result in results.items():
         dev = result["development"]
@@ -175,6 +210,9 @@ def render(bundle: dict) -> str:
             f"{_fmt(dev.get('sharpe'))} | {_fmt((delta.get('sharpe') or {}).get('delta'))} | "
             f"{_fmt(dev.get('profit_factor'))} | {_fmt(dev.get('max_drawdown'))} | "
             f"{_fmt(dev.get('trades'))} | {_fmt(dev.get('net_pnl'), 2)} | "
+            f"{_fmt(dev.get('policy_vetoes'))} | "
+            f"{_fmt(dev.get('engine_exchange_rejections'))} | "
+            f"{_fmt(dev.get('invalid_precision_rejections'))} | "
             f"{stats.get('profitable_windows')}/{stats.get('window_count')} |"
         )
 
@@ -247,6 +285,19 @@ def render(bundle: dict) -> str:
         if gate["status"] == INELIGIBLE:
             lines += ["", f"Not selectable: {gate['ineligible_reason']}"]
 
+        deterministic = result.get("deterministic_verification", {})
+        if deterministic:
+            lines += [
+                "",
+                "### Measured deterministic verification",
+                "",
+                (
+                    f"Comparison: **{deterministic['comparison_result']}**. "
+                    f"Primary hash `{deterministic['first_result_sha256']}`; "
+                    f"independent repeat hash `{deterministic['second_result_sha256']}`."
+                ),
+            ]
+
         lines += ["", "### Development metrics", "", "| Metric | Value |", "|---|---:|"]
         for key in (
             "total_return",
@@ -266,9 +317,16 @@ def render(bundle: dict) -> str:
             "net_pnl",
             "turnover_notional",
             "accounting_residual",
-            "rejected_orders",
+            "policy_vetoes",
+            "engine_exchange_rejections",
+            "pre_submission_rejections",
+            "invalid_precision_rejections",
+            "rejected_orders",  # backward-compatible raw event count
         ):
-            lines.append(f"| {key} | {_fmt(dev.get(key))} |")
+            label = (
+                "raw_suppression_and_rejection_records" if key == "rejected_orders" else key
+            )
+            lines.append(f"| {label} | {_fmt(dev.get(key))} |")
         lines += ["", "| Cost | Value |", "|---|---:|"]
         for key, value in dev.get("costs", {}).items():
             lines.append(f"| {key} | {_fmt(value, 4)} |")
@@ -296,10 +354,19 @@ def render(bundle: dict) -> str:
         for regime, value in dev.get("market_regime", {}).items():
             lines.append(f"| {regime} | {_fmt(value, 2)} |")
 
-        lines += ["", "### Rejections", ""]
+        lines += ["", "### Decision suppression and execution rejections", ""]
         by_reason = dev.get("rejections_by_reason") or {}
         by_symbol_reason = dev.get("rejections_by_symbol_reason") or {}
-        lines.append(f"Total: {dev.get('rejected_orders')}. By reason: {by_reason or 'none'}.")
+        lines.append(
+            f"Policy vetoes / suppressed decisions: {dev.get('policy_vetoes')}; "
+            f"actual matching-engine/exchange rejections: "
+            f"{dev.get('engine_exchange_rejections')}; pre-submission validation "
+            f"rejections: {dev.get('pre_submission_rejections')}; invalid precision "
+            f"rejections: {dev.get('invalid_precision_rejections')}. The backward-compatible "
+            f"raw event count is {dev.get('rejected_orders')}. Overlay vetoes were never "
+            "submitted to Binance."
+        )
+        lines.append(f"Reasons across all categories: {by_reason or 'none'}.")
         if by_symbol_reason:
             lines += ["", "| Symbol | Reason | Count |", "|---|---|---:|"]
             for key, count in by_symbol_reason.items():
@@ -320,14 +387,18 @@ def render(bundle: dict) -> str:
                 f"worst {_fmt(stats['worst_window_return'])}."
             ),
             "",
-            ("| Start | End exclusive | Return | Sharpe | Max DD | Trades | Fills | Rejected |"),
-            "|---|---|---:|---:|---:|---:|---:|---:|",
+            (
+                "| Start | End exclusive | Return | Sharpe | Max DD | Trades | Fills | "
+                "Policy vetoes | Engine/exchange | Invalid precision |"
+            ),
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
         for w in result["walk_forward"]:
             lines.append(
                 f"| {str(w['start_utc'])[:10]} | {str(w['end_utc_exclusive'])[:10]} | "
                 f"{_fmt(w['total_return'])} | {_fmt(w['sharpe'], 4)} | {_fmt(w['max_drawdown'])} | "
-                f"{w['trades']} | {w['fills']} | {w['rejected_orders']} |"
+                f"{w['trades']} | {w['fills']} | {w['policy_vetoes']} | "
+                f"{w['engine_exchange_rejections']} | {w['invalid_precision_rejections']} |"
             )
         lines += [
             "",
